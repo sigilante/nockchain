@@ -140,9 +140,9 @@ jobs:
         if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')  # Only on qualifying pushes/tags, not PRs
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}
-          name: ${{ steps.channel.outputs.channel }} Release ${{ steps.channel.outputs.version }}
+          tag_name: ${{ steps.channel.outputs.channel }}-build-${{ github.sha }}
+          name: ${{ steps.channel.outputs.channel }} Build ${{ github.sha }}
           files: |
-            dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
-            dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
-            dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoon_version }}-${{ matrix.target }}.tar.gz
+            dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoonc_version }}-${{ matrix.target }}.tar.gz
+            dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.nockup_version }}-${{ matrix.target }}.tar.gz
