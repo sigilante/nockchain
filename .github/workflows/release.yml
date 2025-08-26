@@ -31,23 +31,19 @@ jobs:
         uses: swatinem/rust-cache@v2
 
       - name: Build hoon
-        run: cargo build --release --bin hoon --manifest-path crates/hoon/Cargo.toml
-
-      - name: Verify hoon binary
         run: |
-          if [ -f target/release/hoon ]; then
-            echo "hoon binary exists"
-            file target/release/hoon
-          else
-            echo "hoon binary missing - listing directory contents:"
-            ls -la target/release/ || echo "target/release directory missing"
-          fi
+          cargo build --release --bin hoon --manifest-path crates/hoon/Cargo.toml
+          file target/release/hoon
 
       - name: Build hoonc
-        run: cargo build --release --bin hoonc --manifest-path crates/hoonc/Cargo.toml
+        run: |
+          cargo build --release --bin hoonc --manifest-path crates/hoonc/Cargo.toml
+          file target/release/hoonc
 
       - name: Build nockup
-        run: cargo build --release --bin nockup --manifest-path crates/nockup/Cargo.toml
+        run: |
+          cargo build --release --bin nockup --manifest-path crates/nockup/Cargo.toml
+          file target/release/nockup
 
       - name: Package binaries
         run: |
