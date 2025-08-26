@@ -1,0 +1,62 @@
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    permissions:
+      contents: write  # Required for action-gh-release
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+
+      - name: Build hoon
+        run: cargo build --release --bin hoon --manifest-path crates/hoon/Cargo.toml
+
+      - name: Build hoonc
+        run: cargo build --release --bin hoonc --manifest-path crates/hoonc/Cargo.toml
+
+      - name: Build nockup
+        run: cargo build --release --bin nockup --manifest-path crates/nockup/Cargo.toml
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          # Copy and make executable
+          cp crates/hoon/target/release/hoon dist/hoon
+          chmod +x dist/hoon
+          cp crates/hoonc/target/release/hoonc dist/hoonc
+          chmod +x dist/hoonc
+          cp crates/nockup/target/release/nockup dist/nockup
+          chmod +x dist/nockup
+          # Create archives
+          tar -czf dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoon
+          tar -czf dist/hoonc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoonc
+          tar -czf dist/nockup-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist nockup
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            dist/hoonc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            dist/nockup-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
