@@ -50,9 +50,9 @@ jobs:
       - name: Extract Cargo versions
         id: cargo-versions
         run: |
-          HOON_VERSION=$(grep '^version[[:space:]]*=' crates/hoon/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
-          HOONC_VERSION=$(grep '^version[[:space:]]*=' crates/hoonc/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
-          NOCKUP_VERSION=$(grep '^version[[:space:]]*=' crates/nockup/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
+          HOON_VERSION=$(grep '^version[[:space:]]*=' crates/hoon/Cargo.toml | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+          HOONC_VERSION=$(grep '^version[[:space:]]*=' crates/hoonc/Cargo.toml | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
+          NOCKUP_VERSION=$(grep '^version[[:space:]]*=' crates/nockup/Cargo.toml | sed 's/.*=[[:space:]]*"\([^"]*\)".*/\1/' | head -1)
           # For nightly, append date
           if [[ "${{ steps.channel.outputs.channel }}" == "nightly" ]]; then
             DATE=$(date +%Y%m%d)
