@@ -35,14 +35,12 @@ jobs:
 
       - name: Verify hoon binary
         run: |
-          ls
-          ls target
-          if [ -f crates/hoon/target/release/hoon ]; then
+          if [ -f target/release/hoon ]; then
             echo "hoon binary exists"
-            file crates/hoon/target/release/hoon
+            file target/release/hoon
           else
             echo "hoon binary missing - listing directory contents:"
-            ls -la crates/hoon/target/release/ || echo "target/release directory missing"
+            ls -la target/release/ || echo "target/release directory missing"
           fi
 
       - name: Build hoonc
@@ -55,11 +53,11 @@ jobs:
         run: |
           mkdir -p dist
           # Copy and make executable
-          cp crates/hoon/target/release/hoon dist/hoon
+          cp target/release/hoon dist/hoon
           chmod +x dist/hoon
-          cp crates/hoonc/target/release/hoonc dist/hoonc
+          cp target/release/hoonc dist/hoonc
           chmod +x dist/hoonc
-          cp crates/nockup/target/release/nockup dist/nockup
+          cp target/release/nockup dist/nockup
           chmod +x dist/nockup
           # Create archives
           tar -czf dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoon
