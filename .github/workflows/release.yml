@@ -47,6 +47,29 @@ jobs:
             echo "version=pr-${{ github.event.number }}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Extract Cargo versions
+        id: cargo-versions
+        run: |
+          HOON_VERSION=$(grep '^version[[:space:]]*=' crates/hoon/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
+          HOONC_VERSION=$(grep '^version[[:space:]]*=' crates/hoonc/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
+          NOCKUP_VERSION=$(grep '^version[[:space:]]*=' crates/nockup/Cargo.toml | sed 's/.*=[[:space:]]*\([0-9.]*\).*/\1/' | head -1)
+          # For nightly, append date
+          if [[ "${{ steps.channel.outputs.channel }}" == "nightly" ]]; then
+            DATE=$(date +%Y%m%d)
+            HOON_VERSION="${HOON_VERSION}-${DATE}"
+            HOONC_VERSION="${HOONC_VERSION}-${DATE}"
+            NOCKUP_VERSION="${NOCKUP_VERSION}-${DATE}"
+          fi
+          # Validate versions
+          if [[ -z "$HOON_VERSION" || -z "$HOONC_VERSION" || -z "$NOCKUP_VERSION" ]]; then
+            echo "Error: Missing version in one or more Cargo.toml files"
+            exit 1
+          fi
+          echo "hoon_version=$HOON_VERSION" >> $GITHUB_OUTPUT
+          echo "hoonc_version=$HOONC_VERSION" >> $GITHUB_OUTPUT
+          echo "nockup_version=$NOCKUP_VERSION" >> $GITHUB_OUTPUT
+          echo "Extracted versions: hoon=$HOON_VERSION, hoonc=$HOONC_VERSION, nockup=$NOCKUP_VERSION"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -74,7 +97,9 @@ jobs:
         run: |
           mkdir -p dist
           CHANNEL="${{ steps.channel.outputs.channel }}"
-          VERSION="${{ steps.channel.outputs.version }}"
+          HOON_VERSION="${{ steps.cargo-versions.outputs.hoon_version }}"
+          HOONC_VERSION="${{ steps.cargo-versions.outputs.hoonc_version }}"
+          NOCKUP_VERSION="${{ steps.cargo-versions.outputs.nockup_version }}"
           if [[ "$CHANNEL" == "pr" ]]; then
             echo "Skipping packaging for PRs"
             exit 0
@@ -98,17 +123,17 @@ jobs:
           else
             echo "Skipping nockup copy: binary missing"
           fi
-          # Create archives with channel and version
+          # Create archives with channel and per-crate versions
           if [ -f dist/hoon ]; then
-            tar -czf dist/hoon-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist hoon
+            tar -czf dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz -C dist hoon
           fi
           if [ -f dist/hoonc ]; then
-            tar -czf dist/hoonc-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist hoonc
+            tar -czf dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz -C dist hoonc
           fi
           if [ -f dist/nockup ]; then
-            tar -czf dist/nockup-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist nockup
+            tar -czf dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz -C dist nockup
           fi
-          echo "Packaged artifacts for channel $CHANNEL version $VERSION:"
+          echo "Packaged artifacts for channel $CHANNEL:"
           ls -la dist/
 
       - name: Upload release assets
