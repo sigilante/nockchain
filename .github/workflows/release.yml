@@ -55,10 +55,14 @@ jobs:
           chmod +x dist/hoonc
           cp target/release/nockup dist/nockup
           chmod +x dist/nockup
+          ls
           # Create archives
           tar -czf dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoon
+          ls
           tar -czf dist/hoonc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoonc
+          ls
           tar -czf dist/nockup-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist nockup
+          ls
 
       - name: Upload release assets
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'  # Only on push to master, not PRs
