@@ -2,9 +2,10 @@ name: Release Binaries
 
 on:
   push:
-    branches: ["master"]
+    branches: ["master", "nightly"]
+    tags: ["v*"]
   pull_request:
-    branches: ["master"]
+    branches: ["master", "nightly"]
 
 jobs:
   build:
@@ -21,6 +22,30 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Determine channel
+        id: channel
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "channel=stable" >> $GITHUB_OUTPUT
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "master" ]]; then
+            echo "channel=stable" >> $GITHUB_OUTPUT
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+            echo "version=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref_name }}" == "nightly" ]]; then
+            echo "channel=nightly" >> $GITHUB_OUTPUT
+            DATE=$(date +%Y%m%d)
+            echo "version=${DATE}" >> $GITHUB_OUTPUT
+          else
+            echo "channel=dev" >> $GITHUB_OUTPUT
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+            echo "version=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "channel=pr" >> $GITHUB_OUTPUT
+            echo "version=pr-${{ github.event.number }}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -48,27 +73,51 @@ jobs:
       - name: Package binaries
         run: |
           mkdir -p dist
-          # Copy and make executable
-          cp target/release/hoon dist/hoon
-          chmod +x dist/hoon
-          cp target/release/hoonc dist/hoonc
-          chmod +x dist/hoonc
-          cp target/release/nockup dist/nockup
-          chmod +x dist/nockup
-          ls
-          # Create archives
-          tar -czf dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoon
-          ls
-          tar -czf dist/hoonc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist hoonc
-          ls
-          tar -czf dist/nockup-${{ github.ref_name }}-${{ matrix.target }}.tar.gz -C dist nockup
-          ls
+          CHANNEL="${{ steps.channel.outputs.channel }}"
+          VERSION="${{ steps.channel.outputs.version }}"
+          if [[ "$CHANNEL" == "pr" ]]; then
+            echo "Skipping packaging for PRs"
+            exit 0
+          fi
+          # Copy and make executable (using root target/release/)
+          if [ -f target/release/hoon ]; then
+            cp target/release/hoon dist/hoon
+            chmod +x dist/hoon
+          else
+            echo "Skipping hoon copy: binary missing"
+          fi
+          if [ -f target/release/hoonc ]; then
+            cp target/release/hoonc dist/hoonc
+            chmod +x dist/hoonc
+          else
+            echo "Skipping hoonc copy: binary missing"
+          fi
+          if [ -f target/release/nockup ]; then
+            cp target/release/nockup dist/nockup
+            chmod +x dist/nockup
+          else
+            echo "Skipping nockup copy: binary missing"
+          fi
+          # Create archives with channel and version
+          if [ -f dist/hoon ]; then
+            tar -czf dist/hoon-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist hoon
+          fi
+          if [ -f dist/hoonc ]; then
+            tar -czf dist/hoonc-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist hoonc
+          fi
+          if [ -f dist/nockup ]; then
+            tar -czf dist/nockup-${CHANNEL}-${VERSION}-${{ matrix.target }}.tar.gz -C dist nockup
+          fi
+          echo "Packaged artifacts for channel $CHANNEL version $VERSION:"
+          ls -la dist/
 
       - name: Upload release assets
-        if: github.event_name == 'push' && github.ref == 'refs/heads/master'  # Only on push to master, not PRs
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')  # Only on qualifying pushes/tags, not PRs
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}
+          name: ${{ steps.channel.outputs.channel }} Release ${{ steps.channel.outputs.version }}
           files: |
-            dist/hoon-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            dist/hoonc-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
-            dist/nockup-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+            dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.channel.outputs.version }}-${{ matrix.target }}.tar.gz
