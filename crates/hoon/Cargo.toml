@@ -13,3 +13,7 @@ clap.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[[bin]]
+name = "hoon"
+path = "src/main.rs"
