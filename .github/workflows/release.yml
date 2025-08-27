@@ -94,7 +94,7 @@ jobs:
           file target/release/nockup
 
       - name: Set up GPG
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')
+        if: matrix.os == 'ubuntu-latest' && github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')
         run: |
           # Import GPG private key
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
@@ -110,7 +110,7 @@ jobs:
           HOON_VERSION="${{ steps.cargo-versions.outputs.hoon_version }}"
           HOONC_VERSION="${{ steps.cargo-versions.outputs.hoonc_version }}"
           NOCKUP_VERSION="${{ steps.cargo-versions.outputs.nockup_version }}"
-          SHOULD_SIGN="${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag') }}"
+          SHOULD_SIGN="${{ matrix.os == 'ubuntu-latest' && github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag') }}"
           
           if [[ "$CHANNEL" == "pr" ]]; then
             echo "Skipping packaging for PRs"
@@ -190,8 +190,8 @@ jobs:
           name: ${{ steps.channel.outputs.channel }} Build ${{ github.sha }}
           files: |
             dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoon_version }}-${{ matrix.target }}.tar.gz
-            dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoon_version }}-${{ matrix.target }}.tar.gz.asc
+            ${{ matrix.os == 'ubuntu-latest' && format('dist/hoon-{0}-{1}-{2}.tar.gz.asc', steps.channel.outputs.channel, steps.cargo-versions.outputs.hoon_version, matrix.target) || '' }}
             dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoonc_version }}-${{ matrix.target }}.tar.gz
-            dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoonc_version }}-${{ matrix.target }}.tar.gz.asc
+            ${{ matrix.os == 'ubuntu-latest' && format('dist/hoonc-{0}-{1}-{2}.tar.gz.asc', steps.channel.outputs.channel, steps.cargo-versions.outputs.hoonc_version, matrix.target) || '' }}
             dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.nockup_version }}-${{ matrix.target }}.tar.gz
-            dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.nockup_version }}-${{ matrix.target }}.tar.gz.asc
+            ${{ matrix.os == 'ubuntu-latest' && format('dist/nockup-{0}-{1}-{2}.tar.gz.asc', steps.channel.outputs.channel, steps.cargo-versions.outputs.nockup_version, matrix.target) || '' }}
