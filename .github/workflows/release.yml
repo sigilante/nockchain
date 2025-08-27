@@ -98,6 +98,10 @@ jobs:
         run: |
           # Import GPG private key
           echo "${{ secrets.GPG_PRIVATE_KEY }}" | tr -d '\n' | base64 -d | gpg --batch --import
+          # Configure GPG for non-interactive use
+          echo "use-agent" >> ~/.gnupg/gpg.conf
+          echo "pinentry-mode loopback" >> ~/.gnupg/gpg.conf
+          echo "batch" >> ~/.gnupg/gpg.conf
           # Get the full fingerprint and trust the key
           FINGERPRINT=$(gpg --list-secret-keys --with-colons | grep '^fpr:' | head -1 | cut -d: -f10)
           echo "${FINGERPRINT}:6:" | gpg --import-ownertrust
@@ -142,15 +146,15 @@ jobs:
           if [[ "$SHOULD_SIGN" == "true" ]]; then
             echo "Signing binaries..."
             if [ -f dist/hoon ]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon
+              echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon
               echo "Created dist/hoon.asc"
             fi
             if [ -f dist/hoonc ]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc
+              echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc
               echo "Created dist/hoonc.asc"
             fi
             if [ -f dist/nockup ]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup
+              echo "${{ secrets.GPG_PASSPHRASE }}" | gpg --batch --yes --passphrase-fd 0 --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup
               echo "Created dist/nockup.asc"
             fi
           else
@@ -162,21 +166,21 @@ jobs:
             tar -czf dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz -C dist hoon
             # Sign the archive if this is a release build
             if [[ "$SHOULD_SIGN" == "true" ]]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz
+              gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz
             fi
           fi
           if [ -f dist/hoonc ]; then
             tar -czf dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz -C dist hoonc
             # Sign the archive if this is a release build
             if [[ "$SHOULD_SIGN" == "true" ]]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz
+              gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz
             fi
           fi
           if [ -f dist/nockup ]; then
             tar -czf dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz -C dist nockup
             # Sign the archive if this is a release build
             if [[ "$SHOULD_SIGN" == "true" ]]; then
-              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz
+              gpg --batch --yes --pinentry-mode loopback --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz
             fi
           fi
           
