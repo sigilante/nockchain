@@ -93,17 +93,30 @@ jobs:
           cargo build --release --bin nockup --manifest-path crates/nockup/Cargo.toml
           file target/release/nockup
 
-      - name: Package binaries
+      - name: Set up GPG
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')
+        run: |
+          # Import GPG private key
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
+          # Trust the key (optional but recommended)
+          echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust
+          # Verify key is available
+          gpg --list-secret-keys
+
+      - name: Package and sign binaries
         run: |
           mkdir -p dist
           CHANNEL="${{ steps.channel.outputs.channel }}"
           HOON_VERSION="${{ steps.cargo-versions.outputs.hoon_version }}"
           HOONC_VERSION="${{ steps.cargo-versions.outputs.hoonc_version }}"
           NOCKUP_VERSION="${{ steps.cargo-versions.outputs.nockup_version }}"
+          SHOULD_SIGN="${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag') }}"
+          
           if [[ "$CHANNEL" == "pr" ]]; then
             echo "Skipping packaging for PRs"
             exit 0
           fi
+          
           # Copy and make executable (using root target/release/)
           if [ -f target/release/hoon ]; then
             cp target/release/hoon dist/hoon
@@ -123,16 +136,49 @@ jobs:
           else
             echo "Skipping nockup copy: binary missing"
           fi
+          
+          # Sign individual binaries if this is a release build
+          if [[ "$SHOULD_SIGN" == "true" ]]; then
+            echo "Signing binaries..."
+            if [ -f dist/hoon ]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon
+              echo "Created dist/hoon.asc"
+            fi
+            if [ -f dist/hoonc ]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc
+              echo "Created dist/hoonc.asc"
+            fi
+            if [ -f dist/nockup ]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup
+              echo "Created dist/nockup.asc"
+            fi
+          else
+            echo "Skipping binary signing for non-release builds"
+          fi
+          
           # Create archives with channel and per-crate versions
           if [ -f dist/hoon ]; then
             tar -czf dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz -C dist hoon
+            # Sign the archive if this is a release build
+            if [[ "$SHOULD_SIGN" == "true" ]]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoon-${CHANNEL}-${HOON_VERSION}-${{ matrix.target }}.tar.gz
+            fi
           fi
           if [ -f dist/hoonc ]; then
             tar -czf dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz -C dist hoonc
+            # Sign the archive if this is a release build
+            if [[ "$SHOULD_SIGN" == "true" ]]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/hoonc-${CHANNEL}-${HOONC_VERSION}-${{ matrix.target }}.tar.gz
+            fi
           fi
           if [ -f dist/nockup ]; then
             tar -czf dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz -C dist nockup
+            # Sign the archive if this is a release build
+            if [[ "$SHOULD_SIGN" == "true" ]]; then
+              gpg --batch --yes --detach-sign --armor --default-key "${{ secrets.GPG_KEY_ID }}" dist/nockup-${CHANNEL}-${NOCKUP_VERSION}-${{ matrix.target }}.tar.gz
+            fi
           fi
+          
           echo "Packaged artifacts for channel $CHANNEL:"
           ls -la dist/
 
@@ -144,5 +190,8 @@ jobs:
           name: ${{ steps.channel.outputs.channel }} Build ${{ github.sha }}
           files: |
             dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoon_version }}-${{ matrix.target }}.tar.gz
+            dist/hoon-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoon_version }}-${{ matrix.target }}.tar.gz.asc
             dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoonc_version }}-${{ matrix.target }}.tar.gz
+            dist/hoonc-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.hoonc_version }}-${{ matrix.target }}.tar.gz.asc
             dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.nockup_version }}-${{ matrix.target }}.tar.gz
+            dist/nockup-${{ steps.channel.outputs.channel }}-${{ steps.cargo-versions.outputs.nockup_version }}-${{ matrix.target }}.tar.gz.asc
