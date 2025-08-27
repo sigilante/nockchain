@@ -94,15 +94,12 @@ async fn has_existing_templates(templates_dir: &PathBuf) -> Result<bool> {
 async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
     // Check Git commit HEAD of branch and compare to reported local version.
     let commit_id = get_git_commit_id().await?;
-    println!("{} Remote commit ID: {}", "🔍".yellow(), commit_id.cyan());
     let commit_file = templates_dir.join("commit.toml");
-    println!("{} Commit file path: {}", "🔍".yellow(), commit_file.display().to_string().cyan());
 
     // Try to read the file directly
     match tokio_fs::read_to_string(&commit_file).await {
         Ok(commit_content) => {
             let commit: toml::Value = toml::de::from_str(&commit_content).context("Failed to parse commit file")?;
-            println!("{} Local commit ID: {}", "🔍".yellow(), commit["commit"]["id"].to_string().cyan());
             let local_commit_id = commit["commit"]["id"].to_string().replace("\"", "");
             if local_commit_id == commit_id {
                 println!("{} Templates are up to date", "✅".green());
@@ -215,61 +212,56 @@ async fn download_binaries(config: &toml::Value) -> Result<()> {
         architecture.cyan()
     );
 
-    // Download and verify hoon binary archive
-    let archive_url_hoon = manifest["pkg"]["hoon"]["target"][architecture]["url"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid URL for hoon binary"))?;
-    let archive_url_hoon = archive_url_hoon.replace("http://", "https://");
-    let signature_url_hoon = format!("{}.asc", archive_url_hoon);
-    
-    let archive_blake3_hoon = manifest["pkg"]["hoon"]["target"][architecture]["hash_blake3"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid Blake3 hash for hoon binary"))?;
-    let archive_sha1_hoon = manifest["pkg"]["hoon"]["target"][architecture]["hash_sha1"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Invalid SHA1 hash for hoon binary"))?;
+    // Download and verify binary archives.
+    for index in ["hoon", "hoonc", "nockup"] {
+        println!(
+            "{} Downloading {} binary...",
+            "⬇️".green(),
+            index.cyan()
+        );
+        let archive_url = manifest["pkg"][index]["target"][architecture]["url"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{} Invalid URL for {} binary", "❌".red(), index))?;
+        let archive_url = archive_url.replace("http://", "https://");
+        let signature_url = format!("{}.asc", archive_url);
 
-    println!(
-        "{} Downloading hoon archive from: {}",
-        "⬇️".green(),
-        archive_url_hoon.cyan()
-    );
-    println!(
-        "{} Downloading signature from: {}",
-        "🔐".green(),
-        signature_url_hoon.cyan()
-    );
-    println!(
-        "{} Expected Blake3 checksum: {}",
-        "🔑".green(),
-        archive_blake3_hoon.cyan()
-    );
-    println!(
-        "{} Expected SHA1 checksum: {}",
-        "🔑".green(),
-        archive_sha1_hoon.cyan()
-    );
+        let archive_blake3 = manifest["pkg"][index]["target"][architecture]["hash_blake3"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{} Invalid Blake3 hash for {} binary", "❌".red(), index))?;
+        let archive_sha1 = manifest["pkg"][index]["target"][architecture]["hash_sha1"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("{} Invalid SHA1 hash for {} binary", "❌".red(), index))?;
 
-    // Download archive and signature
-    let archive_path = download_file(&archive_url_hoon).await?;
-    let signature_path = download_file(&signature_url_hoon).await?;
+        println!(
+            "{} Blake3 checksum passed.",
+            "✅".green()
+        );
+        println!(
+            "{} SHA1 checksum passed.",
+            "✅".green()
+        );
 
-    // Verify GPG signature first
-    verify_gpg_signature(&archive_path, &signature_path).await?;
+        // Download archive and signature
+        let archive_path = download_file(&archive_url).await?;
+        let signature_path = download_file(&signature_url).await?;
 
-    // Verify checksums of the archive
-    verify_checksums(&archive_path, &archive_blake3_hoon, &archive_sha1_hoon).await?;
+        // Verify GPG signature first
+        verify_gpg_signature(&archive_path, &signature_path).await?;
 
-    // Extract binary from tar.gz
-    let target_dir = get_cache_dir()?;
-    let binary_path = target_dir.join("bin");
-    fs::create_dir_all(&binary_path)?;
-    
-    extract_binary_from_archive(&archive_path, &binary_path, "hoon").await?;
+        // Verify checksums of the archive
+        verify_checksums(&archive_path, &archive_blake3, &archive_sha1).await?;
 
-    // Clean up downloaded files
-    fs::remove_file(&archive_path)?;
-    fs::remove_file(&signature_path)?;
+        // Extract binary from tar.gz
+        let target_dir = get_cache_dir()?;
+        let binary_path = target_dir.join("bin");
+        fs::create_dir_all(&binary_path)?;
+        
+        extract_binary_from_archive(&archive_path, &binary_path, index).await?;
+
+        // Clean up downloaded files
+        fs::remove_file(&archive_path)?;
+        fs::remove_file(&signature_path)?;
+    }
 
     Ok(())
 }
@@ -277,10 +269,18 @@ async fn download_binaries(config: &toml::Value) -> Result<()> {
 async fn verify_gpg_signature(archive_path: &std::path::Path, signature_path: &std::path::Path) -> Result<()> {
     println!("{} Verifying GPG signature...", "🔐".yellow());
     
+    // Check if files exist
+    if !archive_path.exists() {
+        return Err(anyhow::anyhow!("Archive file does not exist: {}", archive_path.display()));
+    }
+    if !signature_path.exists() {
+        return Err(anyhow::anyhow!("Signature file does not exist: {}", signature_path.display()));
+    }
+    
     // First attempt to verify
     let output = Command::new("gpg")
         .args([
-            "--verify",
+            "--verify", //"--verbose",
             signature_path.to_str().unwrap(),
             archive_path.to_str().unwrap(),
         ])
@@ -311,6 +311,10 @@ async fn verify_gpg_signature(archive_path: &std::path::Path, signature_path: &s
             .await
             .context("Failed to import public key from keyserver")?;
 
+        println!("{} Import exit status: {}", "🔍".yellow(), import_output.status);
+        println!("{} Import stdout: {}", "🔍".yellow(), String::from_utf8_lossy(&import_output.stdout));
+        println!("{} Import stderr: {}", "🔍".yellow(), String::from_utf8_lossy(&import_output.stderr));
+
         if !import_output.status.success() {
             let import_stderr = String::from_utf8_lossy(&import_output.stderr);
             println!("{} Failed to import public key: {}", "⚠️".yellow(), import_stderr);
@@ -326,6 +330,9 @@ async fn verify_gpg_signature(archive_path: &std::path::Path, signature_path: &s
                 .await;
                 
             if let Ok(alt_output) = alt_import {
+                println!("{} Alt import exit status: {}", "🔍".yellow(), alt_output.status);
+                println!("{} Alt import stderr: {}", "🔍".yellow(), String::from_utf8_lossy(&alt_output.stderr));
+
                 if !alt_output.status.success() {
                     return Err(anyhow::anyhow!(
                         "Failed to import public key from keyservers. Please import manually:\n  gpg --keyserver keyserver.ubuntu.com --recv-keys A6FFD2DB7D4C9710"
@@ -343,13 +350,16 @@ async fn verify_gpg_signature(archive_path: &std::path::Path, signature_path: &s
         // Retry verification after importing the key
         let retry_output = Command::new("gpg")
             .args([
-                "--verify",
+                "--verify", "--verbose",
                 signature_path.to_str().unwrap(),
                 archive_path.to_str().unwrap(),
             ])
             .output()
             .await
             .context("Failed to execute gpg verification after key import")?;
+
+        println!("{} Retry exit status: {}", "🔍".yellow(), retry_output.status);
+        println!("{} Retry stderr: {}", "🔍".yellow(), String::from_utf8_lossy(&retry_output.stderr));
 
         if !retry_output.status.success() {
             let retry_stderr = String::from_utf8_lossy(&retry_output.stderr);
@@ -430,7 +440,16 @@ async fn download_file(url: &str) -> Result<PathBuf> {
             response.status()
         ));
     }
-    let temp_file = std::env::temp_dir().join("nockup_download");
+    
+    // Extract filename from URL and add timestamp to ensure uniqueness
+    let url_filename = url.split('/').last().unwrap_or("download");
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let filename = format!("nockup_{}_{}", timestamp, url_filename);
+    let temp_file = std::env::temp_dir().join(filename);
+    
     let mut file = std::fs::File::create(&temp_file).context("Failed to create temporary file")?;
     let content = response.bytes().await?;
     std::io::copy(&mut content.as_ref(), &mut file).context("Failed to write to temporary file")?;
