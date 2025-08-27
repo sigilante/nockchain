@@ -4210,7 +4210,7 @@ dependencies = [
 
 [[package]]
 name = "nockup"
-version = "0.0.2"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -4219,6 +4219,7 @@ dependencies = [
  "clap",
  "colored",
  "dirs 5.0.1",
+ "flate2",
  "fs_extra",
  "handlebars",
  "hex",
@@ -4229,6 +4230,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6272,6 +6274,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 
 [[package]]
+name = "tar"
+version = "0.4.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d863878d212c87a19c1a610eb53bb01fe12951c0501cf5a0d65f724914a667a"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
+
+[[package]]
 name = "tempfile"
 version = "3.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7834,6 +7847,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror 2.0.12",
  "time",
+]
+
+[[package]]
+name = "xattr"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af3a19837351dc82ba89f8a125e22a3c475f05aba604acc023d62b2739ae2909"
+dependencies = [
+ "libc",
+ "rustix 1.0.8",
 ]
 
 [[package]]

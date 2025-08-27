@@ -54,6 +54,18 @@ Nockup supports the following `nockup` commands.
     $ cargo install --path .
     ```
 
+3. Install the GPG public key (on Linux).  Nockup **will not work** if you do not provide the public key.
+
+    ```
+    $ gpg --keyserver keyserver.ubuntu.com --recv-keys A6FFD2DB7D4C9710
+    ```
+
+4. Check for updates.
+
+    ```
+    $ nockup update
+    ```
+
 ## Usage
 
 ```

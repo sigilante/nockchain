@@ -1,6 +1,6 @@
 [package]
 name = "nockup"
-version = "0.0.2"
+version = "0.0.1"
 edition = "2021"
 authors = [""]
 description = "A developer support framework for NockApp development"
@@ -67,6 +67,10 @@ sha1 = "0.10.6"
 hex = "0.4"
 
 proptest = "1.0"
+
+flate2 = "1.0"
+
+tar = "0.4"
 
 [build-dependencies]
 # For generating version info at build time
