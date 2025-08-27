@@ -97,9 +97,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest' && github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/nightly' || github.ref_type == 'tag')
         run: |
           # Import GPG private key
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
-          # Trust the key (optional but recommended)
-          echo "${{ secrets.GPG_KEY_ID }}:6:" | gpg --import-ownertrust
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | tr -d '\n' | base64 -d | gpg --batch --import
+          # Get the full fingerprint and trust the key
+          FINGERPRINT=$(gpg --list-secret-keys --with-colons | grep '^fpr:' | head -1 | cut -d: -f10)
+          echo "${FINGERPRINT}:6:" | gpg --import-ownertrust
           # Verify key is available
           gpg --list-secret-keys
 
