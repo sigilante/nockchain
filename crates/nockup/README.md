@@ -176,11 +176,12 @@ Code building is a general-purpose computing process, like `eval`.  You should n
 
 ## Roadmap
 
-* [ ] implement CI with index for channels and versioning
-  1. Build CI pipeline for matrix of Linux/macOS, stable/nightly, and aarch64/x86_64.
-  2. Post binaries.
-* [ ] add code signing support
+Checklist for release:
 
-## Contributors
+* add Apple code signing support
+* test Linux code signing on Linux
+* update manifest files (and install/update strings) to zorp-corp/nockchain
 
-Some CLI testing has been implemented and is accessible via `cargo test`.
+## Contributor's Guide
+
+Some CLI testing has been implemented and is accessible via `cargo test`.  This can, of course, always be improved.

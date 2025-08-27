@@ -174,7 +174,6 @@ async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
 
 async fn update_templates(templates_dir: &PathBuf) -> Result<()> {
     // For now, just re-clone to get the latest version
-    // In the future, you might want to implement proper git pull logic
     clone_templates(templates_dir).await
 }
 
