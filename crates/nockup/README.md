@@ -166,7 +166,48 @@ The final product is, of course, a binary which you may run either directly or v
 
 One of the design goals of Nockup is to avoid the need to write much, if any, Rust code to successfully deploy a NockApp.  To that end, we provide templates which by and large only expect the developer to write in Hoon or another language which targets the Nock ISA.
 
-A project is specified by its manifest file, which includes details like the project name and the template to use.  Most projects will prefer the `basic` template, but a (stateless) `http-static` and a (stateful) `http-server` template are also available, among other options in `/templates`.
+A project is specified by its manifest file, which includes details like the project name and the template to use.  Many projects will prefer the `basic` template, but other options are available in `/templates`.
+
+- `basic`:  simplest NockApp template.
+- `codetalker`:  gRPC listener and broadcaster.
+- `http-static`:  static HTTP file server.
+- `http-server`:  stateful HTTP server.
+
+#### Multiple Targets
+
+A Rust project (and _a fortiori_ a NockApp project) can produce more than one binary target.  The default expectation for a single-binary project is to supply the following two files:
+
+1. `src/main.rs` - the main Rust driver.
+2. `hoon/app/app.hoon` - the Hoon kernel.
+
+However, if you want to produce multiple binaries and kernels, you should supply the programs in this pattern:
+
+1. `src/bin/main1.rs` - the first Rust driver.  (This may have any name.)
+2. `src/bin/main2.rs` - the second Rust driver.  (This may have any name.)
+3. `hoon/app/main1.hoon` - the first Hoon kernel.  (This should have the same name as the Rust driver `main1.rs`.)
+4. `hoon/app/main2.hoon` - the second Hoon kernel.  (This should have the same name as the Rust driver `main2.rs`.)
+
+In the `Cargo.toml` file, include both targets explicitly:
+
+```
+[[bin]]
+name = "main1"
+path = "src/bin/main1.rs"
+
+[[bin]]
+name = "main2"
+path = "src/bin/main2.rs"
+```
+
+Nockup is opinionated here, and will match `hoon/app/main1.hoon`, etc., as kernels; that is,
+
+```
+nockup build myproject
+```
+
+will produce both `target/release/main1` and `target/release/main2`.
+
+Projects which produce more than one binary cannot be used directly with `nockup run` since more than one process must be started.  This should be kept in mind when using templates which produce more than one binary (like `codetalker`).
 
 ### Channels
 
