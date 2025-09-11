@@ -41,7 +41,7 @@ pub async fn run() -> Result<()> {
     println!("📝 Config installed at: {}", config_path.display());
     config["channel"] = toml::Value::String("stable".into());
     // Get architecture of current platform.
-    config["architecture"] = toml::Value::String(std::env::consts::ARCH.into());
+    config["architecture"] = toml::Value::String(get_target_identifier());
     // Write architecture to config file
     fs::write(config_path, toml::to_string(&config)?).context("Failed to write config file")?;
 
@@ -62,6 +62,21 @@ pub async fn run() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn get_target_identifier() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    
+    match (arch, os) {
+        ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_string(),
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc".to_string(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
+        ("aarch64", "windows") => "aarch64-pc-windows-msvc".to_string(),
+        _ => format!("{}-unknown-{}", arch, os), // fallback
+    }
 }
 
 async fn prepend_path_to_shell_rc(bin_dir: &PathBuf) -> Result<()> {
@@ -233,6 +248,20 @@ async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
     // Move just the templates directory to our cache location
     fs::rename(&repo_templates_dir, templates_dir)?;
 
+    // Check if manifests directory exists in the repo
+    let repo_manifests_dir = temp_dir.join("manifests");
+    if !repo_manifests_dir.exists() {
+        // Cleanup and return error
+        fs::remove_dir_all(&temp_dir).ok();
+        return Err(anyhow::anyhow!(
+            "No 'manifests' directory found in the repository"
+        ));
+    }
+
+    // Move just the manifests directory to our cache location
+    let manifests_dir = templates_dir.parent().unwrap().join("manifests");
+    fs::rename(&repo_manifests_dir, manifests_dir)?;
+
     // Update the commit.toml file.
     let commit_file = templates_dir.join("commit.toml");
     let commit_data = format!("[commit]\nid = \"{}\"\n", commit_id);
@@ -240,7 +269,7 @@ async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
 
     // Clean up the temporary repo directory
     fs::remove_dir_all(&temp_dir)?;
-    println!("{} Templates downloaded successfully", "✓".green());
+    println!("{} Templates and manifests downloaded successfully", "✓".green());
     Ok(())
 }
 
