@@ -2,14 +2,6 @@
 
 *Nockup* is a command-line tool to produce [NockApps](https://github.com/nockchain/nockchain) and manage project builds and dependencies.
 
-> 🚨 **Status**  Pre-release development.
->
-> * Nockup has CLI functionality and basic project templating.
->
-> * Nockchain interaction templates are in active development.
->
-> * Nockup will be officially released as a crate within [Nockchain](https://github.com/nockchain/nockchain).
-
 [The NockApp platform](https://github.com/nockchain/nockchain) is a general-purpose framework for building apps that run using the Nock instruction set architecture.  It is particularly well-suited for use with [Nockchain](https://nockchain.org) and the Nock ZKVM.
 
 ![](./img/hero.jpg)
@@ -21,7 +13,7 @@
 Prerequisites: Rust toolchain (`rustup`, `cargo`, &c.), Git.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nockchain/nockchain/refs/head/master/crates/nockup/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nockchain/nockchain/refs/heads/master/crates/nockup/install.sh | bash
 ```
 
 This checks for dependencies and then installs the Nockup binary and its requirements, including the GPG key used to verify binaries on Linux.  (This is from the `stable` channel by default; see [Channels](#channels) for more information.)

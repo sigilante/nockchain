@@ -1,8 +1,8 @@
 # Nockchain
 
-**Nockchain is programmable sound money that scales.**
+**Nockchain is programmable gold that scales.**
 
-Nockchain is a ZK-Proof of Work L1 that combines sound money incentives with modern research into data availability, app-rollups, and intent-based composability.
+Nockchain is a ZK-Proof of Work blockchain that combines sound money incentives with modern research into data availability, app-rollups, and intent-based composability.
 
 
 *Nockchain is entirely experimental and many parts are unaudited. We make no representations or guarantees as to the behavior of this software.*
