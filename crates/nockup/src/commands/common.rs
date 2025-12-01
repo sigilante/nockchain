@@ -12,7 +12,7 @@ use tar::Archive;
 use tokio::fs as tokio_fs;
 use tokio::process::Command;
 
-const GITHUB_REPO: &str = "sigilante/nockup";
+const GITHUB_REPO: &str = "nockchain/nockchain";
 const TEMPLATES_BRANCH: &str = "master";
 
 pub fn get_cache_dir() -> Result<PathBuf> {

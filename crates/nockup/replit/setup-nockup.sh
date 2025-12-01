@@ -18,7 +18,7 @@ fi
 
 # Install nockup
 echo "📦 Installing nockup..."
-curl -H "Cache-Control: no-cache" -H "Pragma: no-cache" -fsSL https://raw.githubusercontent.com/sigilante/nockup/master/install.sh | bash
+curl -H "Cache-Control: no-cache" -H "Pragma: no-cache" -fsSL https://raw.githubusercontent.com/nockchain/nockchain/master/crates/nockup/install.sh | bash
 
 # Source the activation script to make nockup available immediately
 if [ -f "$HOME/.nockup/activate.sh" ]; then

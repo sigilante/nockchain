@@ -288,7 +288,7 @@ To that end, Nockup supports three patterns for importing libraries:
 2. Repository imports, simple structure.
 3. Nested repository imports.
 
-Examples of each are provided in [`example-manifest-with-libraries.toml`](https://github.com/sigilante/nockup/blob/master/manifests/example-manifest-with-libraries.toml).
+Examples of each are provided in [`example-manifest-with-libraries.toml`](https://github.com/nockchain/nockchain/blob/master/crates/nockup/manifests/example-manifest-with-libraries.toml).
 
 #### Single Libraries
 

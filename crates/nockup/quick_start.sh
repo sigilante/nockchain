@@ -83,7 +83,7 @@ check_nockup() {
 
     if ! command -v nockup >/dev/null 2>&1; then
         print_error "Nockup not found. Please run the installer first:"
-        print_info "  curl -fsSL https://raw.githubusercontent.com/sigilante/nockup/master/install.sh | bash"
+        print_info "  curl -fsSL https://raw.githubusercontent.com/nockchain/nockchain/master/crates/nockup/install.sh | bash"
         exit 1
     fi
 

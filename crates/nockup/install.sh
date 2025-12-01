@@ -17,8 +17,8 @@ GITHUB_REPO="nockchain/nockchain"
 VERSION="unknown"
 RELEASE_TAG="unknown"
 CHANNEL="stable"
-CONFIG_URL_MACOS="https://raw.githubusercontent.com/nockchain/nockup/refs/heads/master/default-config-aarch64-apple-darwin.toml"
-CONFIG_URL_LINUX="https://raw.githubusercontent.com/nockchain/nockup/refs/heads/master/default-config-x86_64-unknown-linux-gnu.toml"
+CONFIG_URL_MACOS="https://raw.githubusercontent.com/nockchain/nockchain/refs/heads/master/crates/nockup/default-config-aarch64-apple-darwin.toml"
+CONFIG_URL_LINUX="https://raw.githubusercontent.com/nockchain/nockchain/refs/heads/master/crates/nockup/default-config-x86_64-unknown-linux-gnu.toml"
 # Determine config URL based on OS
 if [[ "$(uname -s)" == "Darwin" ]]; then
     CONFIG_URL="$CONFIG_URL_MACOS"
@@ -192,32 +192,32 @@ setup_toolchain() {
     
     get_latest_manifest() {
         local channel="$1"
-        local manifest_file="${channel}-manifest.toml"
+        local manifest_file="nockchain-manifest.toml"
         local output_file="${toolchain_dir}/channel-nockup-${channel}.toml"
-        
+
         print_info "Fetching latest ${channel} manifest..."
-        
-        local api_url="https://api.github.com/repos/nockchain/nockchain/releases"
-        local temp_releases="/tmp/releases_${channel}.json"
-        
-        if ! download_file "$api_url" "$temp_releases"; then
-            print_warning "Failed to fetch releases from GitHub API for ${channel}"
+
+        # Get the latest commit SHA from the master branch
+        local commits_url="https://api.github.com/repos/nockchain/nockchain/commits/master"
+        local temp_commit="/tmp/commit_${channel}.json"
+
+        if ! download_file "$commits_url" "$temp_commit"; then
+            print_warning "Failed to fetch latest commit from GitHub API for ${channel}"
             return 1
         fi
-        
-        local latest_tag=""
-        # ✅ Fixed: Added [[:space:]]* to handle spaces in JSON
-        latest_tag=$(grep -o "\"tag_name\"[[:space:]]*:[[:space:]]*\"${channel}-build-[^\"]*\"" "$temp_releases" 2>/dev/null | \
-                    sed 's/"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -1) || true
-        
-        rm -f "$temp_releases"
-        
-        if [[ -z "$latest_tag" ]]; then
-            print_warning "No ${channel} releases found"
+
+        local latest_commit_sha=""
+        latest_commit_sha=$(grep -o "\"sha\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$temp_commit" | \
+                           sed 's/"sha"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -1) || true
+
+        rm -f "$temp_commit"
+
+        if [[ -z "$latest_commit_sha" ]]; then
+            print_warning "No commit SHA found for ${channel}"
             return 1
         fi
-        
-        local manifest_url="https://github.com/nockchain/nockchain/releases/download/${latest_tag}/${manifest_file}"
+
+        local manifest_url="https://github.com/nockchain/nockchain/releases/download/build-${latest_commit_sha}/${manifest_file}"
         
         print_info "Downloading from: $manifest_url"
         if download_file "$manifest_url" "$output_file"; then
