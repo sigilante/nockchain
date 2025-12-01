@@ -112,35 +112,35 @@ get_latest_release() {
     fi
     
     print_info "Latest commit: ${latest_commit_sha:0:7}"
-    
-    # Now construct the expected tag name
-    local expected_tag="${channel}-build-${latest_commit_sha}"
-    
-    print_info "Looking for release: $expected_tag"
-    
+
+    # Construct the release tag (channel is ignored in the actual release tag)
+    local release_tag="build-${latest_commit_sha}"
+
+    print_info "Looking for release: $release_tag"
+
     # Verify this release exists
-    local releases_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${expected_tag}"
+    local releases_url="https://api.github.com/repos/${GITHUB_REPO}/releases/tags/${release_tag}"
     local temp_release="/tmp/nockup-release-$$.json"
-    
+
     if ! download_file "$releases_url" "$temp_release"; then
-        print_error "Release not found for tag: $expected_tag"
+        print_error "Release not found for tag: $release_tag"
         print_info "The build may still be in progress"
         rm -f "$temp_release"
         return 1
     fi
-    
+
     # Extract version from release name
     local version=""
     version=$(grep -o "\"name\"[[:space:]]*:[[:space:]]*\"[^\"]*\"" "$temp_release" | \
               sed 's/"name"[[:space:]]*:[[:space:]]*"\([^"]*\)"/\1/' | head -1) || true
-    
+
     if [[ -z "$version" ]]; then
-        version=$(echo "$expected_tag" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') || version="latest"
+        version=$(echo "$release_tag" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+') || version="latest"
     fi
-    
+
     rm -f "$temp_release"
-    
-    echo "$expected_tag|$version"
+
+    echo "$release_tag|$version"
 }
 
 # Function to detect platform and architecture
@@ -430,7 +430,7 @@ main() {
     }
     trap cleanup EXIT
 
-    local archive_name="nockup-${CHANNEL}-latest-${target}.tar.gz"
+    local archive_name="nockup-${target}.tar.gz"
     local download_url="https://github.com/${GITHUB_REPO}/releases/download/${RELEASE_TAG}/${archive_name}"
     local archive_path="${temp_dir}/${archive_name}"
 
