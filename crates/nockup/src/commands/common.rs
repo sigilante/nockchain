@@ -173,7 +173,7 @@ async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
         ));
     }
 
-    let repo_templates_dir = temp_dir.join("templates");
+    let repo_templates_dir = temp_dir.join("crates/nockup/templates");
     if !repo_templates_dir.exists() {
         fs::remove_dir_all(&temp_dir).ok();
         return Err(anyhow::anyhow!(
@@ -190,7 +190,7 @@ async fn clone_templates(templates_dir: &PathBuf) -> Result<()> {
         Err(e) => return Err(e.into()),
     }
 
-    let repo_manifests_dir = temp_dir.join("manifests");
+    let repo_manifests_dir = temp_dir.join("crates/nockup/manifests");
     if !repo_manifests_dir.exists() {
         fs::remove_dir_all(&temp_dir).ok();
         return Err(anyhow::anyhow!(
