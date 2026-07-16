@@ -37,10 +37,27 @@
     |=  arg=load-kernel-state:dk
     ::  cut
     |^
-    =.  k  ~>  %bout  (update-constants (check-checkpoints (state-n-to-9 arg)))
-    =.  c.k  ~>  %bout  check-and-repair:con
+    ::  each stage is named before it runs so that the %bout durations, which
+    ::  print unlabelled, are attributable
+    ~>  %slog.[0 'load: begin']
+    =/  ks=kernel-state:dk
+      ~>  %slog.[0 'load: [1/5] state-n-to-9: migrating state to version 9']
+      ~>  %bout  (state-n-to-9 arg)
+    =.  ks
+      ~>  %slog.[0 'load: [2/5] check-checkpoints: verifying checkpointed digests']
+      ~>  %bout  (check-checkpoints ks)
+    =.  k
+      ~>  %slog.[0 'load: [3/5] update-constants']
+      ~>  %bout  (update-constants ks)
+    =.  c.k
+      ~>  %slog.[0 'load: [4/5] check-and-repair: validating consensus state']
+      ~>  %bout  check-and-repair:con
+    =.  c.k
+      ~>  %slog.[0 'load: [5/5] repair-orphaned-claims: releasing txs stranded by past reorgs']
+      ~>  %bout  repair-orphaned-claims:con
     ~|  %v1-phase-must-be-lte-asert-phase
     ?>  (lte v1-phase.constants.k asert-phase.constants.k)
+    ~>  %slog.[0 'load: complete']
     k
     ::  this arm should be renamed each state upgrade to state-n-to-[latest] and extended to loop through all upgrades
     ++  state-n-to-9
@@ -516,16 +533,18 @@
       `(bind (~(get h-by blocks.c.k) u.id) to-page:local-page:t)
     ::
         [%heaviest-chain ~]
+      ::  the tip, not highest-block-height: that is a monotone max over every
+      ::  accepted block, side chains included, so it names a height the
+      ::  heaviest chain need not have reached.
       ^-  (unit (unit [page-number:t block-id:t]))
-      ?~  highest=highest-block-height.d.k
+      ?~  heaviest-block.c.k
         [~ ~]
-      =/  block-id=(unit block-id:t)
-        (~(get z-by heaviest-chain.d.k) u.highest)
-      ?~  block-id
+      =/  lp=(unit local-page:t)  (~(get h-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp
         [~ ~]
       %-  some
       %-  some
-      [u.highest u.block-id]
+      [~(height get:local-page:t u.lp) u.heaviest-block.c.k]
     ::
         [%heaviest-chain-map ~]
       ^-  (unit (unit (z-map page-number:t block-id:t)))
@@ -595,15 +614,13 @@
       =/  first-name=hash:t  (from-b58:hash:t first-name.pole)
       ?~  heaviest-block.c.k
         [~ ~]
-      ?.  (~(has h-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp=(~(get h-by blocks.c.k) u.heaviest-block.c.k)
         [~ ~]
       ?~  bal=(~(get h-by balance.c.k) u.heaviest-block.c.k)
         [~ ~]
-      ?~  highest=highest-block-height.d.k
-        [~ ~]
       %-  some
       %-  some
-      :+  u.highest
+      :+  ~(height get:local-page:t u.lp)
         u.heaviest-block.c.k
       %-  ~(rep h-by u.bal)
       |=  [[k=nname:t v=nnote:t] bal=(z-map nname:t nnote:t)]
@@ -616,15 +633,13 @@
       =/  pubkey=schnorr-pubkey:t  (from-b58:schnorr-pubkey:t key-b58.pole)
       ?~  heaviest-block.c.k
         [~ ~]
-      ?.  (~(has h-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp=(~(get h-by blocks.c.k) u.heaviest-block.c.k)
         [~ ~]
       ?~  bal=(~(get h-by balance.c.k) u.heaviest-block.c.k)
         [~ ~]
-      ?~  highest=highest-block-height.d.k
-        [~ ~]
       %-  some
       %-  some
-      :+  u.highest
+      :+  ~(height get:local-page:t u.lp)
         u.heaviest-block.c.k
       %-  ~(rep h-by u.bal)
       |=  [[k=nname:t v=nnote:t] pub-bal=(z-map nname:t nnote:t)]
@@ -1379,13 +1394,40 @@
           ==
         [orphaned-block-span reorg-span effs]
       ::
+      ::  Update derived state BEFORE garbage collection, which needs the
+      ::  canonical page-number -> block-id index (heaviest-chain.d.k) to tell
+      ::  an orphaned block from one on the heaviest chain. On a reorg this
+      ::  index only names the winning chain once +update has run, so
+      ::  collecting first would classify blocks against the chain we just
+      ::  left. +update walks the heaviest chain's parents, which garbage
+      ::  collection never drops, and nothing between here and the old call
+      ::  site reads d.k -- so it is safe to hoist.
+      =.  d.k  (update:der c.k pag)
+      ::
+      ::  The reorg above abandoned the branch ending at .old-heavy. Hand that
+      ::  branch's transactions back to the mempool. +accept-block claimed every
+      ::  tx for the block that carried it, and until now nothing ever released
+      ::  an ACCEPTED block's claim (only +reject-pending-block, for pending
+      ::  ones) -- so every tx on an orphaned branch was stranded for good:
+      ::  invisible to the miner, never re-gossiped, never garbage collected,
+      ::  and with its inputs pinned in spent-by so no replacement tx could
+      ::  spend those notes either. Releasing here (rather than waiting for
+      ::  +sweep-orphan-blocks) is what makes an orphaned tx promptly mineable
+      ::  again. The blocks themselves stay in .blocks until the sweep retires
+      ::  them, so a chain that reorgs back is unaffected.
+      =?  c.k  is-reorg
+        ?~  old-heavy  c.k
+        (release-orphaned-branch:con u.old-heavy heaviest-chain.d.k)
+      ::
       ::  Garbage collect pending blocks and excluded transactions.
       ::  Garbage collection only runs when we receive a new heaviest
       ::  block, since that's when the block height advances and we can
       ::  determine what's expired. Pending blocks are removed based on
       ::  elapsed heaviest blocks since they were heard. Excluded txs are
       ::  removed based on the same criteria with the added check that they
-      ::  they aren't spent in the current heaviest chain.
+      ::  they aren't spent in the current heaviest chain -- which is also what
+      ::  drops a tx just handed back by +release-orphaned-branch above, if the
+      ::  winning chain spent its inputs via some other tx.
       =?  c.k  is-new-heaviest
         (garbage-collect:con retain.a.k)
       ::
@@ -1400,8 +1442,6 @@
       ::  tell the miner about the new block
       =.  m.k  (heard-new-block:min c.k now)
       ::
-      ::  update derived state
-      =.  d.k  (update:der c.k pag)
       ?.  =(old-heavy heaviest-block.c.k)
         =^  mining-effs  k  do-mine
         =.  effs  (weld mining-effs effs)

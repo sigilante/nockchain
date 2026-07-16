@@ -882,6 +882,231 @@
   ::
   ++  con  ;;(consensus-state c.internal.outer.nockchain)
   ::
+  ::  the derived state, whose .heaviest-chain is the canonical
+  ::  page-number -> block-id index used to tell an orphaned block from one on
+  ::  the heaviest chain.
+  ++  der  ;;(derived-state d.internal.outer.nockchain)
+  ::
+  ::  +strand-tx-on-block: put a tx back exactly the way the OLD kernel left it
+  ::  -- still held in raw-txs, still claimed by .bid, absent from excluded-txs.
+  ::
+  ::    Reproduces the pre-fix stranded state, which the current kernel will no
+  ::    longer produce on its own (+release-orphaned-branch frees the tx at reorg
+  ::    time). Note the result still satisfies +apt: the tx IS in exactly one of
+  ::    blocks-needed-by / excluded-txs. Nothing is structurally broken -- the
+  ::    claim is simply never released -- which is why the bug went unnoticed.
+  ++  strand-tx-on-block
+    |=  [=tx-id:t =block-id:t]
+    ^-  consensus-state
+    =/  c=consensus-state  con
+    =.  blocks-needed-by.c  (~(put h-ju blocks-needed-by.c) tx-id block-id)
+    =.  excluded-txs.c  (~(del h-in excluded-txs.c) tx-id)
+    c
+  ::
+  ::  +repair-orphans: the one-time repair +load runs on boot
+  ++  repair-orphans
+    |=  c=consensus-state
+    ^-  consensus-state
+    ~(repair-orphaned-claims dcon c bc)
+  ::
+  ::  +boot-with: run the kernel's REAL +load over a given consensus state, the
+  ::  way the runtime does when a new kernel is swapped in over existing state.
+  ::
+  ::    Calling +repair-orphaned-claims directly (via +repair-orphans above) only
+  ::    proves the repair logic works. This proves +load actually RUNS it, which
+  ::    is the part that can silently fail: if the wiring were wrong, or if
+  ::    heaviest-chain.d were not populated at load time, the repair would find
+  ::    no orphans, no-op, and leave every stranded tx stranded -- while the logs
+  ::    looked perfectly healthy. That is the failure this exercises.
+  ++  boot-with
+    |=  c=consensus-state
+    ^-  consensus-state
+    =/  ks  internal.outer.nockchain
+    =.  c.ks  c
+    =/  booted  (load:nockchain [%0 desk-hash.outer.nockchain ks])
+    ;;(consensus-state c.internal.outer.booted)
+  ::
+  ::  the page at the tip of the heaviest chain
+  ++  tip-page
+    ^-  page:t
+    (to-page:local-page:t (~(got h-by blocks:con) (need heaviest-block:con)))
+  ::
+  ::  +with-heaviest-block: .c with its tip moved to .block-id. Pair with
+  ::  +der-update to reach the state a reorg onto a shorter heavier chain
+  ::  leaves: a tip below blocks that are still held.
+  ++  with-heaviest-block
+    |=  [c=consensus-state =block-id:t]
+    ^-  consensus-state
+    =.  heaviest-block.c  `block-id
+    c
+  ::
+  ::  +der-update: the derived-state update, as +accept-block runs it
+  ++  der-update
+    |=  [d=derived-state c=consensus-state pag=page:t]
+    ^-  derived-state
+    (~(update dder d bc) c pag)
+  ::
+  ::  +release-branch: the live reorg release, as +accept-block runs it
+  ++  release-branch
+    |=  [c=consensus-state old-heavy=block-id:t hc=(z-map page-number:t block-id:t)]
+    ^-  consensus-state
+    (~(release-orphaned-branch dcon c bc) old-heavy hc)
+  ::
+  ++  heaviest-chain-at
+    |=  [d=derived-state =page-number:t]
+    ^-  (unit block-id:t)
+    (~(get z-by heaviest-chain.d) page-number)
+  ::
+  ++  put-heaviest-chain-at
+    |=  [d=derived-state =page-number:t =block-id:t]
+    ^-  derived-state
+    =.  heaviest-chain.d  (~(put z-by heaviest-chain.d) page-number block-id)
+    d
+  ::
+  ++  del-heaviest-chain-at
+    |=  [d=derived-state =page-number:t]
+    ^-  derived-state
+    =.  heaviest-chain.d  (~(del z-by heaviest-chain.d) page-number)
+    d
+  ::
+  ::  +with-con: this node, running on the given consensus state. Use to poke a
+  ::  node with a state +boot-with produced: +load returns the wrapper's outer
+  ::  core, which does not nest with the +k-by door's sample.
+  ++  with-con
+    |=  c=consensus-state
+    ^-  _nockchain
+    =/  n  nockchain
+    =.  c.internal.outer.n  c
+    n
+  ::
+  ::  membership probes against a bare consensus-state (rather than the kernel)
+  ++  con-excluded
+    |=  [c=consensus-state =tx-id:t]
+    (~(has h-in excluded-txs.c) tx-id)
+  ::
+  ++  con-claimed
+    |=  [c=consensus-state =tx-id:t]
+    (~(has h-by blocks-needed-by.c) tx-id)
+  ::
+  ++  con-raw-tx
+    |=  [c=consensus-state =tx-id:t]
+    (~(has h-by raw-txs.c) tx-id)
+  ::
+  ++  con-invariants
+    |=  c=consensus-state
+    ^-  (unit @tas)
+    ~(apt dcon c bc)
+  ::
+  ::  +con-referential-integrity: every cross-map reference in .c resolves.
+  ::  `~` means sound; each term names an invariant that broke.
+  ::
+  ::    Complements +apt, which checks only the raw-txs partition and nothing
+  ::    about the block-keyed maps agreeing with each other. Most of these break
+  ::    as a kernel crash on a `got`, not as a wrong answer.
+  ++  con-referential-integrity
+    |=  c=consensus-state
+    ^-  (list @tas)
+    =/  block-ids=(list block-id:t)  ~(tap h-in ~(key h-by blocks.c))
+    =/  has-block  |=(=block-id:t (~(has h-by blocks.c) block-id))
+    %+  murn
+      ^-  (list [m=@tas ok=?])
+      :~  ::  the tip itself must be a block we hold
+          :-  %dangling-heaviest-block
+          ?|  =(~ heaviest-block.c)
+              (has-block (need heaviest-block.c))
+          ==
+          ::  every block we hold carries its own derived entries. Two entries
+          ::  are legitimately absent and are NOT required here: .txs, which
+          ::  only a block that actually carried txs has, and .balance for
+          ::  GENESIS -- genesis has no coinbase, so +accept-page's fold over
+          ::  coinbases puts nothing. +get-cur-balance encodes that same
+          ::  exception: it returns an empty balance for a genesis tip and
+          ::  crashes only for a non-genesis one.
+          :-  %missing-balance
+          %+  levy  block-ids
+          |=  =block-id:t
+          ?:  .=  *page-number:t
+              ~(height get:local-page:t (~(got h-by blocks.c) block-id))
+            %.y
+          (~(has h-by balance.c) block-id)
+          :-  %missing-min-timestamp
+          (levy block-ids |=(=block-id:t (~(has h-by min-timestamps.c) block-id)))
+          :-  %missing-epoch-start
+          (levy block-ids |=(=block-id:t (~(has h-by epoch-start.c) block-id)))
+          :-  %missing-target
+          (levy block-ids |=(=block-id:t (~(has h-by targets.c) block-id)))
+          ::  +update-min-timestamps walks parents 11 deep and +accept-page one
+          ::  deep, both with `got`: a block whose parent was dropped crashes the
+          ::  kernel the moment a child of it arrives.
+          :-  %dangling-parent
+          %+  levy  block-ids
+          |=  =block-id:t
+          =/  lp  (~(got h-by blocks.c) block-id)
+          ?:  =(*page-number:t ~(height get:local-page:t lp))  %.y
+          (has-block ~(parent get:local-page:t lp))
+          ::  .epoch-start's VALUES are block-ids too, reaching up to
+          ::  blocks-per-epoch back
+          :-  %dangling-epoch-start
+          %+  levy  block-ids
+          |=  =block-id:t
+          ?.  (~(has h-by epoch-start.c) block-id)  %.y
+          (has-block (~(got h-by epoch-start.c) block-id))
+          ::  ...and nothing may be keyed by a block we no longer hold
+          :-  %orphaned-balance-key
+          (levy ~(tap h-in ~(key h-by balance.c)) has-block)
+          :-  %orphaned-txs-key
+          (levy ~(tap h-in ~(key h-by txs.c)) has-block)
+          :-  %orphaned-min-timestamps-key
+          (levy ~(tap h-in ~(key h-by min-timestamps.c)) has-block)
+          :-  %orphaned-epoch-start-key
+          (levy ~(tap h-in ~(key h-by epoch-start.c)) has-block)
+          :-  %orphaned-targets-key
+          (levy ~(tap h-in ~(key h-by targets.c)) has-block)
+      ==
+    |=  [m=@tas ok=?]
+    ^-  (unit @tas)
+    ?:(ok ~ `m)
+  ::
+  ::  +con-block-residue: which block-keyed maps still hold .block-id, in a
+  ::  fixed order. `~` means the block is gone from all of them.
+  ::
+  ::    Names every map rather than probing .blocks alone: deletion is
+  ::    all-or-nothing across them, and a .blocks-only probe reports a dropped
+  ::    .balance as clean.
+  ::
+  ::    A block that carried no txs legitimately has no .txs entry.
+  ++  con-block-residue
+    |=  [c=consensus-state =block-id:t]
+    ^-  (list @tas)
+    %+  murn
+      ^-  (list [m=@tas present=?])
+      :~  [%blocks (~(has h-by blocks.c) block-id)]
+          [%balance (~(has h-by balance.c) block-id)]
+          [%txs (~(has h-by txs.c) block-id)]
+          [%min-timestamps (~(has h-by min-timestamps.c) block-id)]
+          [%epoch-start (~(has h-by epoch-start.c) block-id)]
+          [%targets (~(has h-by targets.c) block-id)]
+      ==
+    |=  [m=@tas present=?]
+    ^-  (unit @tas)
+    ?:(present `m ~)
+  ::
+  ::  +consensus-invariants: the consensus state's own +apt check, as an oracle.
+  ::
+  ::    ~ means every structural invariant holds; a term names the one that
+  ::    broke. The interesting ones here are the raw-txs partition:
+  ::      %txs-fell-through-cracks  a raw-tx in NEITHER blocks-needed-by nor
+  ::                                excluded-txs -- stranded: unmineable,
+  ::                                un-re-gossiped, un-droppable.
+  ::      %excluded-txs-arent       a raw-tx in BOTH -- claimed by a block yet
+  ::                                also offered to the miner.
+  ::      %extra-excluded-txs       an excluded-tx we do not actually hold.
+  ::    Any code that moves txs between those sets should be asserted against
+  ::    this, not just against hand-picked membership checks.
+  ++  consensus-invariants
+    ^-  (unit @tas)
+    ~(apt dcon con bc)
+  ::
   ++  has-raw-tx
     |=  =tx-id:t
     (~(has h-by raw-txs:con) tx-id)
