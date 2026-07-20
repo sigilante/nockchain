@@ -1428,19 +1428,26 @@ fn strip_ansi(input: &str) -> String {
 
 fn extract_tx_id(output: &str) -> Option<String> {
     let sanitized = strip_ansi(output);
-    let regex = Regex::new(r"(?s)Validation for TX\s*([A-Za-z0-9\s]+?)\s+passed").ok()?;
-    let caps = regex.captures(&sanitized)?;
-    let id: String = caps
-        .get(1)?
-        .as_str()
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .collect();
-    if id.is_empty() {
-        None
-    } else {
-        Some(id)
+    let patterns = [
+        r"(?s)Validation for TX\s*([A-Za-z0-9\s]+?)\s+passed",
+        r"(?s)-\s*TX\s*([A-Za-z0-9\s]+?)\s+passed local",
+    ];
+    for pattern in patterns {
+        let regex = Regex::new(pattern).ok()?;
+        let Some(caps) = regex.captures(&sanitized) else {
+            continue;
+        };
+        let id: String = caps
+            .get(1)?
+            .as_str()
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .collect();
+        if !id.is_empty() {
+            return Some(id);
+        }
     }
+    None
 }
 
 fn extract_wallet_address(output: &str) -> Result<Option<String>> {
@@ -2222,13 +2229,19 @@ mod tests {
 
     #[test]
     fn extract_tx_id_accepts_wrapped_send_output() {
-        let output = "Sent Tx\n- Validation for TX \nA7gtG4Ku4kDhtxrQz21bUx1eaZ9U65ZWNuq7TM3WxmPd29G6dc\nRCToh passed. TX has been submitted to node.\n";
+        let old_output = "Sent Tx\n- Validation for TX \nA7gtG4Ku4kDhtxrQz21bUx1eaZ9U65ZWNuq7TM3WxmPd29G6dc\nRCToh passed. TX has been submitted to node.\n";
+        let current_output = "Broadcast Tx\n- TX 67kPbJJN9we22E6PSrsXHHT2sDgUG7uQE77ES2QwD8mVrrpcpYZa5\niK passed local \nvalidation and was broadcast to the node.\n";
 
-        let actual = crate::runner::extract_tx_id(output);
+        let old_actual = crate::runner::extract_tx_id(old_output);
+        let current_actual = crate::runner::extract_tx_id(current_output);
 
         assert_eq!(
-            actual.as_deref(),
+            old_actual.as_deref(),
             Some("A7gtG4Ku4kDhtxrQz21bUx1eaZ9U65ZWNuq7TM3WxmPd29G6dcRCToh")
+        );
+        assert_eq!(
+            current_actual.as_deref(),
+            Some("67kPbJJN9we22E6PSrsXHHT2sDgUG7uQE77ES2QwD8mVrrpcpYZa5iK")
         );
     }
 

@@ -5,7 +5,7 @@ use nockchain_libp2p_io::test_support::{
     base58_for_tip5_seed, collect_tip5_zset_strings_for_seeds,
     measure_realistic_heard_block_decode, measure_tip5_zset_traversal_for_seeds,
     observe_bounded_key_fair_queue_pressure, observe_mixed_peer_key_fair_queue_pressure,
-    QueuePressurePeer, ReqResKernelPressureProbe, ReqResStateBoundsProbe,
+    QueuePressurePeer, ReqResStateBoundsProbe,
 };
 
 #[test]
@@ -18,28 +18,6 @@ fn req_res_kernel_pressure_deep_zset_walk_is_iterative_and_ordered() {
     assert_eq!(tx_ids.len(), seeds.len());
     assert_eq!(tx_ids[0], base58_for_tip5_seed(0));
     assert_eq!(tx_ids[4095], base58_for_tip5_seed(4095));
-}
-
-#[test]
-fn req_res_kernel_pressure_speculative_tx_prefetch_claims_are_capped_and_deduped() {
-    let max_claims = 256;
-    let tx_ids = (0..(max_claims + 32))
-        .map(|idx| format!("tx-{idx:04}"))
-        .collect::<Vec<_>>();
-    let mut probe = ReqResKernelPressureProbe::new();
-
-    let first_claim = probe.claim_speculative_tx_prefetches(tx_ids.clone(), max_claims);
-    assert_eq!(first_claim.len(), max_claims);
-    assert_eq!(first_claim[0], "tx-0000");
-    assert_eq!(first_claim[255], "tx-0255");
-
-    let duplicate_claim = probe.claim_speculative_tx_prefetches(tx_ids.clone(), max_claims);
-    assert_eq!(duplicate_claim.len(), 32);
-    assert_eq!(duplicate_claim[0], "tx-0256");
-
-    probe.clear_speculative_tx_prefetch("tx-0000");
-    let reclaimed = probe.claim_speculative_tx_prefetches(tx_ids, 1);
-    assert_eq!(reclaimed, vec![String::from("tx-0000")]);
 }
 
 #[tokio::test]

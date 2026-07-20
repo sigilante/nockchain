@@ -17,7 +17,6 @@ use nockvm::noun::{Noun, NounSpace};
 use rand::prelude::SliceRandom;
 use tracing::{debug, info, trace, warn};
 
-use crate::catch_up::{CatchUpSignal, ModeTransition};
 use crate::ip_block::PeerExclusions;
 use crate::messages::{NockchainDataRequest, NockchainFact, NockchainRequest, RequestReplayKey};
 use crate::metrics::NockchainP2PMetrics;
@@ -30,7 +29,6 @@ use crate::tip5_util::tip5_hash_to_base58;
 
 const TX_SOURCE_HINT_CAP: usize = 65_536;
 const BLOCK_HEIGHT_ATTEMPT_CAP: usize = 65_536;
-const SPECULATIVE_TX_PREFETCH_CAP: usize = 8_192;
 const KERNEL_BLOCK_HEIGHT_REQUEST_CAP: usize = 65_536;
 const SEEN_BLOCKS_CAP: usize = 65_536;
 const BLOCK_RECEIPT_CAP: usize = 65_536;
@@ -52,7 +50,6 @@ pub(crate) const PROCESSING_CLAIM_TTL: Duration = Duration::from_secs(60);
 const RESPONSE_SIZE_HINT_CAP: usize = 16_384;
 const DEFERRED_HEARD_BLOCK_TOTAL_CAP: usize = 65_536;
 pub(crate) const DEFERRED_HEARD_BLOCK_PER_PEER_CAP: usize = 4_096;
-const OBSERVED_BLOCK_HEIGHT_CANDIDATE_CAP: usize = 65_536;
 const INBOUND_REPLAY_TOTAL_CAP: usize = 65_536;
 
 #[derive(Default)]
@@ -571,8 +568,6 @@ pub struct P2PState {
     metrics: Arc<NockchainP2PMetrics>,
     peer_stats_registry: Arc<PeerStatsRegistry>,
     block_id_to_peers: BTreeMap<String, BTreeSet<PeerId>>,
-    observed_block_height_candidates: BTreeMap<String, u64>,
-    observed_block_height_candidate_order: VecDeque<String>,
     block_first_seen_at: BTreeMap<String, Instant>,
     block_receipts: BTreeMap<String, BTreeSet<PeerId>>,
     block_receipt_order: VecDeque<String>,
@@ -618,7 +613,6 @@ pub struct P2PState {
     deferred_heard_block_total_count: usize,
     kernel_block_height_request_order: VecDeque<u64>,
     kernel_requested_block_heights: BTreeSet<u64>,
-    speculative_tx_prefetches: BTreeMap<String, Instant>,
     /// Peers that returned a `Decode` error for a block-with-txs bundle
     /// request. We stick them on this set so subsequent `by-height` requests
     /// to the same peer fall back to the classic `%block %by-height` shape
@@ -667,7 +661,6 @@ pub struct P2PState {
     pub first_negative: u64,
     pub seen_tx_clear_interval: u64,
     pub last_tx_cache_clear_height: u64,
-    catch_up: CatchUpSignal,
 }
 
 impl P2PState {
@@ -688,8 +681,6 @@ impl P2PState {
             metrics,
             peer_stats_registry,
             block_id_to_peers: BTreeMap::new(),
-            observed_block_height_candidates: BTreeMap::new(),
-            observed_block_height_candidate_order: VecDeque::new(),
             block_first_seen_at: BTreeMap::new(),
             block_receipts: BTreeMap::new(),
             block_receipt_order: VecDeque::new(),
@@ -731,7 +722,6 @@ impl P2PState {
             deferred_heard_block_total_count: 0,
             kernel_block_height_request_order: VecDeque::new(),
             kernel_requested_block_heights: BTreeSet::new(),
-            speculative_tx_prefetches: BTreeMap::new(),
             non_bundle_capable_peers: BTreeSet::new(),
             non_range_capable_peers: BTreeSet::new(),
             inflight_prefetches: BTreeMap::new(),
@@ -747,11 +737,8 @@ impl P2PState {
             first_negative: 0,
             seen_tx_clear_interval,
             last_tx_cache_clear_height: 0,
-            catch_up: CatchUpSignal::new(),
         };
-        state.update_req_res_inflight_metrics();
-        state.refresh_peer_stats_snapshot();
-        state.publish_catch_up_metrics();
+        state.publish_deferred_metrics();
         state
     }
 
@@ -1369,55 +1356,6 @@ impl P2PState {
             .insert(block_id_str);
     }
 
-    pub(crate) fn track_accepted_block_id_str_and_peer(
-        &mut self,
-        block_id_str: String,
-        peer_id: PeerId,
-    ) -> Option<u64> {
-        self.track_block_id_str_and_peer(block_id_str.clone(), peer_id);
-        let height = self.remove_observed_block_height_candidate(&block_id_str)?;
-        self.note_peer_observed_height(height);
-        Some(height)
-    }
-
-    pub(crate) fn record_observed_block_height_candidate(
-        &mut self,
-        block_id_str: String,
-        height: u64,
-    ) {
-        if !self
-            .observed_block_height_candidates
-            .contains_key(&block_id_str)
-        {
-            self.observed_block_height_candidate_order
-                .push_back(block_id_str.clone());
-        }
-        self.observed_block_height_candidates
-            .insert(block_id_str, height);
-        self.evict_observed_block_height_candidates();
-    }
-
-    pub(crate) fn remove_observed_block_height_candidate(
-        &mut self,
-        block_id_str: &str,
-    ) -> Option<u64> {
-        let height = self.observed_block_height_candidates.remove(block_id_str)?;
-        self.observed_block_height_candidate_order
-            .retain(|candidate| candidate != block_id_str);
-        Some(height)
-    }
-
-    fn evict_observed_block_height_candidates(&mut self) {
-        while self.observed_block_height_candidates.len() > OBSERVED_BLOCK_HEIGHT_CANDIDATE_CAP {
-            let Some(oldest_block_id) = self.observed_block_height_candidate_order.pop_front()
-            else {
-                break;
-            };
-            self.observed_block_height_candidates
-                .remove(&oldest_block_id);
-        }
-    }
-
     fn track_block_height_attempt_peer(&mut self, height: u64, peer_id: PeerId) {
         if !self.block_height_attempted_peers.contains_key(&height) {
             self.block_height_attempt_order.push_back(height);
@@ -1437,7 +1375,6 @@ impl P2PState {
     }
 
     pub(crate) fn remove_block_id_str(&mut self, block_id: &str) {
-        self.remove_observed_block_height_candidate(block_id);
         let Some(peers) = self.block_id_to_peers.remove(block_id) else {
             return;
         };
@@ -1540,6 +1477,23 @@ impl P2PState {
         }
     }
 
+    fn discard_deferred_blocks_for_peer(&mut self, peer_id: &PeerId) {
+        let mut removed = 0usize;
+        self.deferred_heard_blocks.retain(|_, blocks| {
+            let before = blocks.len();
+            blocks.retain(|_, block| &block.peer_id != peer_id);
+            removed = removed.saturating_add(before.saturating_sub(blocks.len()));
+            !blocks.is_empty()
+        });
+        if removed > 0 {
+            self.deferred_heard_block_total_count = self
+                .deferred_heard_block_total_count
+                .saturating_sub(removed);
+            self.deferred_heard_block_count_by_peer.remove(peer_id);
+            self.publish_deferred_metrics();
+        }
+    }
+
     fn clear_peer_session_state(&mut self, peer_id: &PeerId, clear_replay_cache: bool) {
         self.clear_outbound_requests_for_peer(peer_id);
         self.inbound_req_res_inflight.remove(peer_id);
@@ -1549,6 +1503,7 @@ impl P2PState {
         self.non_range_capable_peers.remove(peer_id);
         self.prefetch_peer_range_stats.remove(peer_id);
         self.prefetch_bandwidth_window.remove(peer_id);
+        self.discard_deferred_blocks_for_peer(peer_id);
         if clear_replay_cache {
             self.clear_inbound_replay_cache_for_peer(peer_id);
         }
@@ -1686,49 +1641,6 @@ impl P2PState {
 
     pub fn remove_tx_id_hint(&mut self, tx_id: &str) {
         self.remove_tx_id_str(tx_id);
-    }
-
-    fn evict_expired_speculative_tx_prefetches(&mut self, now: Instant) {
-        self.speculative_tx_prefetches
-            .retain(|_, expires_at| *expires_at > now);
-    }
-
-    pub fn claim_speculative_tx_prefetch_ids<I>(
-        &mut self,
-        tx_ids: I,
-        ttl: Duration,
-        max_claims: usize,
-    ) -> Vec<String>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        if max_claims == 0 {
-            return Vec::new();
-        }
-
-        let now = Instant::now();
-        self.evict_expired_speculative_tx_prefetches(now);
-        let expires_at = now + ttl;
-        let mut claimed = Vec::new();
-        for tx_id in tx_ids {
-            if claimed.len() >= max_claims
-                || self.speculative_tx_prefetches.len() >= SPECULATIVE_TX_PREFETCH_CAP
-            {
-                break;
-            }
-            if self.seen_txs.contains(&tx_id) || self.speculative_tx_prefetches.contains_key(&tx_id)
-            {
-                continue;
-            }
-            self.speculative_tx_prefetches
-                .insert(tx_id.clone(), expires_at);
-            claimed.push(tx_id);
-        }
-        claimed
-    }
-
-    pub fn clear_speculative_tx_prefetch(&mut self, tx_id: &str) {
-        self.speculative_tx_prefetches.remove(tx_id);
     }
 
     /// Mark a peer as non-bundle-capable so future `%block %by-height`
@@ -1952,17 +1864,6 @@ impl P2PState {
         self.prefetch_height_failure_budget = budget;
         self.prefetch_stuck_backoff = backoff;
         self.prefetch_bandwidth_cap_per_peer_bytes_per_min = bandwidth_cap_bytes_per_min;
-    }
-
-    pub fn set_catch_up_config(
-        &mut self,
-        behind_tip_threshold: u64,
-        peer_observed_threshold: u64,
-        hysteresis: Duration,
-    ) {
-        self.catch_up
-            .configure(behind_tip_threshold, peer_observed_threshold, hysteresis);
-        self.publish_catch_up_metrics();
     }
 
     pub fn prefetch_height_failure_budget(&self) -> u8 {
@@ -2205,7 +2106,7 @@ impl P2PState {
             }
         }
         if removed_any {
-            self.note_deferred_changed();
+            self.publish_deferred_metrics();
         }
         removed_any
     }
@@ -2549,101 +2450,16 @@ impl P2PState {
         ready
     }
 
-    fn deferred_max_height(&self) -> Option<u64> {
-        self.deferred_heard_blocks.last_key_value().map(|(h, _)| *h)
-    }
-
     fn note_deferred_changed(&mut self) {
-        let max = self.deferred_max_height();
-        let transition = self.catch_up.note_deferred_max_height(Instant::now(), max);
-        self.publish_catch_up_metrics();
-        self.log_mode_transition(transition);
+        self.publish_deferred_metrics();
     }
 
-    /// Notify the catch-up signal that the kernel-frontier `first_negative`
-    /// advanced. The driver `%seen %block` handler updates `first_negative`
-    /// directly; calling this immediately after keeps the signal in lockstep.
-    pub fn note_frontier_advanced(&mut self) {
-        let frontier = self.first_negative;
-        let transition = self
-            .catch_up
-            .note_frontier_advance(Instant::now(), frontier);
-        self.publish_catch_up_metrics();
-        self.log_mode_transition(transition);
-    }
-
-    /// Notify the catch-up signal that we observed a successful block
-    /// response at `height`. Drives `peer_observed_max_height`.
-    pub fn note_peer_observed_height(&mut self, height: u64) {
-        let transition = self
-            .catch_up
-            .note_peer_response_height(Instant::now(), height);
-        self.publish_catch_up_metrics();
-        self.log_mode_transition(transition);
-    }
-
-    /// Read-only view of the catch-up signal.
-    #[allow(dead_code)]
-    pub fn catch_up_signal(&self) -> &CatchUpSignal {
-        &self.catch_up
-    }
-
-    fn refresh_catch_up_mode(&mut self, now: Instant) {
-        let transition = self.catch_up.refresh_mode(now);
-        self.publish_catch_up_metrics();
-        self.log_mode_transition(transition);
-    }
-
-    /// Whether outgoing gossip should be suppressed right now.
-    /// True only while the catch-up signal reports `CatchingUp` (demonstrably
-    /// behind tip). This deliberately covers every outbound gossip effect:
-    /// historic block rebroadcasts, tx submission gossip, and mining output.
-    /// A catching-up node is not allowed to originate gossip until it returns
-    /// to `Tip`.
-    pub fn should_suppress_outgoing_gossip(&mut self) -> bool {
-        self.refresh_catch_up_mode(Instant::now());
-        self.catch_up.is_catching_up()
-    }
-
-    fn publish_catch_up_metrics(&self) {
-        let _ = self
-            .metrics
-            .sync_mode
-            .swap(self.catch_up.mode().as_metric_value());
-        let _ = self
-            .metrics
-            .behind_tip_estimate
-            .swap(self.catch_up.behind_tip_estimate() as f64);
-        let _ = self
-            .metrics
-            .deferred_blocks_above_frontier
-            .swap(self.catch_up.deferred_blocks_above_frontier() as f64);
-        let _ = self
-            .metrics
-            .peer_observed_max_height
-            .swap(self.catch_up.peer_observed_max_height() as f64);
+    fn publish_deferred_metrics(&self) {
         let _ = self
             .metrics
             .prefetch_buffer_size
             .swap(self.deferred_heard_block_total() as f64);
     }
-
-    fn log_mode_transition(&self, transition: Option<ModeTransition>) {
-        let Some(transition) = transition else {
-            return;
-        };
-        self.metrics.sync_mode_transitions_total.increment();
-        trace!(
-            from = transition.from.as_str(),
-            to = transition.to.as_str(),
-            frontier = self.catch_up.frontier(),
-            max_deferred = self.catch_up.max_deferred_height(),
-            peer_observed = self.catch_up.peer_observed_max_height(),
-            behind_tip_estimate = self.catch_up.behind_tip_estimate(),
-            "sync mode transition"
-        );
-    }
-
     #[cfg(test)]
     pub fn deferred_heard_block_heights(&self) -> Vec<u64> {
         self.deferred_heard_blocks.keys().copied().collect()
@@ -2660,11 +2476,6 @@ impl P2PState {
             .get(&height)
             .map(|blocks| blocks.values().map(|block| block.source).collect())
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub fn speculative_tx_prefetch_count(&self) -> usize {
-        self.speculative_tx_prefetches.len()
     }
 
     /// Returns true if we are tracking a given block ID.
@@ -4312,10 +4123,6 @@ mod tests {
         // Create another block ID that both peers will share
         let other_block_id = T(&mut slab, &[D(6), D(7), D(8), D(9), D(10)]);
         let space = slab.noun_space();
-        let bad_block_id_str =
-            tip5_hash_to_base58(block_id_tuple, &space).expect("block id should encode");
-        tracker.record_observed_block_height_candidate(bad_block_id_str.clone(), 999);
-
         // Track both block IDs with both peers
         tracker
             .track_block_id_and_peer(block_id_tuple, peer_id1, &space)
@@ -4386,11 +4193,6 @@ mod tests {
         // Verify the other block ID is also no longer tracked
         // (since we removed the peers entirely)
         assert!(!tracker.is_tracking_block_id(other_block_id, &space));
-        assert_eq!(
-            tracker.track_accepted_block_id_str_and_peer(bad_block_id_str, peer_id1),
-            None,
-            "bad block processing should clear the pending observed-height candidate"
-        );
     }
 
     #[test]
@@ -4569,182 +4371,6 @@ mod tests {
         let inner = T(&mut slab, &[D(1), D(2)]);
         slab.set_root(inner);
         NockchainFact::HeardBlock(String::from("dummy"), slab)
-    }
-
-    #[test]
-    fn catch_up_signal_starts_cold() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::Cold
-        );
-        assert_eq!(state.catch_up_signal().behind_tip_estimate(), 0);
-
-        // Advance frontier from 0 -> 1 with no backlog: cold flips to Tip.
-        state.first_negative = 1;
-        state.note_frontier_advanced();
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::Tip
-        );
-        assert_eq!(state.catch_up_signal().frontier(), 1);
-    }
-
-    #[test]
-    fn catch_up_signal_picks_up_deferred_backlog() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let peer_id = PeerId::random();
-        // Defer 10 future blocks at heights 100..=109, well above the
-        // BEHIND_TIP_DEFERRED_THRESHOLD of 8.
-        for height in 100..110u64 {
-            state.defer_heard_block(
-                peer_id,
-                height,
-                format!("block-{height}"),
-                dummy_heard_block_fact(),
-            );
-        }
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::CatchingUp
-        );
-        assert_eq!(state.catch_up_signal().max_deferred_height(), 109);
-        // No frontier advance yet, so behind_tip_estimate is the deferred max.
-        assert_eq!(state.catch_up_signal().behind_tip_estimate(), 109);
-    }
-
-    #[test]
-    fn suppress_outgoing_gossip_only_while_catching_up() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        // Cold at boot: do not suppress (we don't yet know we're behind).
-        assert!(!state.should_suppress_outgoing_gossip());
-
-        // Build a deferred backlog above the threshold -> CatchingUp -> suppress.
-        let peer_id = PeerId::random();
-        for height in 100..110u64 {
-            state.defer_heard_block(
-                peer_id,
-                height,
-                format!("block-{height}"),
-                dummy_heard_block_fact(),
-            );
-        }
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::CatchingUp
-        );
-        assert!(state.should_suppress_outgoing_gossip());
-
-        // A separate node that advances frontier with no backlog reaches Tip
-        // and must not suppress.
-        let mut tip_state = P2PState::new(isolated_test_metrics(), 100);
-        tip_state.first_negative = 1;
-        tip_state.note_frontier_advanced();
-        assert_eq!(
-            tip_state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::Tip
-        );
-        assert!(!tip_state.should_suppress_outgoing_gossip());
-    }
-
-    #[test]
-    fn suppress_outgoing_gossip_refreshes_hysteresis_before_reading() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let now = Instant::now();
-
-        state.catch_up.note_deferred_max_height(now, Some(100));
-        state.catch_up.note_frontier_advance(now, 1);
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::CatchingUp
-        );
-
-        let drained_at = now + Duration::from_millis(10_000);
-        state.catch_up.note_deferred_max_height(drained_at, None);
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::CatchingUp
-        );
-
-        let past_hysteresis = drained_at + Duration::from_millis(30_001);
-        state.refresh_catch_up_mode(past_hysteresis);
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::Tip
-        );
-        assert!(!state.catch_up_signal().is_catching_up());
-    }
-
-    #[test]
-    fn catch_up_signal_records_peer_observed_height() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        state.note_peer_observed_height(500);
-        assert_eq!(state.catch_up_signal().peer_observed_max_height(), 500);
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::CatchingUp
-        );
-    }
-
-    #[test]
-    fn accepted_block_tracking_consumes_observed_height_candidate() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let peer_id = PeerId::random();
-        let block_id = String::from("block-42");
-
-        state.record_observed_block_height_candidate(block_id.clone(), 42);
-        assert_eq!(state.catch_up_signal().peer_observed_max_height(), 0);
-
-        assert_eq!(
-            state.track_accepted_block_id_str_and_peer(block_id.clone(), peer_id),
-            Some(42)
-        );
-        assert_eq!(state.catch_up_signal().peer_observed_max_height(), 42);
-        assert_eq!(
-            state.track_accepted_block_id_str_and_peer(block_id, peer_id),
-            None,
-            "accepted height candidate should be consumed once"
-        );
-    }
-
-    #[test]
-    fn removing_block_id_clears_observed_height_candidate() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let peer_id = PeerId::random();
-        let block_id = String::from("block-to-remove");
-
-        state.record_observed_block_height_candidate(block_id.clone(), 88);
-        state.track_block_id_str_and_peer(block_id.clone(), peer_id);
-        state.remove_block_id_str(&block_id);
-
-        assert_eq!(
-            state.track_accepted_block_id_str_and_peer(block_id, peer_id),
-            None
-        );
-        assert_eq!(state.catch_up_signal().peer_observed_max_height(), 0);
-    }
-
-    #[test]
-    fn observed_height_candidate_cap_evicts_oldest_entry() {
-        let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let peer_id = PeerId::random();
-
-        for idx in 0..=OBSERVED_BLOCK_HEIGHT_CANDIDATE_CAP {
-            state.record_observed_block_height_candidate(format!("block-{idx}"), idx as u64);
-        }
-
-        assert_eq!(
-            state.track_accepted_block_id_str_and_peer(String::from("block-0"), peer_id),
-            None,
-            "oldest candidate should be evicted when the cap is exceeded"
-        );
-        assert_eq!(
-            state.track_accepted_block_id_str_and_peer(
-                format!("block-{OBSERVED_BLOCK_HEIGHT_CANDIDATE_CAP}"),
-                peer_id,
-            ),
-            Some(OBSERVED_BLOCK_HEIGHT_CANDIDATE_CAP as u64)
-        );
     }
 
     #[test]
@@ -5159,7 +4785,6 @@ mod tests {
         assert!(!state.prefetch_peer_range_stats.contains_key(&peer));
         assert!(!state.has_inbound_replay(peer, replay_key, Duration::from_secs(60)));
     }
-
     #[test]
     fn request_peer_selection_interleaves_ip_buckets() {
         let mut state = P2PState::new(isolated_test_metrics(), 100);
@@ -5300,28 +4925,44 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_signal_max_deferred_drops_when_drained() {
+    fn peer_cleanup_discards_only_its_deferred_blocks() {
         let mut state = P2PState::new(isolated_test_metrics(), 100);
-        let peer_id = PeerId::random();
-        for height in 1..=4u64 {
-            state.defer_heard_block(
-                peer_id,
-                height,
-                format!("block-{height}"),
-                dummy_heard_block_fact(),
-            );
-        }
-        // 4 deferred but threshold is 8: not yet CatchingUp.
-        assert_eq!(
-            state.catch_up_signal().mode(),
-            crate::catch_up::SyncMode::Cold
+        let attacker = PeerId::random();
+        let honest = PeerId::random();
+
+        state.defer_heard_block(
+            attacker,
+            50,
+            String::from("attacker-50"),
+            dummy_heard_block_fact(),
+        );
+        state.defer_heard_block(
+            attacker,
+            60,
+            String::from("attacker-60"),
+            dummy_heard_block_fact(),
+        );
+        state.defer_heard_block(
+            honest,
+            50,
+            String::from("honest-50"),
+            dummy_heard_block_fact(),
+        );
+        state.defer_heard_block(
+            honest,
+            70,
+            String::from("honest-70"),
+            dummy_heard_block_fact(),
         );
 
-        // Advance frontier past all of them, then drain.
-        state.first_negative = 5;
-        state.note_frontier_advanced();
-        let drained = state.take_ready_deferred_heard_blocks();
-        assert_eq!(drained.len(), 4);
-        assert_eq!(state.catch_up_signal().max_deferred_height(), 0);
+        assert_eq!(state.deferred_heard_block_total(), 4);
+
+        state.remove_peer(&attacker);
+
+        assert_eq!(state.deferred_heard_block_total(), 2);
+        assert!(state.has_deferred_block_at_height(50));
+        assert!(!state.has_deferred_block_at_height(60));
+        assert!(state.has_deferred_block_at_height(70));
+        assert_eq!(state.deferred_heard_block_heights(), vec![50, 70]);
     }
 }

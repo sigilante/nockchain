@@ -639,41 +639,6 @@ impl Default for ReqResLiarBanProbe {
     }
 }
 
-pub struct ReqResKernelPressureProbe {
-    state: P2PState,
-}
-
-impl ReqResKernelPressureProbe {
-    pub fn new() -> Self {
-        let metrics_registry = gnort::MetricsRegistry::new(gnort::RegistryConfig::default());
-        let metrics = Arc::new(
-            NockchainP2PMetrics::register(&metrics_registry).expect("Could not register metrics"),
-        );
-        Self {
-            state: P2PState::new(metrics, LibP2PConfig::default().seen_tx_clear_interval),
-        }
-    }
-
-    pub fn claim_speculative_tx_prefetches(
-        &mut self,
-        tx_ids: Vec<String>,
-        max_claims: usize,
-    ) -> Vec<String> {
-        self.state
-            .claim_speculative_tx_prefetch_ids(tx_ids, Duration::from_secs(15), max_claims)
-    }
-
-    pub fn clear_speculative_tx_prefetch(&mut self, tx_id: &str) {
-        self.state.clear_speculative_tx_prefetch(tx_id);
-    }
-}
-
-impl Default for ReqResKernelPressureProbe {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyFairQueuePressureObservation {
     pub per_key_rejected: bool,

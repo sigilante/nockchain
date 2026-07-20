@@ -19,7 +19,6 @@ use tracing::{debug, trace, warn};
 use crate::driver::gen2::*;
 use crate::driver::{
     record_local_peer_abuse, Libp2pWire, LocalPeerAbuseKind, LocalPeerAbuseSeverity, SwarmAction,
-    SwarmActionDispatcher,
 };
 use crate::ip_block::PeerExclusions;
 use crate::messages::{
@@ -320,7 +319,6 @@ pub(super) async fn handle_inbound_request(
                 trace!("handle_request_response: Gossip noun parsed");
                 let driver_state_for_poke = driver_state.clone();
                 let metrics_for_poke = metrics.clone();
-                let swarm_tx_for_poke = swarm_tx.clone();
 
                 let send_response: tokio::task::JoinHandle<Result<(), NockAppError>> =
                     tokio::spawn(async move {
@@ -401,24 +399,19 @@ pub(super) async fn handle_inbound_request(
                             let inserted =
                                 state_guard.defer_heard_block(peer, height, block_id.clone(), gossip);
                             drop(state_guard);
-                            let speculative_prefetch_count =
-                                if let Some(tx_ids) = heard_block_tx_ids.as_ref() {
-                                    let mut swarm_actions =
-                                        SwarmActionDispatcher::Channel(&swarm_tx_for_poke);
-                                    track_future_heard_block_tx_hints_and_prefetch(
-                                        peer, tx_ids, &track_state_arc, &mut swarm_actions,
-                                    )
+                            let tx_hint_count = if let Some(tx_ids) = heard_block_tx_ids.as_ref() {
+                                track_future_heard_block_tx_hints(peer, tx_ids, &track_state_arc)
                                     .await?
-                                } else {
-                                    0
-                                };
+                            } else {
+                                0
+                            };
                             trace!(
                                 peer = %peer,
                                 block_id = %block_id,
                                 height,
                                 frontier,
                                 inserted,
-                                speculative_prefetch_count,
+                                tx_hint_count,
                                 "Deferred future heard-block gossip before kernel poke"
                             );
                             return Ok(());

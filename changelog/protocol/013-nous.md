@@ -316,17 +316,17 @@ Primary insertion points:
 - `open/crates/nockchain-libp2p-io/src/driver/gen2/outbound.rs` and `open/crates/nockchain-libp2p-io/src/driver/gen2/responses.rs` for batch result unpacking and fact routing.
 - `open/crates/nockchain-libp2p-io/src/p2p_state.rs` for per-peer inflight accounting, active request dedupe, range capability state, deferred prefetch coverage, and response-size hints.
 
-### Capability-Aware Catch-Up Prefetch Peer Selection
+### Capability-Aware Kernel-Demand Range Prefetch Peer Selection
 
 Problem statement:
-- A catching-up requester may know a backbone peer supports `gen2`, but the current prefetch peer chooser can select an unrelated connected peer first.
+- A requester with deep kernel block-height demand may know a backbone peer supports `gen2`, but the prefetch peer chooser can select an unrelated connected peer first.
 - If that selected peer is not known to support `gen2`, the driver suppresses the full range shape and falls back to a classic `BlockByHeight` singleton for the requested start height.
-- If that peer does not complete the range request, stable peer ordering can pin the catch-up loop to the same ineffective peer.
-- The desired behavior is to route catch-up range work only to peers with the protocol and shape capability needed to serve it, then adapt quickly when observed behavior contradicts the current belief.
+- If that peer does not complete the range request, stable peer ordering can pin the range-fetch loop to the same ineffective peer.
+- The desired behavior is to route range work only to peers with the protocol and shape capability needed to serve it, then adapt quickly when observed behavior contradicts the current belief.
 
 Request classes:
-- `BlockRangeWithTxs` is the catch-up prefetch range request shape.
-- `BlockRangeWithTxs` is issued only when `prefetch_enabled=true`, the request height is nonzero, the sync mode is `Cold` or `CatchingUp` or kernel demand is deep enough, and the prefetch window knobs are nonzero.
+- `BlockRangeWithTxs` is the kernel-demand range prefetch request shape.
+- `BlockRangeWithTxs` is issued only when `prefetch_enabled=true`, the request height is nonzero, kernel demand is at least `prefetch_kernel_demand_threshold` blocks beyond the current frontier, and the prefetch window knobs are nonzero.
 - `BlockRangeWithTxs` is carried over gen2 batching when the selected peer advertises inbound gen2 and outbound gen2 send is enabled.
 - `BlockRangeWithTxs` MUST NOT be sent as a blind `gen1` range request to a peer whose range capability is `Unknown` or `Unsupported`.
 - `gen1` block-by-height singleton fallback remains valid and MUST stay available when no range-capable `gen2` peer is eligible.
@@ -365,7 +365,7 @@ Capability update rules:
 
 Eligibility gate:
 
-A peer is eligible for normal catch-up range prefetch only if all of the following are true:
+A peer is eligible for normal kernel-demand range prefetch only if all of the following are true:
 - The peer is currently connected.
 - The peer is known as `Gen2`.
 - `range_capability == Supported`.
@@ -464,13 +464,11 @@ Configuration keys and constants:
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `prefetch_enabled` | `false` | Enable catch-up range prefetch and the capability-aware selector |
-| `prefetch_window_initial` | `4` | Minimum requested range window |
-| `prefetch_window_max` | `64` | Maximum requested range window |
-| `prefetch_behind_threshold` | `8` | Deferred-buffer threshold and kernel-demand threshold used by prefetch eligibility |
-| `prefetch_peer_observed_threshold` | `32` | Peer-observed height gap threshold for catch-up mode |
-| `prefetch_hysteresis_ms` | `30000` | Catch-up exit hysteresis |
-| `prefetch_max_inflight_per_peer` | `2` | Per-peer range prefetch inflight cap |
+| `prefetch_enabled` | `true` | Enable kernel-demand range prefetch and the capability-aware selector |
+| `prefetch_window_initial` | `16` | Minimum requested range window |
+| `prefetch_window_max` | `128` | Maximum requested range window |
+| `prefetch_kernel_demand_threshold` | `8` | Kernel-demand depth above frontier required for range prefetch eligibility |
+| `prefetch_max_inflight_per_peer` | `4` | Per-peer range prefetch inflight cap |
 | `prefetch_height_failure_budget` | `8` | Per-height singleton retry budget before stuck backoff |
 | `prefetch_stuck_backoff_secs` | `20` | Per-height stuck backoff |
 | `prefetch_bandwidth_cap_per_peer_bytes_per_min` | `209715200` | Per-peer prefetch byte cap over a 60s window |
@@ -479,8 +477,6 @@ Configuration keys and constants:
 | `PREFETCH_PEER_COOLDOWN_MAX` | `60s` | Compile-time maximum range failure cooldown |
 | `PREFETCH_PEER_ACTIVE_REQUEST_BIAS` | `1.5` | Compile-time inflight penalty exponent |
 | `PREFETCH_PEER_EWMA_ALPHA` | `0.2` | Compile-time EWMA update factor for range response bytes and RTT |
-
-The shipped default for `prefetch_enabled` remains `false`.
 
 ### Backpressure and Flow Control
 
@@ -619,13 +615,11 @@ Recommended key names:
 | `gen2_batch_coalesce_window_ms`     | `10`            | Coalescing window                                         |
 | `gen2_max_inflight_per_peer`        | `32`            | Per-peer inflight req-res cap                             |
 | `gen2_swarm_action_queue_capacity`  | `1000`          | Bounded driver queue size for swarm actions               |
-| `prefetch_enabled`                  | `false`         | Enable catch-up range prefetch                            |
-| `prefetch_window_initial`           | `4`             | Initial range prefetch window                             |
-| `prefetch_window_max`               | `64`            | Maximum range prefetch window                             |
-| `prefetch_behind_threshold`         | `8`             | Deferred backlog and kernel-demand threshold              |
-| `prefetch_peer_observed_threshold`  | `32`            | Peer-observed height threshold for catch-up mode          |
-| `prefetch_hysteresis_ms`            | `30000`         | Catch-up exit hysteresis                                  |
-| `prefetch_max_inflight_per_peer`    | `2`             | Per-peer range prefetch inflight cap                      |
+| `prefetch_enabled`                  | `true`          | Enable kernel-demand range prefetch                       |
+| `prefetch_window_initial`           | `16`            | Initial range prefetch window                             |
+| `prefetch_window_max`               | `128`           | Maximum range prefetch window                             |
+| `prefetch_kernel_demand_threshold`  | `8`             | Kernel-demand depth above frontier for range prefetch     |
+| `prefetch_max_inflight_per_peer`    | `4`             | Per-peer range prefetch inflight cap                      |
 | `prefetch_height_failure_budget`    | `8`             | Per-height retry budget before stuck backoff              |
 | `prefetch_stuck_backoff_secs`       | `20`            | Per-height stuck backoff                                  |
 | `prefetch_bandwidth_cap_per_peer_bytes_per_min` | `209715200` | Per-peer range prefetch byte cap over 60s |
@@ -696,17 +690,12 @@ Required transport metrics:
 - `gen2_batch_pending_peers`
 - `req_res_retry_scheduled_total`
 - `req_res_effect_dedup_suppressed`
-- catch-up/prefetch metrics:
-  - `sync_mode`
-  - `sync_mode_transitions_total`
-  - `behind_tip_estimate`
-  - `deferred_blocks_above_frontier`
-  - `peer_observed_max_height`
+- range-prefetch metrics:
   - `prefetch_cache_hits_total`
   - `prefetch_cache_misses_total`
   - `prefetch_buffer_size`
   - `prefetch_issued_total`
-  - `prefetch_singleton_suppressed_total`
+  - `prefetch_duplicate_range_avoided_total`
   - `prefetch_no_eligible_peer_total`
   - `prefetch_invalidated_total`
   - `prefetch_height_stuck_total`
@@ -730,7 +719,7 @@ Required logs:
 - batch response item/failure counts
 - queue saturation decisions (reject/defer)
 - dedupe suppression decisions (request key and reason)
-- catch-up prefetch issuance decisions, including selected peer, request range, mode, response estimates, and probe flag
+- range prefetch issuance decisions, including selected peer, request range, response estimates, and probe flag
 - suppression of range prefetch when only `gen1` peers or no eligible range peers are available
 - range, bundle, and singleton fallback decisions
 
@@ -852,14 +841,14 @@ Operator-facing impact:
 - Additional metrics/logs are required for rollout safety (generation selection, fallback rates, dedupe suppressions, queue pressure).
 - Optional `BlockWithTxsByHeight` bundle requests can carry a block fact plus raw transaction facts, bounded by `gen2_item_max_bytes`.
 - Optional `BlockRangeWithTxs` prefetch can carry a contiguous prefix of bundled blocks, bounded by `gen2_block_batch_max_response_bytes`.
-- Catch-up prefetch should stop pinning to the first lexicographic peer and should prefer peers that have demonstrated `gen2` range service.
+- Range prefetch should stop pinning to the first lexicographic peer and should prefer peers that have demonstrated `gen2` range service.
 - Networks with no range-capable `gen2` peers should degrade to singleton block fetch rather than repeating full range attempts against incapable peers.
 
 Rollout risk and mitigation:
 - Mixed-version networks remain supported through gen1 fallback.
 - Operators can disable gen2 send (`req_res_gen2_send_enabled=false`) as a rollback lever while still accepting gen2 if needed.
 - Operators can disable bundle upgrades with `req_res_gen2_bundle_enabled=false`.
-- Operators can disable catch-up range prefetch and its selector with `prefetch_enabled=false` while leaving the rest of Nous enabled.
+- Operators can disable kernel-demand range prefetch and its selector with `prefetch_enabled=false` while leaving the rest of Nous enabled.
 
 ## Testing and Validation
 
@@ -970,7 +959,7 @@ Scope: these gates verify the transport-layer batching primitive, the "supply si
 | A fully disabled node remains gen1-only inside a gen2-active network | `tests/req_res_gen2_e2e.rs` | `nix develop -c ./scripts/test-req-res-gen2-e2e.sh --cargo-only` | `req_res_full_disable_peer_stays_gen1_only_in_gen2_network` |
 | Gossip traffic remains singleton while gen2 batching is active | `tests/req_res_gen2_e2e.rs` | `nix develop -c ./scripts/test-req-res-gen2-e2e.sh --cargo-only` | `req_res_gen2_batching_keeps_gossip_singleton` |
 | Gen2 PoW preimage uses explicit domain separation and canonical batch bytes | `src/messages.rs`, `src/cbor_tests.rs` | `nix develop -c cargo test -p nockchain-libp2p-io --lib -- --nocapture` | `test_gen2_pow_preimage_matches_spec_layout`, `test_batch_request_pow_verification_roundtrip` |
-| Catch-up range prefetch selects only range-capable gen2 peers, probes unknown peers with bounded range length, and falls back to singleton block fetch when no safe range peer exists | `src/driver.rs`, `src/p2p_state.rs`, `src/metrics.rs`, `tests/req_res_gen2_e2e.rs` | `nix develop -c cargo test -p nockchain-libp2p-io prefetch_ -- --nocapture` and `nix develop -c ./scripts/test-req-res-gen2-e2e.sh --cargo-only` | selector unit tests for eligibility, weighted rendezvous ranking, cooldown, probe bounds, and singleton fallback; e2e transcript showing no full range request to gen1-only peers |
+| Kernel-demand range prefetch selects only range-capable gen2 peers, probes unknown peers with bounded range length, and falls back to singleton block fetch when no safe range peer exists | `src/driver.rs`, `src/p2p_state.rs`, `src/metrics.rs`, `tests/req_res_gen2_e2e.rs` | `nix develop -c cargo test -p nockchain-libp2p-io prefetch_ -- --nocapture` and `nix develop -c ./scripts/test-req-res-gen2-e2e.sh --cargo-only` | selector unit tests for eligibility, weighted rendezvous ranking, cooldown, probe bounds, and singleton fallback; e2e transcript showing no full range request to gen1-only peers |
 
 Edge-case audit note (2026-03-24):
 - The request vocabulary now includes singleton requests plus `BlockWithTxsByHeight` and `BlockRangeWithTxs { start_height, len }`. `BlockRangeWithTxs` is the only count-bearing request shape, and the responder may return a contiguous prefix shorter than `len` when the chain ends, a gap is found, or the response budget fills. Bounds, prefix behavior, and singleton fallback are covered by driver and gen2 request-execution tests.
@@ -1054,7 +1043,7 @@ Rationale captured in `config.rs`:
 - per-peer inflight cap enforcement
 - sender retry/backoff behavior under repeated backpressure
 
-### F. Catch-Up Peer Selection
+### F. Kernel-Demand Range Peer Selection
 - gen2-supported peer beats lexicographically earlier gen1 peer for `BlockRangeWithTxs`
 - `Gen2 + Supported` peer beats `Gen2 + Unknown` peer for normal range prefetch
 - unknown-peer probe uses `PREFETCH_RANGE_PROBE_LEN = 2` and updates capability on success or decode failure
@@ -1104,7 +1093,7 @@ Notes:
 - Deferred: count-weighted/account-weighted PoW redesign.
 
 2. Default gen2 flags in shipped config
-- Decision: `req_res_gen2_accept_enabled=false`, `req_res_gen2_send_enabled=false`, `req_res_gen2_bundle_enabled=false`, and `prefetch_enabled=false` in shipped defaults until rollout gate stages are explicitly enabled.
+- Decision: `req_res_gen2_accept_enabled=false`, `req_res_gen2_send_enabled=false`, and `req_res_gen2_bundle_enabled=false` in shipped defaults; `prefetch_enabled=true` is gated by kernel-demand depth and per-peer range capability.
 
 3. Envelope strictness
 - Decision: envelope strictness is keyed by `kind` plus the relevant ID, message, bundle, or range fields for that kind.
@@ -1119,7 +1108,7 @@ Notes:
 5. Request-response behavior architecture
 - Decision: single request-response behavior with deterministic protocol ordering.
 - Decision: transport generation fallback remains peer-scoped and outcome-driven.
-- Decision: catch-up range routing maintains local per-peer range capability and performance state when `prefetch_enabled=true`.
+- Decision: kernel-demand range routing maintains local per-peer range capability and performance state when `prefetch_enabled=true`.
 
 6. Backpressure response contract
 - Decision: if execution has started, return partial per-item `Error(Backpressure)` for unprocessed tail items.
@@ -1136,10 +1125,10 @@ Notes:
 - Decision: range capability is tracked as local requester state: `Unknown`, `Supported`, or `Unsupported`.
 - Decision: successful range responses mark `Supported`; decode and unsupported-protocol failures mark `Unsupported`; transient failures update cooldown without changing shape capability.
 - Decision: unknown range capability may be probed only with `len <= 2`.
-- Decision: full catch-up range prefetch is restricted to `Gen2 + Supported` peers; unknown peers receive only bounded probes, and unsupported peers receive no range request.
+- Decision: full kernel-demand range prefetch is restricted to `Gen2 + Supported` peers; unknown peers receive only bounded probes, and unsupported peers receive no range request.
 
-10. Catch-up prefetch peer ranking
-- Decision: replace lexicographic first-peer selection for catch-up range prefetch with capability-gated weighted rendezvous ranking.
+10. Kernel-demand prefetch peer ranking
+- Decision: replace lexicographic first-peer selection for range prefetch with capability-gated weighted rendezvous ranking.
 - Decision: ranking weight combines smoothed success probability, smoothed RTT, smoothed payload size, and active inflight penalty.
 - Decision: transient range failure opens peer cooldown and queues singleton retry work for the start height through the alternate-peer path.
 - Decision: absence of an eligible range peer falls back to singleton `BlockByHeight`, not full range requests to incapable peers.

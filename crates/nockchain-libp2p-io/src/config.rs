@@ -78,29 +78,23 @@ const GEN2_BATCH_COALESCE_WINDOW_MS: u64 = 10;
 const GEN2_MAX_INFLIGHT_PER_PEER: usize = 128;
 const GEN2_SWARM_ACTION_QUEUE_CAPACITY: usize = 1000;
 
-// ---- catch-up prefetch (Phase 4 of catch-up prefetch epic) ----
+// ---- range prefetch ----
 //
-// Outbound prefetch of contiguous block ranges when the catch-up signal
-// reports `CatchingUp`. On by default after the LAX1 stacked canary validated
-// the gen2 + prefetch stack; see `docs/GEN2-ROLLOUT-STAGE-GATES.md`.
+// Outbound prefetch of contiguous block ranges after the kernel asks for a
+// sufficiently deep block height. Prefetch stays demand-driven: unsolicited
+// future gossip cannot enable it.
 const PREFETCH_ENABLED: bool = true;
-// Initial prefetch window in blocks. Phase 4 grows from this base on
-// hit-rate; Phase 6 tunes against checkpoint replay.
+// Initial prefetch window in blocks. The window grows from this base on
+// hit-rate and is capped below.
 const PREFETCH_WINDOW_INITIAL: u8 = 16;
 // Hard cap on the requested prefetch window. The responder returns the
 // largest contiguous prefix that fits the byte budget, which lets the
 // requester ask past the expected fit point without accepting an oversized
 // response.
 const PREFETCH_WINDOW_MAX: u8 = 128;
-// Heard-but-undelivered backlog above frontier needed to declare
-// CatchingUp. Mirrors the constant in `catch_up.rs`; surfaced here so
-// operators can override without recompiling.
-const PREFETCH_BEHIND_THRESHOLD: u64 = 8;
-// Demonstrable peer-observed gap above frontier needed to declare
-// CatchingUp. Mirrors `catch_up.rs`.
-const PREFETCH_PEER_OBSERVED_THRESHOLD: u64 = 32;
-// Drained-condition hold time before exiting CatchingUp.
-const PREFETCH_HYSTERESIS_MS: u64 = 30_000;
+// Kernel-requested height gap above the current frontier before range
+// prefetch is eligible.
+const PREFETCH_KERNEL_DEMAND_THRESHOLD: u64 = 8;
 // Cap on simultaneously-inflight prefetches per peer. LAX1-tuned to 4 to keep
 // the catch-up pipeline full while bounding per-peer prefetch load.
 const PREFETCH_MAX_INFLIGHT_PER_PEER: u8 = 4;
@@ -309,10 +303,9 @@ pub struct LibP2PConfig {
     #[serde(default = "default_gen2_swarm_action_queue_capacity")]
     pub gen2_swarm_action_queue_capacity: usize,
 
-    /// Enable catch-up block prefetch. When `true` and the catch-up signal
-    /// reports `CatchingUp`, the driver issues `BlockRangeWithTxs` requests
-    /// to refill the deferred-block buffer ahead of kernel demand. On by
-    /// default after LAX1 canary validation.
+    /// Enable kernel-demanded block range prefetch. When `true`, a sufficiently
+    /// deep kernel `%request %block %by-height` can issue a `BlockRangeWithTxs`
+    /// request alongside the normal singleton request.
     #[serde(default = "default_prefetch_enabled")]
     pub prefetch_enabled: bool,
 
@@ -326,18 +319,10 @@ pub struct LibP2PConfig {
     #[serde(default = "default_prefetch_window_max")]
     pub prefetch_window_max: u8,
 
-    /// Override the catch-up signal's deferred-buffer threshold.
-    #[serde(default = "default_prefetch_behind_threshold")]
-    pub prefetch_behind_threshold: u64,
-
-    /// Override the catch-up signal's peer-observed gap threshold.
-    #[serde(default = "default_prefetch_peer_observed_threshold")]
-    pub prefetch_peer_observed_threshold: u64,
-
-    /// Override the catch-up signal's exit-hysteresis hold time in
-    /// milliseconds.
-    #[serde(default = "default_prefetch_hysteresis_ms")]
-    pub prefetch_hysteresis_ms: u64,
+    /// Kernel-demanded height gap above the current frontier before range
+    /// prefetch is eligible.
+    #[serde(default = "default_prefetch_kernel_demand_threshold")]
+    pub prefetch_kernel_demand_threshold: u64,
 
     /// Cap on simultaneously-inflight prefetches per peer.
     #[serde(default = "default_prefetch_max_inflight_per_peer")]
@@ -570,14 +555,8 @@ fn default_prefetch_window_initial() -> u8 {
 fn default_prefetch_window_max() -> u8 {
     PREFETCH_WINDOW_MAX
 }
-fn default_prefetch_behind_threshold() -> u64 {
-    PREFETCH_BEHIND_THRESHOLD
-}
-fn default_prefetch_peer_observed_threshold() -> u64 {
-    PREFETCH_PEER_OBSERVED_THRESHOLD
-}
-fn default_prefetch_hysteresis_ms() -> u64 {
-    PREFETCH_HYSTERESIS_MS
+fn default_prefetch_kernel_demand_threshold() -> u64 {
+    PREFETCH_KERNEL_DEMAND_THRESHOLD
 }
 fn default_prefetch_max_inflight_per_peer() -> u8 {
     PREFETCH_MAX_INFLIGHT_PER_PEER
@@ -704,9 +683,7 @@ impl Default for LibP2PConfig {
             prefetch_enabled: default_prefetch_enabled(),
             prefetch_window_initial: default_prefetch_window_initial(),
             prefetch_window_max: default_prefetch_window_max(),
-            prefetch_behind_threshold: default_prefetch_behind_threshold(),
-            prefetch_peer_observed_threshold: default_prefetch_peer_observed_threshold(),
-            prefetch_hysteresis_ms: default_prefetch_hysteresis_ms(),
+            prefetch_kernel_demand_threshold: default_prefetch_kernel_demand_threshold(),
             prefetch_max_inflight_per_peer: default_prefetch_max_inflight_per_peer(),
             prefetch_height_failure_budget: default_prefetch_height_failure_budget(),
             prefetch_stuck_backoff_secs: default_prefetch_stuck_backoff_secs(),

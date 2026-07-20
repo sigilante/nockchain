@@ -431,8 +431,6 @@ pub(crate) fn log_pending_gen2_batch_flush(
 }
 pub(crate) const PENDING_GEN2_BATCH_DUPLICATE_REASON: &str = "exact_message_already_pending";
 pub(crate) const ACTIVE_OUTBOUND_REQUEST_DUPLICATE_REASON: &str = "exact_message_already_inflight";
-pub(crate) const SPECULATIVE_TX_PREFETCH_TTL: Duration = Duration::from_secs(15);
-pub(crate) const SPECULATIVE_TX_PREFETCH_MAX_IDS_PER_BLOCK: usize = 256;
 pub(crate) const GEN2_RETRY_MAX_ATTEMPTS: u8 = 3;
 pub(crate) const GEN2_RETRY_BASE_DELAY_MS: u64 = 100;
 pub(crate) const GEN2_RETRY_MAX_DELAY_MS: u64 = 2_000;

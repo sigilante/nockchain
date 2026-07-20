@@ -290,29 +290,6 @@ metrics_struct![
     // worth paging on, by construction, a dump only fires on a stall
     // or an operator request, both of which deserve attention.
     (watchdog_stack_dump_total, "nockchain-libp2p-io.watchdog_stack_dump_total", Count),
-    // ---- catch-up signal (Phase 1 of catch-up prefetch epic) ----
-    // Observation only; nothing yet acts on these. See `catch_up.rs`.
-    //
-    // sync_mode: 0 = Cold, 1 = CatchingUp, 2 = Tip. Encoded as a numeric
-    // gauge so Datadog can plot transitions; the corresponding label
-    // string is in trace logs.
-    (sync_mode, "nockchain-libp2p-io.sync_mode", Gauge),
-    // sync_mode_transitions_total: bumps once per mode change. Sustained
-    // flapping would show up as a high rate without a corresponding
-    // sync-progress signal.
-    (sync_mode_transitions_total, "nockchain-libp2p-io.sync_mode_transitions_total", Count),
-    // behind_tip_estimate: lower bound on tip - frontier, taken from the
-    // strongest of (max-deferred-height, peer-observed-max-height). 0
-    // when no signal indicates we are behind.
-    (behind_tip_estimate, "nockchain-libp2p-io.behind_tip_estimate", Gauge),
-    // deferred_blocks_above_frontier: max-deferred-height - frontier.
-    // Distinct from `behind_tip_estimate` because it reflects only
-    // gossip-derived backlog, not peer responses.
-    (deferred_blocks_above_frontier, "nockchain-libp2p-io.deferred_blocks_above_frontier", Gauge),
-    // peer_observed_max_height: highest height seen in any successful
-    // outbound block response. Demonstrates that some peer has at least
-    // this much chain.
-    (peer_observed_max_height, "nockchain-libp2p-io.peer_observed_max_height", Gauge),
     // ---- Phase 2: deferred-buffer cache short-circuit ----
     // prefetch_cache_hits_total: kernel-emitted block-by-height requests
     // that were satisfied from the deferred buffer without outbound
@@ -325,16 +302,15 @@ metrics_struct![
     // prefetch_buffer_size: total deferred heard-blocks across all
     // heights, exposed as a gauge so growth and drain are both visible.
     (prefetch_buffer_size, "nockchain-libp2p-io.prefetch_buffer_size", Gauge),
-    // ---- Phase 4: catch-up triggered prefetch issuance ----
-    // prefetch_issued_total: catch-up range prefetches dispatched in
-    // place of a kernel-singleton block-by-height request.
+    // ---- Phase 4: kernel-demand range prefetch issuance ----
+    // prefetch_issued_total: range prefetches dispatched alongside a
+    // kernel-singleton block-by-height request.
     (prefetch_issued_total, "nockchain-libp2p-io.prefetch_issued_total", Count),
-    // prefetch_singleton_suppressed_total: kernel-singleton requests
-    // suppressed because an inflight prefetch already covers the
-    // requested height.
+    // prefetch_duplicate_range_avoided_total: range prefetches skipped
+    // because an inflight range already covers the requested height.
     (
-        prefetch_singleton_suppressed_total,
-        "nockchain-libp2p-io.prefetch_singleton_suppressed_total", Count
+        prefetch_duplicate_range_avoided_total,
+        "nockchain-libp2p-io.prefetch_duplicate_range_avoided_total", Count
     ),
     // prefetch_no_eligible_peer_total: catch-up prefetch eligibility
     // checks where no connected peer satisfied range-capability and
@@ -384,16 +360,5 @@ metrics_struct![
     (
         prefetch_peer_no_gen2_range_peer_total,
         "nockchain-libp2p-io.prefetch_peer_no_gen2_range_peer_total", Count
-    ),
-    // ---- outgoing-gossip suppression while behind tip ----
-    // gossip_suppressed_behind_tip_total: kernel-emitted %gossip effects
-    // (heard-block / heard-tx / future variants) that were NOT broadcast
-    // because the catch-up signal reports SyncMode::CatchingUp. While
-    // catching up, a node is intentionally quiet: no historic block
-    // rebroadcasts, local tx submission gossip, or mining output. Should
-    // fall to ~0 once a node reaches Tip.
-    (
-        gossip_suppressed_behind_tip_total,
-        "nockchain-libp2p-io.gossip_suppressed_behind_tip_total", Count
     )
 ];

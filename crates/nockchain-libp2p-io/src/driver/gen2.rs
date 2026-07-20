@@ -18,8 +18,7 @@ pub(crate) use frontier::flush_ready_deferred_heard_blocks;
 pub(crate) use frontier::{
     collect_tip5_zset_strings, flush_ready_deferred_heard_blocks_with_dispatcher,
     future_heard_block_details, heard_block_height_from_fact_poke,
-    heard_block_tx_ids_from_fact_poke, queue_speculative_raw_tx_prefetches_with_dispatcher,
-    track_future_heard_block_tx_hints_and_prefetch,
+    heard_block_tx_ids_from_fact_poke, track_future_heard_block_tx_hints,
 };
 use inbound::handle_inbound_request;
 use outbound::handle_outbound_response;

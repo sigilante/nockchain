@@ -158,9 +158,9 @@ steps:
       - "--names"
       - "${note_name}"
       - "--recipient"
-      - '{"kind":"p2pkh","address":"${recipient_pkh}","amount":10000}'
+      - '{"kind":"p2pkh","address":"${recipient_pkh}","amount":1000000}'
       - "--fee"
-      - "10000000"
+      - "1"
       - "--save-raw-tx"
       - "--refund-pkh"
       - "${miner_pkh}"
@@ -174,7 +174,7 @@ steps:
     command: "send-tx"
     args: ["${tx_path}"]
     capture:
-      regex: 'Validation for TX\s*([A-Za-z0-9]+)\s*passed'
+      regex: 'TX\s+([A-Za-z0-9]+)\s+passed local'
       store_as: "tx1_id"
 
   - action: wait_for_tx_accepted
@@ -223,7 +223,7 @@ steps:
       - "--recipient"
       - '{"kind":"p2pkh","address":"${miner_pkh}","amount":5000}'
       - "--fee"
-      - "5000"
+      - "1"
       - "--save-raw-tx"
       - "--refund-pkh"
       - "${recipient_pkh}"
@@ -237,7 +237,7 @@ steps:
     command: "send-tx"
     args: ["${tx2_path}"]
     capture:
-      regex: 'Validation for TX\s*([A-Za-z0-9]+)\s*passed'
+      regex: 'TX\s+([A-Za-z0-9]+)\s+passed local'
       store_as: "tx2_id"
 
   - action: wait_for_tx_accepted

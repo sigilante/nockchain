@@ -12,9 +12,7 @@ use rand::{rng, Rng};
 use serde_bytes::ByteBuf;
 
 use crate::p2p_util::PeerIdExt;
-use crate::tip5_util::{
-    base58_to_ubig, decimal_to_base_p, tip5_hash_to_base58, tip5_hash_to_base58_stack,
-};
+use crate::tip5_util::{tip5_hash_to_base58, tip5_hash_to_base58_stack};
 
 pub(crate) const FACT_POKE_VERSION: u64 = 0;
 const GEN2_BATCH_POW_DOMAIN_SEPARATOR: &[u8] = b"nockchain:req-res:gen2:pow:v1";
@@ -337,27 +335,6 @@ pub(crate) fn request_slab_from_message(message: &[u8]) -> Result<NounSlab, Nock
     let request_noun = request_slab.cue_into(Bytes::copy_from_slice(message))?;
     request_slab.set_root(request_noun);
     Ok(request_slab)
-}
-
-fn tip5_hash_noun_from_base58(slab: &mut NounSlab, base58: &str) -> Result<Noun, NockAppError> {
-    let ubig = base58_to_ubig(base58.to_owned())?;
-    let words = decimal_to_base_p(ubig)?;
-    let word0 = Atom::new(slab, words[0]).as_noun();
-    let word1 = Atom::new(slab, words[1]).as_noun();
-    let word2 = Atom::new(slab, words[2]).as_noun();
-    let word3 = Atom::new(slab, words[3]).as_noun();
-    let word4 = Atom::new(slab, words[4]).as_noun();
-    Ok(T(slab, &[word0, word1, word2, word3, word4]))
-}
-
-pub(crate) fn raw_tx_request_message(tx_id: &str) -> Result<ByteBuf, NockAppError> {
-    let mut slab = NounSlab::new();
-    let tx_id_noun = tip5_hash_noun_from_base58(&mut slab, tx_id)?;
-    let by_id = T(&mut slab, &[D(tas!(b"by-id")), tx_id_noun]);
-    let raw_tx = T(&mut slab, &[D(tas!(b"raw-tx")), by_id]);
-    let request = T(&mut slab, &[D(tas!(b"request")), raw_tx]);
-    slab.set_root(request);
-    Ok(ByteBuf::from(slab.jam().as_ref()))
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]

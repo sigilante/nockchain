@@ -5,7 +5,6 @@
 #![allow(clippy::items_after_test_module)]
 
 mod behaviour; // Nockchain libp2p behavior type
-pub mod catch_up; // Catch-up sync-mode signal (Phase 1 of catch-up prefetch)
 pub mod config; // Configurable values for the Nockchain libp2p driver
 pub mod driver; // Nockchain libp2p driver for NockApp
 mod ip_block; // IP-level connection gating (deny banned IPs)

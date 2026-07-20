@@ -7,7 +7,6 @@ use tokio::sync::{mpsc, Mutex};
 use tracing::trace;
 
 use crate::driver::gen2::*;
-use crate::driver::{SwarmAction, SwarmActionDispatcher};
 use crate::messages::{
     BundledBlockWithTxs, EnvelopeKind, NockchainDataRequest, NockchainFact, NockchainRequest,
     ResponseEnvelope,
@@ -18,8 +17,8 @@ use crate::traffic_cop;
 
 /// Decompose a bundle envelope (`kind == HeardBlockWithTxs`) into its
 /// constituent block + tx facts, route each through `route_response_fact` in
-/// page-declared order, and queue `RawTransactionById` requests for any tx-id
-/// the responder listed as unincluded.
+/// page-declared order, and record source hints for any tx-id the responder
+/// listed as unincluded.
 ///
 /// Kind/id consistency is checked against the decoded inner facts; a block-id
 /// or tx-id that doesn't match the envelope metadata is surfaced as an error
@@ -125,26 +124,13 @@ pub(crate) async fn route_bundle_envelope_with_source_with_dispatcher(
 
     if let Some(unincluded) = envelope.unincluded_tx_ids.as_ref() {
         if !unincluded.is_empty() {
-            let tx_ids = {
-                let mut state_guard = driver_state.lock().await;
-                state_guard.track_tx_ids_and_peer(unincluded.iter().cloned(), peer);
-                state_guard.claim_speculative_tx_prefetch_ids(
-                    unincluded.iter().cloned(),
-                    SPECULATIVE_TX_PREFETCH_TTL,
-                    SPECULATIVE_TX_PREFETCH_MAX_IDS_PER_BLOCK,
-                )
-            };
-            if tx_ids.is_empty() {
-                return Ok(());
-            }
+            let mut state_guard = driver_state.lock().await;
+            state_guard.track_tx_ids_and_peer(unincluded.iter().cloned(), peer);
             trace!(
                 peer = %peer,
                 unincluded_count = unincluded.len(),
-                claimed_count = tx_ids.len(),
-                "Queueing classic raw-tx requests for bundle remainder"
+                "Recorded source hints for bundle remainder"
             );
-            queue_speculative_raw_tx_prefetches_with_dispatcher(peer, tx_ids, swarm_actions)
-                .await?;
         }
     }
 

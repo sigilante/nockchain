@@ -151,7 +151,7 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
     traffic: &traffic_cop::TrafficCop,
     metrics: &Arc<NockchainP2PMetrics>,
     driver_state: &Arc<Mutex<P2PState>>,
-    swarm_actions: &mut SwarmActionDispatcher<'_>,
+    _swarm_actions: &mut SwarmActionDispatcher<'_>,
     block_source: BlockSource,
 ) -> Result<(), NockAppError> {
     if let Some((block_id, height)) = future_heard_block_details(&response)? {
@@ -172,7 +172,6 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
             _ => None,
         };
         let mut state_guard = driver_state.lock().await;
-        state_guard.record_observed_block_height_candidate(block_id.clone(), height);
         let frontier = state_guard.first_negative;
         if height > frontier {
             let inserted = state_guard.defer_heard_block_with_source(
@@ -183,11 +182,8 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
                 block_source,
             );
             drop(state_guard);
-            let speculative_prefetch_count = if let Some(tx_ids) = heard_block_tx_ids.as_ref() {
-                track_future_heard_block_tx_hints_and_prefetch(
-                    peer, tx_ids, driver_state, swarm_actions,
-                )
-                .await?
+            let tx_hint_count = if let Some(tx_ids) = heard_block_tx_ids.as_ref() {
+                track_future_heard_block_tx_hints(peer, tx_ids, driver_state).await?
             } else {
                 0
             };
@@ -197,7 +193,7 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
                 height,
                 frontier,
                 inserted,
-                speculative_prefetch_count,
+                tx_hint_count,
                 "Deferred future heard-block until seen frontier advances"
             );
             return Ok(());
@@ -218,10 +214,6 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
         }
         _ => None,
     };
-    if let (Some(block_id), Some(height)) = (received_block_id.as_deref(), received_block_height) {
-        let mut state_guard = driver_state.lock().await;
-        state_guard.record_observed_block_height_candidate(block_id.to_owned(), height);
-    }
     let response_summary = response_fact_trace_summary(&response);
     let heard_block_tx_ids = match &response {
         NockchainFact::HeardBlock(_, fact_poke) => {
@@ -409,10 +401,6 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
             if processing_started.load(Ordering::Relaxed) {
                 cancel_response_processing_gate(driver_state, &response_gate).await;
             }
-            if let Some(block_id) = received_block_id.as_deref() {
-                let mut state_guard = driver_state.lock().await;
-                state_guard.remove_observed_block_height_candidate(block_id);
-            }
             trace!(
                 peer = %peer,
                 response = %response_summary,
@@ -445,10 +433,6 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
             if processing_started.load(Ordering::Relaxed) {
                 cancel_response_processing_gate(driver_state, &response_gate).await;
             }
-            if let Some(block_id) = received_block_id.as_deref() {
-                let mut state_guard = driver_state.lock().await;
-                state_guard.remove_observed_block_height_candidate(block_id);
-            }
             #[cfg(test)]
             if let Some(block_id) = trace_block_id.as_deref() {
                 checkpoint_route_trace(
@@ -470,10 +454,6 @@ pub(crate) async fn route_response_fact_with_source_with_dispatcher(
         Err(err) => {
             if processing_started.load(Ordering::Relaxed) {
                 cancel_response_processing_gate(driver_state, &response_gate).await;
-            }
-            if let Some(block_id) = received_block_id.as_deref() {
-                let mut state_guard = driver_state.lock().await;
-                state_guard.remove_observed_block_height_candidate(block_id);
             }
             #[cfg(test)]
             if let Some(block_id) = trace_block_id.as_deref() {

@@ -11,8 +11,8 @@ use tokio::time::Instant;
 use tracing::info;
 
 use crate::driver::gen2::*;
-use crate::driver::{SwarmAction, SwarmActionDispatcher};
-use crate::messages::{raw_tx_request_message, NockchainFact};
+use crate::driver::SwarmActionDispatcher;
+use crate::messages::NockchainFact;
 use crate::metrics::NockchainP2PMetrics;
 use crate::p2p_state::P2PState;
 use crate::tip5_util::tip5_hash_to_base58;
@@ -21,51 +21,14 @@ use crate::traffic_cop;
 const TIP5_ZSET_MAX_ITEMS: usize = 65_536;
 const TIP5_ZSET_MAX_STACK: usize = 65_536;
 
-pub(crate) async fn queue_speculative_raw_tx_prefetches_with_dispatcher(
-    peer: PeerId,
-    tx_ids: Vec<String>,
-    swarm_actions: &mut SwarmActionDispatcher<'_>,
-) -> Result<(), NockAppError> {
-    for tx_id in tx_ids {
-        let request_message = raw_tx_request_message(&tx_id)?;
-        swarm_actions
-            .dispatch(SwarmAction::QueueKernelRequest {
-                peer_id: peer,
-                request_message,
-            })
-            .await
-            .map_err(|_| {
-                NockAppError::OtherError(String::from(
-                    "Failed to queue speculative raw-tx prefetch",
-                ))
-            })?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn track_future_heard_block_tx_hints_and_prefetch(
+pub(crate) async fn track_future_heard_block_tx_hints(
     peer: PeerId,
     tx_ids: &[String],
     driver_state: &Arc<Mutex<P2PState>>,
-    swarm_actions: &mut SwarmActionDispatcher<'_>,
 ) -> Result<usize, NockAppError> {
-    let speculative_tx_ids = {
-        let mut state_guard = driver_state.lock().await;
-        state_guard.track_tx_ids_and_peer(tx_ids.iter().cloned(), peer);
-        state_guard.claim_speculative_tx_prefetch_ids(
-            tx_ids.iter().cloned(),
-            SPECULATIVE_TX_PREFETCH_TTL,
-            SPECULATIVE_TX_PREFETCH_MAX_IDS_PER_BLOCK,
-        )
-    };
-    let claimed_count = speculative_tx_ids.len();
-    if claimed_count > 0 {
-        queue_speculative_raw_tx_prefetches_with_dispatcher(
-            peer, speculative_tx_ids, swarm_actions,
-        )
-        .await?;
-    }
-    Ok(claimed_count)
+    let mut state_guard = driver_state.lock().await;
+    state_guard.track_tx_ids_and_peer(tx_ids.iter().cloned(), peer);
+    Ok(tx_ids.len())
 }
 pub(crate) fn heard_block_tx_ids_from_fact_poke(
     fact_poke: &NounSlab,

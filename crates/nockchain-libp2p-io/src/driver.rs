@@ -537,16 +537,13 @@ pub fn make_libp2p_driver(
                 window_initial: libp2p_config.prefetch_window_initial,
                 window_max: libp2p_config.prefetch_window_max,
                 max_inflight_per_peer: libp2p_config.prefetch_max_inflight_per_peer,
-                kernel_demand_threshold: libp2p_config.prefetch_behind_threshold.max(1),
+                kernel_demand_threshold: libp2p_config.prefetch_kernel_demand_threshold.max(1),
             };
             let prefetch_height_failure_budget = libp2p_config.prefetch_height_failure_budget;
             let prefetch_stuck_backoff =
                 Duration::from_secs(libp2p_config.prefetch_stuck_backoff_secs);
             let prefetch_bandwidth_cap_per_peer_bytes_per_min =
                 libp2p_config.prefetch_bandwidth_cap_per_peer_bytes_per_min;
-            let prefetch_behind_threshold = libp2p_config.prefetch_behind_threshold;
-            let prefetch_peer_observed_threshold = libp2p_config.prefetch_peer_observed_threshold;
-            let prefetch_hysteresis = Duration::from_millis(libp2p_config.prefetch_hysteresis_ms);
             let swarm_action_queue_capacity = libp2p_config.gen2_swarm_action_queue_capacity();
             let mut swarm = match start_swarm(
                 libp2p_config,
@@ -585,10 +582,6 @@ pub fn make_libp2p_driver(
                 state_guard.set_prefetch_safety_config(
                     prefetch_height_failure_budget, prefetch_stuck_backoff,
                     prefetch_bandwidth_cap_per_peer_bytes_per_min,
-                );
-                state_guard.set_catch_up_config(
-                    prefetch_behind_threshold, prefetch_peer_observed_threshold,
-                    prefetch_hysteresis,
                 );
             }
             let mut kad_bootstrap = tokio::time::interval(kademlia_bootstrap_interval);
@@ -1246,29 +1239,15 @@ async fn handle_effect_with_dispatcher(
         EffectType::Gossip => {
             let tail_slab = extract_gossip_effect_payload(&noun_slab)?;
 
-            let gossip_kind = {
+            let is_heard_block_gossip = {
                 let gossip_space = tail_slab.noun_space();
                 let gossip_noun = unsafe { *tail_slab.root() };
                 gossip_noun
                     .in_space(&gossip_space)
                     .as_cell()
-                    .map(|data_cell| {
-                        if data_cell.head().eq_bytes(b"heard-block") {
-                            "heard-block"
-                        } else if data_cell.head().eq_bytes(b"heard-tx") {
-                            "heard-tx"
-                        } else {
-                            "unknown"
-                        }
-                    })
-                    .unwrap_or("unknown")
+                    .is_ok_and(|data_cell| data_cell.head().eq_bytes(b"heard-block"))
             };
-            let is_heard_block_gossip = gossip_kind == "heard-block";
-            // Clear the serve caches on a new heaviest block (local-state
-            // bookkeeping, independent of whether we re-broadcast) and, while
-            // holding the lock, read whether we should suppress the outgoing
-            // gossip because we are behind tip.
-            let (suppress_outgoing_gossip, behind_tip_estimate) = {
+            {
                 let mut state_guard = driver_state.lock().await;
                 if is_heard_block_gossip {
                     trace!("Gossip effect for heard-block, clearing block and elders cache");
@@ -1276,38 +1255,22 @@ async fn handle_effect_with_dispatcher(
                     state_guard.elders_cache.clear();
                     state_guard.clear_elders_negative_cache();
                 }
-                (
-                    state_guard.should_suppress_outgoing_gossip(),
-                    state_guard.catch_up_signal().behind_tip_estimate(),
-                )
-            };
+            }
 
-            if suppress_outgoing_gossip {
-                // We are demonstrably behind tip (SyncMode::CatchingUp). The
-                // node is intentionally quiet: no historic block rebroadcasts,
-                // local tx submission gossip, or mining output until catch-up
-                // exits.
-                trace!(
-                    behind_tip_estimate, gossip_kind,
-                    "Suppressing outgoing gossip while catching up"
-                );
-                metrics.gossip_suppressed_behind_tip_total.increment();
-            } else {
-                let gossip_request = NockchainRequest::new_gossip(&tail_slab);
-                debug!("Gossiping to {} peers", connected_peers.len());
-                for peer_id in connected_peers.clone() {
-                    let gossip_request_clone = gossip_request.clone();
-                    swarm_actions
-                        .dispatch(SwarmAction::SendRequest {
-                            peer_id,
-                            request: gossip_request_clone,
-                            request_context: None,
-                        })
-                        .await
-                        .map_err(|_e| {
-                            NockAppError::OtherError(String::from("Failed to send gossip request"))
-                        })?;
-                }
+            let gossip_request = NockchainRequest::new_gossip(&tail_slab);
+            debug!("Gossiping to {} peers", connected_peers.len());
+            for peer_id in connected_peers.clone() {
+                let gossip_request_clone = gossip_request.clone();
+                swarm_actions
+                    .dispatch(SwarmAction::SendRequest {
+                        peer_id,
+                        request: gossip_request_clone,
+                        request_context: None,
+                    })
+                    .await
+                    .map_err(|_e| {
+                        NockAppError::OtherError(String::from("Failed to send gossip request"))
+                    })?;
             }
         }
         EffectType::Request => {
@@ -1423,31 +1386,21 @@ async fn handle_effect_with_dispatcher(
                 preferred_peers = state_guard.get_peers_for_tx_id(&tx_id);
             }
 
-            // Phase 2: a deferred-buffer hit may satisfy a kernel by-height
-            // request only when the feature is enabled and the requested
-            // height is already at the driver's frontier. Future buffered
-            // heights still fall through to the outbound request path; they
-            // need a later `%seen %block` frontier advance before local flush
-            // can deliver them.
             if let Some(height) = requested_block_height {
                 {
                     let mut state_guard = driver_state.lock().await;
                     state_guard.note_kernel_block_height_requested(height);
                 }
-                // Snapshot deferred-buffer presence, prefetch coverage, and
-                // sync mode in one guard acquisition so the suppression
-                // decision is consistent.
-                let (ready_cache_hit, deferred_cache_hit, prefetch_covers, mode, frontier) = {
+                let (ready_cache_hit, deferred_cache_hit, prefetch_covers, frontier) = {
                     let state_guard = driver_state.lock().await;
                     (
                         state_guard.has_ready_deferred_block_at_height(height),
                         state_guard.has_deferred_block_at_height(height),
                         state_guard.is_prefetch_inflight_covering_height(height),
-                        state_guard.catch_up_signal().mode(),
                         state_guard.first_negative,
                     )
                 };
-                if prefetch_config.enabled && ready_cache_hit {
+                if ready_cache_hit {
                     metrics.prefetch_cache_hits_total.increment();
                     trace!(
                         height,
@@ -1461,29 +1414,16 @@ async fn handle_effect_with_dispatcher(
                                 "Failed to queue deferred heard-block flush",
                             ))
                         })?;
-                    return Ok(());
+                } else {
+                    metrics.prefetch_cache_misses_total.increment();
                 }
-                if prefetch_config.enabled && deferred_cache_hit {
+                if prefetch_config.enabled && deferred_cache_hit && !ready_cache_hit {
                     trace!(
                         height,
                         "Buffered block-by-height request is ahead of frontier; dispatching outbound request"
                     );
                 }
-                if prefetch_config.enabled && prefetch_covers {
-                    metrics.prefetch_singleton_suppressed_total.increment();
-                    trace!(
-                        height,
-                        "Suppressed outbound block-by-height request: prefetch already covers height"
-                    );
-                    return Ok(());
-                }
-                metrics.prefetch_cache_misses_total.increment();
 
-                // Phase 4: if we're behind tip and prefetch is enabled, replace
-                // the singleton outbound with a windowed range request that
-                // includes `height`. Subsequent kernel singletons within the
-                // window will hit the prefetch_covers branch above and ride
-                // the prefetch response.
                 let kernel_demand_depth = if frontier > 0 && height >= frontier {
                     height.saturating_sub(frontier).saturating_add(1)
                 } else {
@@ -1492,13 +1432,20 @@ async fn handle_effect_with_dispatcher(
                 let kernel_demand_prefetch =
                     kernel_demand_depth >= prefetch_config.kernel_demand_threshold;
                 let prefetch_eligible = prefetch_config.enabled
+                    && !prefetch_covers
                     && height > 0
-                    && (matches!(
-                        mode,
-                        crate::catch_up::SyncMode::CatchingUp | crate::catch_up::SyncMode::Cold
-                    ) || kernel_demand_prefetch)
+                    && kernel_demand_prefetch
                     && prefetch_config.window_initial > 0
                     && prefetch_config.window_max > 0;
+
+                if prefetch_config.enabled && prefetch_covers {
+                    metrics.prefetch_duplicate_range_avoided_total.increment();
+                    trace!(
+                        height,
+                        "Skipping duplicate range prefetch: existing prefetch already covers height"
+                    );
+                }
+
                 if prefetch_eligible {
                     let window_selection = select_prefetch_window(
                         height,
@@ -1527,7 +1474,6 @@ async fn handle_effect_with_dispatcher(
                                         height,
                                         window,
                                         peer = %peer_id,
-                                        mode = mode.as_str(),
                                         frontier,
                                         kernel_demand_depth,
                                         kernel_demand_threshold =
@@ -1538,7 +1484,7 @@ async fn handle_effect_with_dispatcher(
                                         target_response_bytes = window_selection.target_response_bytes,
                                         response_budget_bytes = window_selection.response_budget_bytes,
                                         probe = prefetch_peer.probe,
-                                        "Issuing catch-up prefetch in place of singleton block-by-height"
+                                        "Issuing kernel-demand range prefetch alongside singleton block-by-height"
                                     );
                                     metrics.prefetch_issued_total.increment();
                                     metrics.prefetch_peer_selected_total.increment();
@@ -1556,7 +1502,6 @@ async fn handle_effect_with_dispatcher(
                                                 "Failed to dispatch catch-up prefetch request",
                                             ))
                                         })?;
-                                    return Ok(());
                                 }
                                 Err(err) => {
                                     warn!(
@@ -1843,15 +1788,7 @@ async fn handle_effect_with_dispatcher(
                     block_id_str,
                     peer_id,
                 } => {
-                    let accepted_height =
-                        state_guard.track_accepted_block_id_str_and_peer(block_id_str, peer_id);
-                    if let Some(height) = accepted_height {
-                        trace!(
-                            peer_id = %peer_id,
-                            height,
-                            "Recorded peer-observed height after track add"
-                        );
-                    }
+                    state_guard.track_block_id_str_and_peer(block_id_str, peer_id);
                 }
                 TrackEffect::Remove { block_id_str } => {
                     state_guard.remove_block_id_str(&block_id_str);
@@ -1937,7 +1874,6 @@ async fn handle_effect_with_dispatcher(
                                     "Setting state_guard.first_negative to {:?}",
                                     state_guard.first_negative
                                 );
-                                state_guard.note_frontier_advanced();
 
                                 // Check if we should clear the tx cache
                                 if block_height
@@ -1972,7 +1908,6 @@ async fn handle_effect_with_dispatcher(
                     trace!("seen tx id: {:?}", &tx_id_str);
                     state_guard.finish_processing_tx_seen(&tx_id_str);
                     state_guard.remove_tx_id_hint(&tx_id_str);
-                    state_guard.clear_speculative_tx_prefetch(&tx_id_str);
                 }
                 SeenEffect::Unknown => {}
             }
