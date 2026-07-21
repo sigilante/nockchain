@@ -96,7 +96,10 @@ pub fn grpc_listener_driver(addr: String) -> IODriverFn {
 
             match effect {
                 PublicNockchainEffect::SendTx { raw_tx } => {
-                    match client.wallet_send_transaction(raw_tx).await {
+                    let result = client.wallet_send_transaction(raw_tx).await;
+                    // Resolve before logging: shutdown is blocked until this runs.
+                    nockapp::nockapp::outbound::complete();
+                    match result {
                         Ok(resp) => match resp.result {
                             Some(wallet_send_transaction_response::Result::Ack(_)) => {
                                 info!("wallet_send_transaction acknowledged: true");
