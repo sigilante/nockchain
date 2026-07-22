@@ -423,11 +423,8 @@ fn parse_leading_imports(source: &str) -> Result<Vec<ScopedImport>> {
         let trimmed = line.trim_start();
 
         if trimmed.is_empty() || trimmed.starts_with("::") {
-            if imports.is_empty() {
-                index += 1;
-                continue;
-            }
-            break;
+            index += 1;
+            continue;
         }
         if !trimmed.starts_with('/') {
             break;
@@ -1048,6 +1045,19 @@ mod tests {
                 suffix: "softed-constraints".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_imports_after_comment_lines_in_import_block() {
+        let source = concat!(
+            "/=  a  /common/a\n", ":: /=  skipped  /common/skipped\n", "/=  b  /common/b\n",
+            "::  file docs\n", "|%\n", "--\n",
+        );
+        let imports = parse_leading_imports(source).expect("imports parse");
+
+        assert_eq!(imports.len(), 2);
+        assert_eq!(imports[0].suffix, "/common/a");
+        assert_eq!(imports[1].suffix, "/common/b");
     }
 
     #[test]
