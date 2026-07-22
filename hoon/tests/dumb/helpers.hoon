@@ -164,7 +164,7 @@
 ++  default-btc-hash  (hash:btc-hash:t *btc-hash:t)
 ++  default-genesis-seal  '6uuH7hHG1PDDxBrTHzMmVyU2dLDAdXJLPTqF2c3vKtkGkdbcyMxkxBM'
 ++  default-retain  (some 20)
-++  default-tx-gc-retain  4
+++  default-tx-gc-retain  20
 ::
 ::  +initial-consensus-state: pass this into add-n-pages to get things going
 ++  initial-consensus-state
@@ -541,6 +541,17 @@
   ^-  page:t
   (make-empty-page-multisig parent p:default-keys-1)
 ::
+++  make-empty-pages
+  |=  [start=page:t num=@]
+  ^-  (list page:t)
+  =/  cur=page:t  start
+  =|  pages-added=(list page:t)
+  =-  (flop pages-added)
+  %+  roll  (range:z num)
+  |=  [i=@ cur=_cur pages-added=(list page:t)]
+  =/  next=page:t  (make-empty-page cur)
+  [next [next pages-added]]
+::
 ++  make-empty-page-multisig
   |=  [parent=page:t s=sig:t]
   ^-  page:t
@@ -843,10 +854,8 @@
   %+  roll  (range:z num)
   |=  [i=@ nockchain=_nockchain cur=_start pages-added=(list page:t)]
   =/  next=page:t  (make-empty-page cur)
-  ~&  %next
   =^  effs=(list effect)  nockchain
     (pok [%fact %0 %heard-block next] nockchain)
-  ~&  %new-block-poke
   ::  confirm block was added to consensus state
   ?>  =((need heaviest-block.c.internal.outer.nockchain) ~(digest get:page:t next))
   [nockchain next [next pages-added]]

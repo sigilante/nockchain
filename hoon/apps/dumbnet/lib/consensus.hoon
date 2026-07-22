@@ -878,13 +878,11 @@
   ::  we no longer hold the tx, so there is nothing to give back
   ?.  (~(has h-by raw-txs.c) tx-id)  c
   ::  Refresh heard-at. The tx was first heard before the block that carried it
-  ::  was mined, so on its original heard-at the tx-retention sweep (which keeps
-  ::  only ~4 blocks of mempool history, and runs later in this same
-  ::  +garbage-collect) would drop it on sight -- an orphaned tx would be
-  ::  evicted instead of re-mined. Giving it the current height restores it with
-  ::  a full retention window, so it is re-gossiped and re-offered to the miner.
-  ::  It gets this lease once: it is now in excluded-txs, so no later release
-  ::  can refresh it again, and it ages out normally if it stays unmined.
+  ::  was mined, so a deep reorg can return it with an already-expired original
+  ::  lease. Giving it the current height restores it with a full retention
+  ::  window, so it is re-gossiped and re-offered to the miner. It gets this
+  ::  lease once: it is now in excluded-txs, so no later release can refresh it
+  ::  again, and it ages out normally if it stays unmined.
   =/  [=raw-tx:t heard-at=@]  (~(got h-by raw-txs.c) tx-id)
   =.  raw-txs.c  (~(put h-by raw-txs.c) tx-id [raw-tx cur-height])
   =.  excluded-txs.c  (~(put h-in excluded-txs.c) tx-id)
@@ -1169,19 +1167,22 @@
   =.  c  con
   (drop-tx tx-id)
 ::
+::
+:::  Tx age window used when pending-block retention is unbounded. Excluded txs
+:::  have no count, size, or fee eviction, so a finite lease keeps GC, mining,
+:::  and re-gossip bounded.
+++  unbounded-tx-retain  80
 ::  garbage-collect state
 ++  garbage-collect
   ~/  %garbage-collect
   |=  retain=(unit @)
   ^-  consensus-state:dk
-  ::  Excluded txs are GC'd on a much shorter window than pending blocks
-  ::  (decoupled): keep at most min(retain, 4) blocks of excluded-tx
-  ::  history -- 4 blocks if admin configured never-drop (~) -- so
-  ::  |excluded-txs| stays bounded and the dropable-txs spent-fold does
-  ::  not blow up. Pending blocks keep the full `retain`.
+  ::  Finite retain is honored for both pending blocks and excluded txs. When
+  ::  retain is ~, pending blocks stay unbounded but excluded txs get a finite
+  ::  lease because they have no count, size, or fee eviction.
   =/  tx-retain=(unit @)
-    ?~  retain  `4
-    `(min u.retain 4)
+    ?~  retain  `unbounded-tx-retain
+    retain
   ~>  %slog.[0 (cat 3 'garbage-collect: excluded-txs count ' (rsh [3 2] (scot %ui ~(wyt h-in excluded-txs.c))))]
   =.  c  (drop-dropable-blocks retain)
   ::  Txs of a freshly orphaned branch are handed back to the mempool at reorg

@@ -747,18 +747,10 @@
           ~(consensus-invariants k-by:h booted-chain)
       ==
 ::
-::  A returned tx must get a fresh retention lease. The mempool keeps only ~4
-::  blocks of history (tx-retain), measured from the tx's heard-at. An orphaned
-::  tx was necessarily heard BEFORE the block that mined it, so by the time the
-::  reorg returns it, its original heard-at is already older than the retention
-::  window -- and the retention sweep, which runs later in the very same
-::  +garbage-collect, would drop it on sight. It would be evicted rather than
-::  re-mined, and the whole release would be pointless. +release-orphan-claims
-::  refreshes heard-at to the current height to prevent exactly that; this test
-::  fails if that refresh is removed.
-::
-::  The chain is deep enough for the tx's original heard-at to be stale: tx1 is
-::  heard at height 2 and the reorg lands at height 8, well past 4 blocks.
+:::  Returned orphan txs get a fresh retention lease. The original heard-at can
+:::  predate the mined block far enough for the same +garbage-collect event to
+:::  evict the tx before it is re-mined. +release-orphan-claims refreshes
+:::  heard-at to the current height.
 ++  test-reorg-orphaned-tx-survives-retention-sweep
   =+  [nockchain genesis]=init-nockchain:h
   =^  pages  nockchain
@@ -770,30 +762,23 @@
     (~(heard-tx k-by:h nockchain) raw1)
   ?>  (~(check-excluded k-by:h nockchain) id.raw1)
   ::
-  ::  mined at height 3, on a branch we then extend to height 7
+  ::  mined at height 3, on a branch extended past the finite retention window
   =/  block-3  (make-page-with-txs:v0:h (snag 1 pages) ~[id.raw1])
-  =/  block-4  (make-empty-page:h block-3)
-  =/  block-5  (make-empty-page:h block-4)
-  =/  block-6  (make-empty-page:h block-5)
-  =/  block-7  (make-empty-page:h block-6)
+  =/  original-tail=(list page:t)
+    (make-empty-pages:h block-3 (dec default-tx-gc-retain:h))
   =^  effs=(list effect:h)  nockchain
-    (~(heard-blocks k-by:h nockchain) ~[block-3 block-4 block-5 block-6 block-7])
-  ?>  =(~(digest get:page:t block-7) ~(heaviest-block k-by:h nockchain))
+    (~(heard-blocks k-by:h nockchain) [block-3 original-tail])
   ?>  !(~(has-excluded k-by:h nockchain) id.raw1)
   ::
   ::  a longer fork from block 2 overtakes it, orphaning the whole branch. tx1
-  ::  comes back with heard-at = 8, so the retention sweep in this same event
-  ::  (which drops excluded txs older than ~4 blocks) must NOT evict it.
-  =/  block-3-p  (make-empty-page:h (snag 1 pages))
-  =/  block-4-p  (make-empty-page:h block-3-p)
-  =/  block-5-p  (make-empty-page:h block-4-p)
-  =/  block-6-p  (make-empty-page:h block-5-p)
-  =/  block-7-p  (make-empty-page:h block-6-p)
-  =/  block-8-p  (make-empty-page:h block-7-p)
+  ::  comes back with a fresh heard-at, so the retention sweep in this same
+  ::  event must NOT evict it.
+  =/  fork-pages=(list page:t)
+    (make-empty-pages:h (snag 1 pages) +(default-tx-gc-retain:h))
+  =/  fork-tip=page:t  (snag default-tx-gc-retain:h fork-pages)
   =^  effs=(list effect:h)  nockchain
-    %-  ~(heard-blocks k-by:h nockchain)
-    ~[block-3-p block-4-p block-5-p block-6-p block-7-p block-8-p]
-  ?>  =(~(digest get:page:t block-8-p) ~(heaviest-block k-by:h nockchain))
+    (~(heard-blocks k-by:h nockchain) fork-pages)
+  ?>  =(~(digest get:page:t fork-tip) ~(heaviest-block k-by:h nockchain))
   ::
   ::  still in the mempool, with a full window to be re-mined
   %+  expect-eq

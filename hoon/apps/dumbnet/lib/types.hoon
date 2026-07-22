@@ -384,9 +384,9 @@
   $+  admin-state-0
   $:  desk-hash=(unit @uvI)               ::  hash of zkvm desk
       init=init-phase                     ::  boolean flag denoting whether kernel is in the init phase.
-      retain=$~([~ 20] (unit @))          ::  how long to retain transactions before dropping
-                                          ::  value of ~ indicates never drop transactions,
-                                          ::  value of [~ 0] indicates drop everything every new block
+      retain=$~([~ 20] (unit @))          ::  finite age window for pending blocks and txs
+                                          ::  value of ~ disables pending-block age GC and
+                                          ::  gives txs a bounded safety lease
   ==
 ::
 +$  admin-state-1  $+(admin-state-1 admin-state-0)
@@ -504,7 +504,7 @@
       [%set-mining-key v0=@t v1=@t]  ::  set $lock for coinbase in mined blocks
       [%set-mining-key-advanced v0=(list [share=@ m=@ keys=(list @t)]) v1=(list [share=@ phk=@t])]  :: multisig and/or split coinbases
       [%enable-mining p=?]  ::  switch for generating candidate blocks for mining
-      [%timer p=~] ::  ask for heaviest block and any needed transactions for pending blocks
+      [%timer p=~] :: ask for heaviest block, needed txs, and miner tx refresh
       [%born p=~]  ::  initial event the king sends on boot
       [%genesis p=[=btc-hash:dt block-height=@ message=cord]]  ::  emit genesis block with this template
       :: set expected btc height and msg hash of genesis block

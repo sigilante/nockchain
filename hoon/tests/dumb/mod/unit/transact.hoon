@@ -1693,9 +1693,9 @@
     !>(excluded-txs.con)
   ==
 ::
-::  given i hear tx at height two and block retention is unbounded, when i hear
-::  fewer pages than the tx GC window the pending state still has that tx
-++  test-pending-tx-unbounded-retain-before-gc
+:::  retain=~ leaves pending-block retention unbounded, but excluded txs still
+:::  use a bounded safety lease.
+++  test-pending-tx-no-drop-retain-before-safety-gc
   =/  con=consensus-state  initial-consensus-state:h
   =^  new-page=page:t  con  (add-n-pages:h 1 con default-retain:h)
   ::  we hear a new tx
@@ -1704,7 +1704,7 @@
   =^  ready  con  (~(add-raw-tx dcon con constants) raw)
   =/  expect-raw-txs  raw-txs.con
   =/  expect-excluded-txs  excluded-txs.con
-  =^  par=page:t  con  (add-n-pages:h (dec default-tx-gc-retain:h) con ~)
+  =^  par=page:t  con  (add-n-pages:h +(default-tx-gc-retain:h) con ~)
   ;:  weld
     %+  expect-eq
       !>(expect-raw-txs)
@@ -1712,6 +1712,45 @@
   ::
     %+  expect-eq
       !>(expect-excluded-txs)
+    !>(excluded-txs.con)
+  ==
+
+:::
+:::  A configured retention window longer than the default safety lease controls
+:::  tx expiry.
+++  test-pending-tx-honors-configured-retain
+  =/  con=consensus-state  initial-consensus-state:h
+  =^  new-page=page:t  con  (add-n-pages:h 1 con default-retain:h)
+  =/  retain=(unit @)  (some 30)
+  ::  we hear a new tx
+  =/  =tx:t  (new:tx:t (make-default-coinbase-raw-tx:v0:h p:default-keys-2:h) 2)
+  =/  raw=raw-tx:t  raw-tx.tx
+  =/  before-raw-txs  raw-txs.con
+  =/  before-excluded-txs  excluded-txs.con
+  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
+  =/  live-raw-txs  raw-txs.con
+  =/  live-excluded-txs  excluded-txs.con
+  ::  The tx is older than 20 blocks but inside the configured 30-block
+  ::  window.
+  =^  par=page:t  con  (add-n-pages:h 25 con retain)
+  =/  kept-raw-txs  raw-txs.con
+  =/  kept-excluded-txs  excluded-txs.con
+  =^  par=page:t  con  (add-n-pages:h 5 con retain)
+  ;:  weld
+    %+  expect-eq
+      !>(live-raw-txs)
+    !>(kept-raw-txs)
+  ::
+    %+  expect-eq
+      !>(live-excluded-txs)
+    !>(kept-excluded-txs)
+  ::
+    %+  expect-eq
+      !>(before-raw-txs)
+    !>(raw-txs.con)
+  ::
+    %+  expect-eq
+      !>(before-excluded-txs)
     !>(excluded-txs.con)
   ==
 ::

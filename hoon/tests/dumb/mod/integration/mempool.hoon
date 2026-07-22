@@ -212,14 +212,15 @@
 ::  in a block must be discarded on receipt (not stored, not relayed). This
 ::  closes the pre-packing / block-creation asymmetry that let an oversize tx
 ::  reach candidate blocks that were then self-rejected as %block-too-large,
-::  wedging the chain. Uses a ~10 KB block-size limit and a 25-input coinbase
-::  fan-in transaction, which is comfortably over the limit.
+:::  wedging the chain. The spend inputs are built off-state because the
+:::  oversize guard runs before balance checks.
 ++  test-v1-mempool-reject-oversize-tx
   =+  h-med=~(. helpers bc-max-block-size-medium-v0:helpers)
+  =+  h-v0=~(. helpers bc-v0-phase:helpers)
   =+  t-med=~(. txe bc-max-block-size-medium-v0:helpers)
   =+  [nockchain genesis]=init-nockchain:h-med
-  =^  pages  nockchain
-    (add-n-pages-integration:h-med genesis 85 nockchain)
+  =/  pages
+    (make-empty-pages:h-v0 default-genesis-page:h-v0 85)
   =/  raw=raw-tx:t
     %-  from-inputs:v0:raw-tx:t
     %-  multi:new:v0:inputs:t
@@ -244,15 +245,12 @@
     !>(%.n)
   !>((~(has-raw-tx k-by:h-med nockchain) tx-id))
 ::
-::  re-broadcast gating for a tx we already hold. see +heard-tx and
-::  +local-tx-submission in apps/dumbnet/inner.hoon: re-hearing a tx that is
-::  already in raw-txs never re-adds it to the mempool, but whether we
-::  re-announce it depends on which driver the poke came from.
-::
-::  +setup-v1-spendable-tx: a valid v1 tx spending the coinbase of a 2-block
-::  chain, plus the kernel that chain lives in. same construction as
-::  +test-v1-mempool-accept-valid above, factored out so the re-broadcast
-::  tests below start from a tx the mempool is known to accept.
+:::  Re-broadcast gating for duplicate txs. +heard-tx never re-adds a tx that
+:::  is already in raw-txs. Local grpc duplicates are gossiped; peer-origin
+:::  duplicates stay silent after %seen.
+:::
+:::  +setup-v1-spendable-tx: a valid v1 tx spending the coinbase of a 2-block
+:::  chain, plus the kernel that chain lives in.
 ++  setup-v1-spendable-tx
   ^-  [_nockchain:h raw-tx:t]
   =+  [nockchain genesis]=init-nockchain:h
@@ -286,11 +284,8 @@
   =/  sps=spends:v1:t  (~(put z-by:zoon *spends:v1:t) nam [%1 sp1])
   [nockchain (new:raw-tx:v1:t sps)]
 ::
-::  an operator re-submitting a tx over grpc (`nockchain-wallet send-tx` on a
-::  tx that is already in our mempool) MUST re-gossip it. this is the only way
-::  to re-announce a tx the rest of the network has dropped -- a non-mining
-::  node never otherwise re-gossips a tx it already holds, so without this the
-::  tx is stuck in our mempool forever and every resend is a silent no-op.
+:::  Operator re-submission over grpc (`nockchain-wallet send-tx`) of an
+:::  already-held tx re-gossips immediately.
 ++  test-v1-mempool-grpc-resend-re-gossips
   =+  [nockchain raw]=setup-v1-spendable-tx
   =/  =cause:h  [%fact %0 %heard-tx raw]
@@ -311,9 +306,7 @@
           (~(has-raw-tx k-by:h nockchain) tx-id)
       ==
 ::
-::  a peer re-gossiping a tx we already hold MUST NOT be re-gossiped back out.
-::  this dedup is what terminates gossip loops: if we re-announced every tx a
-::  peer sent us that we already had, it would bounce between peers forever.
+:::  Peer-origin duplicates do not re-gossip. This terminates gossip loops.
 ++  test-v1-mempool-peer-resend-does-not-re-gossip
   =+  [nockchain raw]=setup-v1-spendable-tx
   =/  =cause:h  [%fact %0 %heard-tx raw]
@@ -329,6 +322,27 @@
     !>([%.y %.n %.y])
   !>  :*  (~(has z-in:zoon (filter-heard-tx-effects:h effs-1)) raw)
           (~(has z-in:zoon (filter-heard-tx-effects:h effs-2)) raw)
+          (~(has-raw-tx k-by:h nockchain) tx-id)
+      ==
+
+::::  Chain progress, not every timer tick, re-announces retained mempool txs.
+++  test-v1-mempool-new-heaviest-regossips-retained-tx
+  =+  [nockchain raw]=setup-v1-spendable-tx
+  =/  tx-id=tx-id:t  ~(id get:raw-tx:t raw)
+  =^  effs-1=(list effect:h)  nockchain
+    (pok:h [%fact %0 %heard-tx raw] nockchain)
+  ?>  (~(has-raw-tx k-by:h nockchain) tx-id)
+  =^  timer-effs=(list effect:h)  nockchain
+    (pok:h [%command %timer ~] nockchain)
+  =/  tip=page:t  ~(tip-page k-by:h nockchain)
+  =/  next=page:t  (make-empty-page:h tip)
+  =^  block-effs=(list effect:h)  nockchain
+    (pok:h [%fact %0 %heard-block next] nockchain)
+  %+  expect-eq
+    !>([%.y %.n %.y %.y])
+  !>  :*  (~(has z-in:zoon (filter-heard-tx-effects:h effs-1)) raw)
+          (~(has z-in:zoon (filter-heard-tx-effects:h timer-effs)) raw)
+          (~(has z-in:zoon (filter-heard-tx-effects:h block-effs)) raw)
           (~(has-raw-tx k-by:h nockchain) tx-id)
       ==
 --

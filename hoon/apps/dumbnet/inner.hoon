@@ -1111,21 +1111,11 @@
       ::
       ::  check if we already have raw-tx
       ?:  (has-raw-tx:con ~(id get:raw-tx:t raw))
-        ::  we already hold this tx, so we never re-add it to the mempool.
-        ::  whether we re-announce it depends on who told us about it.
-        ::
-        ::  from a peer (%libp2p): stay silent apart from %seen. this is the
-        ::  gossip-loop terminator -- if we re-gossiped every tx a peer sent
-        ::  us that we already had, the tx would bounce between peers forever.
-        ::
-        ::  from the local grpc driver (%grpc): this is an operator
-        ::  re-submission (`nockchain-wallet send-tx`), so re-gossip it. no
-        ::  peer sent it to us, so no loop can form. this is the only way to
-        ::  re-announce a tx the network has since dropped: a non-mining node
-        ::  otherwise never re-gossips a tx it already holds (the excluded-txs
-        ::  and candidate-block re-gossip paths are both mining-only), so
-        ::  without this every resend is a silent no-op and a tx stuck in our
-        ::  mempool can never be revived.
+        ::  Duplicate txs are never re-added to the mempool. Peer-origin
+        ::  duplicates emit only %seen; echoing them would create gossip loops.
+        ::  Local grpc duplicates are operator re-submissions and are gossiped
+        ::  immediately. New-heaviest events also announce retained txs, but
+        ::  wallet resends should not wait for block progress.
         =/  re-gossip=?  (local-tx-submission wir)
         =/  log-message
           %^  cat  3
@@ -1433,9 +1423,7 @@
       ::
       ::  if new block is heaviest, regossip txs that haven't been garbage collected
       =?  effs  is-new-heaviest
-        %-  ~(rep h-in excluded-txs.c.k)
-        |=  [=tx-id:t effs=_effs]
-        [[%gossip %0 %heard-tx (got-raw-tx:con tx-id)] effs]
+        (weld regossip-excluded-txs-effects effs)
       ::  regossip block transactions if mining
       =.  effs  (weld (regossip-block-txs-effects pag) effs)
       ::
@@ -1829,6 +1817,15 @@
           ==
         ~>  %slog.[0 log-message]
         [%request %block %elders block-id peer-id]~ :: ask for elders
+    ::
+    ::  re-gossip retained mempool txs.
+    ++  regossip-excluded-txs-effects
+      ~/  %regossip-excluded-txs-effects
+      ^-  (list effect:dk)
+      %-  ~(rep h-in excluded-txs.c.k)
+      |=  [=tx-id:t effects=(list effect:dk)]
+      ^-  (list effect:dk)
+      [[%gossip %0 %heard-tx (got-raw-tx:con tx-id)] effects]
     ::
     ::  only if mining: re-gossip transactions included in block when block is fully validated
     ::  precondition: all transactions for block are in raw-txs
