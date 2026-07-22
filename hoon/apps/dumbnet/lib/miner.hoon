@@ -1,6 +1,7 @@
 /=  dk  /apps/dumbnet/lib/types
 /=  sp  /common/stark/prover
 /=  dumb-transact  /common/tx-engine
+/=  dumb-consensus  /apps/dumbnet/lib/consensus
 /=  asert  /apps/dumbnet/lib/asert
 /=  *  /common/h-zoon
 ::
@@ -67,6 +68,12 @@
     %-  ~(rep h-in candidate-tx-ids)
     |=  [=tx-id:t txs=(h-map tx-id:t raw-tx:t)]
     =/  raw  raw-tx:(~(got h-by raw-txs.c) tx-id)
+    ::  Pending forks retain their raw transactions for several blocks.  Once
+    ::  one of those transactions has spent an input on the heaviest chain it
+    ::  cannot enter our candidate; reject it with the cheap balance-membership
+    ::  test instead of repeatedly running the full transaction accumulator.
+    ?.  (~(inputs-in-heaviest-balance dumb-consensus c blockchain-constants) raw)
+      txs
     (~(put h-by txs) [tx-id raw])
   ::
   ::  union of excluded tx-ids and pending block tx ids
@@ -98,7 +105,8 @@
   ~/  %update-candidate-block
   |=  [c=consensus-state:dk now=@da]
   ^-  [? mining-state:dk]
-  ?:  ?|  =(*page:t candidate-block.m)
+  ?:  ?|  =(%.n mining.m)
+          =(*page:t candidate-block.m)
           no-keys-set
       ==
     ::  not mining or no candidate block is set so no need to update
@@ -124,7 +132,7 @@
   |=  c=consensus-state:dk
   ^-  mining-state:dk
   ::  if the mining pubkey is not set, do nothing
-  ?:  no-keys-set  m
+  ?:  ?|(=(%.n mining.m) no-keys-set)  m
   %-  ~(rep h-by (candidate-txs c))
   |=  [[=tx-id:t raw=raw-tx:t] min=_m]
   =.  m  min
@@ -145,7 +153,7 @@
     ==
   ~>  %slog.[0 log-message]
   ::  if the mining pubkey is not set, do nothing
-  ?:  no-keys-set  m
+  ?:  ?|(=(%.n mining.m) no-keys-set)  m
   ::
   ::  if the transaction is already in the candidate block, do nothing
   ?:  (~(has z-in ~(tx-ids get:page:t candidate-block.m)) tx-id)
@@ -249,6 +257,7 @@
   ~/  %heard-new-block
   |=  [c=consensus-state:dk now=@da]
   ^-  mining-state:dk
+  ?.  mining.m  m
   ::
   ::  do a sanity check that we have a heaviest block, and that the heaviest block
   ::  is not the parent of our current candidate block
