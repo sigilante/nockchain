@@ -36,8 +36,9 @@ def _hoon_jam_impl(ctx):
     # Output file
     output = ctx.outputs.out
 
-    # Create only the temp directory for hoonc's internal use
-    tmp_dir = ctx.actions.declare_directory("_tmp_{}".format(ctx.label.name))
+    # Only the jam is an action output. Compiler PMA/checkpoint state is scratch
+    # space and can exceed the jam by orders of magnitude.
+    scratch_dir = "$PWD/.{}_scratch".format(ctx.label.name)
 
     # print("DEBUG: Temp dir: " + tmp_dir.path)
     # Collect the main source file and all deps
@@ -52,9 +53,10 @@ def _hoon_jam_impl(ctx):
     cmd = []
     cmd.append("set -e")  # Exit immediately if any command fails
 
-    # Create temp directory
-    cmd.append("mkdir -p {}".format(tmp_dir.path))
-
+    cmd.append("scratch_dir={}".format(scratch_dir))
+    cmd.append("rm -rf \"$scratch_dir\"")
+    cmd.append("mkdir -p \"$scratch_dir/home\" \"$scratch_dir/tmp\"")
+    cmd.append("trap 'rm -rf \"$scratch_dir\"' EXIT")
     # Resolve the root of the Hoon source tree from the source path: hoon/
     # at the repository root, or nested one directory deep (<parent>/hoon).
     src_path = src.path
@@ -83,10 +85,9 @@ def _hoon_jam_impl(ctx):
     # print("Hoon dir: " + hoon_dir)
     if ctx.attr.deps_dir:
         cmd.append("mkdir -p {}".format(hoon_dir))
-    home_dir = tmp_dir.path if ctx.attr.deps_dir else hoon_dir
-    cmd.append("env -i HOME={0} XDG_DATA_HOME={0}/.local/share XDG_CONFIG_HOME={0}/.config TMPDIR={1} RUST_LOG=trace {2} {3} {4} {5}".format(
+    home_dir = "$scratch_dir/home" if ctx.attr.deps_dir else hoon_dir
+    cmd.append("env -i HOME=\"{0}\" XDG_DATA_HOME=\"{0}/.local/share\" XDG_CONFIG_HOME=\"{0}/.config\" TMPDIR=\"$scratch_dir/tmp\" RUST_LOG=warn {1} {2} {3} {4}".format(
         home_dir,  # scratch state (.nockapp) must not land in an explicit deps dir
-        tmp_dir.path,
         ctx.executable._hoonc.path,
         " ".join(hoonc_args),
         src_path,  # Use original source path
@@ -99,7 +100,7 @@ def _hoon_jam_impl(ctx):
     # Execute the command
     ctx.actions.run_shell(
         inputs = [src] + deps,
-        outputs = [tmp_dir, output],
+        outputs = [output],
         tools = [ctx.executable._hoonc],
         command = "\n".join(cmd),
         progress_message = "Building JAM file from %s" % src.path,
@@ -195,7 +196,7 @@ def _honk_jam_impl(ctx):
     directory-hash leaf, which hashes the deps tree both compilers see.
     """
     output = ctx.outputs.out
-    tmp_dir = ctx.actions.declare_directory("_tmp_{}".format(ctx.label.name))
+    scratch_dir = "$PWD/.{}_scratch".format(ctx.label.name)
 
     src = ctx.file.src
     prelude = ctx.file.prelude
@@ -226,13 +227,15 @@ def _honk_jam_impl(ctx):
 
     cmd = []
     cmd.append("set -e")
-    cmd.append("mkdir -p {}".format(tmp_dir.path))
+    cmd.append("scratch_dir={}".format(scratch_dir))
+    cmd.append("rm -rf \"$scratch_dir\"")
+    cmd.append("mkdir -p \"$scratch_dir/home\" \"$scratch_dir/tmp\"")
+    cmd.append("trap 'rm -rf \"$scratch_dir\"' EXIT")
     if ctx.attr.deps_dir:
         cmd.append("mkdir -p {}".format(hoon_dir))
-    home_dir = tmp_dir.path if ctx.attr.deps_dir else hoon_dir
-    cmd.append("env -i HOME={0} TMPDIR={1}{2} {3} {4} --output {5} --prelude {6} {7} {8}".format(
+    home_dir = "$scratch_dir/home" if ctx.attr.deps_dir else hoon_dir
+    cmd.append("env -i HOME=\"{0}\" TMPDIR=\"$scratch_dir/tmp\"{1} {2} {3} --output {4} --prelude {5} {6} {7}".format(
         home_dir,
-        tmp_dir.path,
         env_vars,
         ctx.executable._honk.path,
         " ".join(honk_args),
@@ -244,7 +247,7 @@ def _honk_jam_impl(ctx):
 
     ctx.actions.run_shell(
         inputs = [src, prelude] + deps,
-        outputs = [tmp_dir, output],
+        outputs = [output],
         tools = [ctx.executable._honk],
         command = "\n".join(cmd),
         progress_message = "Building native JAM file from %s" % src.path,
