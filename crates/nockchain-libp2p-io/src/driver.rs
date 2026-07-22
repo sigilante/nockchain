@@ -1306,12 +1306,13 @@ async fn handle_effect_with_dispatcher(
                     let block_cell = request_body.tail().as_cell()?;
                     if block_cell.head().eq_bytes(b"elders") {
                         request_desc = String::from("block/elders");
-                        // Extract peer ID from elders request
+                        // Hoon encodes peer IDs as base58 text, not raw multihash bytes.
                         let elders_cell = block_cell.tail().as_cell()?;
                         let elders_block_id_noun = elders_cell.head().noun();
-                        let peer_id_atom = elders_cell.tail().as_atom()?;
-                        if let Ok(bytes) = peer_id_atom.to_bytes_until_nul() {
-                            if let Ok(peer_id) = PeerId::from_bytes(&bytes) {
+                        let peer_id_noun = elders_cell.tail();
+                        peer_id_noun.as_atom()?;
+                        match PeerId::from_noun(peer_id_noun.noun(), &space) {
+                            Ok(peer_id) => {
                                 if let Ok(block_id) = tip5_hash_to_base58_stack(
                                     &mut noun_slab, elders_block_id_noun, &space,
                                 ) {
@@ -1319,13 +1320,15 @@ async fn handle_effect_with_dispatcher(
                                         Some(format!("{block_id}:{}", peer_id.to_base58()));
                                 }
                                 vec![peer_id]
-                            } else {
+                            }
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    "Failed to parse elders source peer; falling back to connected peers"
+                                );
                                 is_limited_request = true;
                                 connected_peers.clone()
                             }
-                        } else {
-                            is_limited_request = true;
-                            connected_peers.clone()
                         }
                     } else {
                         // Keep a stable peer subset for adjacent height requests so the

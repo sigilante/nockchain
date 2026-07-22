@@ -7859,6 +7859,100 @@ async fn test_request_effect_queues_block_request_for_single_stable_peer() {
 }
 
 #[tokio::test]
+async fn test_elders_request_targets_source_peer_and_applies_cooldown() {
+    use tokio::sync::mpsc;
+
+    let source_peer = PeerId::random();
+    let peers = vec![PeerId::random(), source_peer, PeerId::random()];
+    let mut effect_slab = NounSlab::new();
+    let block_id = T(&mut effect_slab, &[D(101), D(102), D(103), D(104), D(105)]);
+    let source_peer_atom =
+        Atom::from_value(&mut effect_slab, source_peer.to_base58()).expect("peer ID should encode");
+    let elders = T(&mut effect_slab, &[block_id, source_peer_atom.as_noun()]);
+    let block_request = T(&mut effect_slab, &[D(tas!(b"elders")), elders]);
+    let request = T(&mut effect_slab, &[D(tas!(b"block")), block_request]);
+    let effect = T(&mut effect_slab, &[D(tas!(b"request")), request]);
+    effect_slab.set_root(effect);
+    let expected_message = ByteBuf::from(effect_slab.jam().as_ref());
+
+    let metrics = isolated_test_metrics();
+    let state_arc = Arc::new(Mutex::new(P2PState::new(
+        metrics.clone(),
+        LIBP2P_CONFIG.seen_tx_clear_interval,
+    )));
+    let (swarm_tx, mut swarm_rx) = mpsc::channel(8);
+
+    handle_effect(
+        effect_slab.clone(),
+        swarm_tx.clone(),
+        peers.clone(),
+        false,
+        state_arc.clone(),
+        metrics.clone(),
+    )
+    .await
+    .expect("elders request should be accepted");
+
+    match swarm_rx.recv().await {
+        Some(SwarmAction::QueueKernelRequest {
+            peer_id,
+            request_message,
+        }) => {
+            assert_eq!(
+                peer_id, source_peer,
+                "elders must be requested from the peer that supplied the orphan block"
+            );
+            assert_eq!(request_message, expected_message);
+        }
+        other => panic!("expected QueueKernelRequest action, got {other:?}"),
+    }
+    assert!(
+        swarm_rx.try_recv().is_err(),
+        "elders request should initially target only its source peer"
+    );
+
+    handle_effect(effect_slab, swarm_tx, peers, false, state_arc, metrics)
+        .await
+        .expect("duplicate elders request should be accepted and suppressed");
+    assert!(
+        swarm_rx.try_recv().is_err(),
+        "duplicate elders request inside the cooldown must not be sent"
+    );
+}
+
+#[tokio::test]
+async fn test_elders_request_rejects_non_atom_source_peer() {
+    use tokio::sync::mpsc;
+
+    let peers = vec![PeerId::random(), PeerId::random()];
+    let mut effect_slab = NounSlab::new();
+    let block_id = T(&mut effect_slab, &[D(101), D(102), D(103), D(104), D(105)]);
+    let invalid_peer = T(&mut effect_slab, &[D(1), D(2)]);
+    let elders = T(&mut effect_slab, &[block_id, invalid_peer]);
+    let block_request = T(&mut effect_slab, &[D(tas!(b"elders")), elders]);
+    let request = T(&mut effect_slab, &[D(tas!(b"block")), block_request]);
+    let effect = T(&mut effect_slab, &[D(tas!(b"request")), request]);
+    effect_slab.set_root(effect);
+
+    let metrics = isolated_test_metrics();
+    let state_arc = Arc::new(Mutex::new(P2PState::new(
+        metrics.clone(),
+        LIBP2P_CONFIG.seen_tx_clear_interval,
+    )));
+    let (swarm_tx, mut swarm_rx) = mpsc::channel(8);
+
+    let result = handle_effect(effect_slab, swarm_tx, peers, false, state_arc, metrics).await;
+    assert!(
+        result.is_err(),
+        "malformed elders source peer should reject the request effect"
+    );
+    assert!(
+        swarm_rx.try_recv().is_err(),
+        "malformed elders request must not fall back to connected peers"
+    );
+}
+
+#[tokio::test]
 async fn test_request_effect_skips_bundle_upgrade_for_non_bundle_capable_peer() {
     use tokio::sync::mpsc;
 
