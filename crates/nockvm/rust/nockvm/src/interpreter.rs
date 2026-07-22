@@ -439,7 +439,8 @@ pub struct Context {
     pub op_budget: Option<u64>,
     /// How jet matching compares formulas and batteries; `Exact` for
     /// runtimes whose cores and registrations come from the same compile
-    /// (hoonc, nockchain), `HintBlind` for honk. See [`JetDispatchMode`].
+    /// (hoonc, nockchain), `HintBlind` for honk. `%sham` name dispatch is
+    /// honk-only and follows this mode.
     pub jet_dispatch: JetDispatchMode,
     pub slogger: Pin<Box<dyn Slogger + Unpin>>,
     pub cold: Cold,
@@ -1949,7 +1950,7 @@ mod hint {
         //  XX: handle IndirectAtom tags
         match tag.direct()?.data() {
             tas!(b"sham") => {
-                if cfg!(feature = "sham_hints") {
+                if context.jet_dispatch == JetDispatchMode::HintBlind {
                     let space = context.stack.fast_noun_space();
                     let jet_name = sham_jet_name(hint, &space)?;
 

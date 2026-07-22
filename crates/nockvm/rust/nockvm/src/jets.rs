@@ -53,14 +53,16 @@ pub type Jet = fn(&mut Context, Noun) -> Result;
 
 /// How jet matching compares formulas and batteries.
 ///
-/// `Exact` matches nouns as-is. `HintBlind` additionally matches modulo
-/// transparent hints (%hand/%hunk/%lose/%mean/%spot): honk requires this
-/// because its natively-minted cores and cued cold-state assets differ
-/// from registered batteries only by such hints, while runtimes whose
-/// registrations and cores come from the same compile (hoonc, nockchain)
-/// never need it. Hint-blind matching costs a formula normalization walk
-/// on warm misses and a structural battery comparison when unification
-/// fails, so it is opt-in per `Context`.
+/// `Exact` matches nouns as-is and treats `%sham` hints as transparent.
+/// `HintBlind` additionally matches modulo transparent hints
+/// (%hand/%hunk/%lose/%mean/%spot) and enables `%sham` name dispatch for
+/// honk's native-prelude bring-up. Honk requires this because its
+/// natively-minted cores and cued cold-state assets differ from registered
+/// batteries only by such hints, while runtimes whose registrations and
+/// cores come from the same compile (hoonc, nockchain) never need it.
+/// Hint-blind matching costs a formula normalization walk on warm misses and
+/// a structural battery comparison when unification fails, so it is opt-in
+/// per `Context`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
 pub enum JetDispatchMode {
     #[default]
