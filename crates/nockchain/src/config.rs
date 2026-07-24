@@ -429,6 +429,4 @@ mod tests {
         let err = cli.validate().expect_err("expected bex cap error");
         assert!(err.contains("must be <="));
     }
-
-
 }
