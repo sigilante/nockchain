@@ -1820,7 +1820,6 @@
     ::
     ::  re-gossip retained mempool txs.
     ++  regossip-excluded-txs-effects
-      ~/  %regossip-excluded-txs-effects
       ^-  (list effect:dk)
       %-  ~(rep h-in excluded-txs.c.k)
       |=  [=tx-id:t effects=(list effect:dk)]
