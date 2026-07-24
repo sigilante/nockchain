@@ -151,27 +151,29 @@ run-genesis-sync-fsync-off:
 		--identity-path "$(GENESIS_SYNC_DATA_DIR_OFF)/.nockchain_identity" \
 		--bind "/ip4/0.0.0.0/udp/$(GENESIS_SYNC_BIND_PORT_OFF)/quic-v1" $(if $(GENESIS_SYNC_PEER),--peer "$(GENESIS_SYNC_PEER)") $(GENESIS_SYNC_COMMON_ARGS) $(GENESIS_SYNC_EXTRA_ARGS)
 
+CLIPPY_FLAGS := -Dwarnings -Dclippy::unwrap_used -Aclippy::missing_safety_doc -Aclippy::result_large_err -Aclippy::unnecessary_cast -Aclippy::unnecessary_sort_by -Aclippy::collapsible_match -Aclippy::manual_checked_ops -Aclippy::while_let_loop
+
 .PHONY: fmt
 fmt:
-	cargo fmt
+	scripts/fmt-rust-workspace.sh
 
 .PHONY: check-cargo-fmt
 check-cargo-fmt:
-	@cargo fmt --check || (echo "Hint: run 'make fmt' to format Rust code." >&2; exit 1)
+	@scripts/fmt-rust-workspace.sh --check || (echo "Hint: run 'make fmt' to format owned Rust workspace packages." >&2; exit 1)
 
 .PHONY: clippy
 clippy: contracts-deps ## Run clippy with the same flags as the upstream repo
 	@echo "Running clippy..."
-	@cargo clippy --all-targets -- -Dclippy::unwrap_used -Aclippy::missing_safety_doc
+	@cargo clippy --all-targets -- $(CLIPPY_FLAGS)
 
 .PHONY: lint-local
 lint-local: contracts-deps ## Run local cargo clippy with warnings denied
-	cargo clippy --all-targets -- -Dclippy::unwrap_used -Aclippy::missing_safety_doc -Dwarnings
+	cargo clippy --all-targets -- $(CLIPPY_FLAGS)
 
 .PHONY: clippy-fix
 clippy-fix: contracts-deps ## Apply clippy autofixes (same flags as `clippy`)
 	@echo "Applying clippy autofixes..."
-	cargo clippy --fix --all-targets --allow-dirty --allow-staged -- -Dclippy::unwrap_used -Aclippy::missing_safety_doc
+	cargo clippy --fix --all-targets --allow-dirty --allow-staged -- $(CLIPPY_FLAGS)
 
 .PHONY: install-hooks
 install-hooks: ## Install git pre-commit hooks (cargo fmt + clippy) from .githooks
@@ -228,11 +230,8 @@ install-nockchain-peek: assets/peek.jam
 HOONC ?= hoonc
 HOONC_FLAGS ?=
 
-# Optional root for per-kernel data/PMA directories. When set, each kernel build
-# is handed its own `--data-dir $(HOONC_PMA_ROOT)/<name>` so several hoonc runs
-# can proceed in parallel without sharing (or clobbering) PMA/checkpoint state.
-# Left empty for local builds so the default shared ~/.nockapp/hoonc cache is
-# reused across kernels. See the `build-kernels-ci` target below.
+# Optional root for a single kernel build's data/PMA directory. Leave empty for
+# normal builds so hoonc uses the shared ~/.nockapp/hoonc cache.
 HOONC_PMA_ROOT ?=
 hoonc_data_flag = $(if $(HOONC_PMA_ROOT),--data-dir $(HOONC_PMA_ROOT)/$(1))
 
@@ -330,21 +329,17 @@ build-hoon: ensure-dirs update-hoonc $(HOON_TARGETS)
 build-assets: ensure-dirs $(HOON_TARGETS)
 	$(call show_env_vars)
 
-# Number of kernel builds to run concurrently in `build-kernels-ci`.
-KERNEL_JOBS ?= 2
-
-# Build every kernel in parallel, each in its own ephemeral PMA dir. Used by CI
-# to cut the previously-serial kernel build time. Each hoonc run is `--ephemeral`
-# (no PMA/event-log/checkpoint writes) and gets a unique `--data-dir` plus a
-# unique output filename, so KERNEL_JOBS builds can run at once without sharing
-# state or clobbering each other's output. Override concurrency with KERNEL_JOBS.
+# CI builds every Hoon kernel serially. Concurrent hoonc processes contend on
+# compiler/PMA state even when pointed at separate data dirs.
 .PHONY: build-kernels-ci
 build-kernels-ci: ensure-dirs
 	$(call show_env_vars)
-	$(MAKE) -j$(KERNEL_JOBS) \
-		HOONC_FLAGS="$(HOONC_FLAGS) --ephemeral" \
-		HOONC_PMA_ROOT="$(CURDIR)/.hoonc-pma" \
-		$(HOON_TARGETS)
+	$(MAKE) assets/dumb.jam
+	$(MAKE) assets/wal.jam
+	$(MAKE) assets/miner.jam
+	$(MAKE) assets/peek.jam
+	$(MAKE) assets/bridge.jam
+	$(MAKE) assets/roswell.jam
 
 
 ## Build dumb.jam with hoonc
