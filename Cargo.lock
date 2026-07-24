@@ -6587,6 +6587,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "nockchain-mining-common"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "futures",
+ "nockapp",
+ "nockapp-grpc",
+ "nockchain-math",
+ "nockvm",
+ "nockvm_macros",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "nockchain-peek"
 version = "0.1.0"
 dependencies = [
@@ -11946,6 +11962,36 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zk-pow-miner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "blake3",
+ "clap",
+ "futures",
+ "gnort",
+ "ibig",
+ "kernels-open-miner",
+ "nockapp",
+ "nockapp-grpc",
+ "nockchain-math",
+ "nockchain-mining-common",
+ "nockvm",
+ "nockvm_macros",
+ "num_cpus",
+ "once_cell",
+ "rand 0.9.4",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "zkvm-jetpack",
 ]
 
 [[package]]

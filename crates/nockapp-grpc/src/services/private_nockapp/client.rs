@@ -1,13 +1,22 @@
+use bytes::Bytes;
+use futures::{Stream, StreamExt};
+use nockapp::noun::slab::NounSlab;
 use tonic::transport::Channel;
 
 use crate::error::{NockAppGrpcError, Result};
-use crate::pb::common::v1::Wire;
+use crate::pb::common::v1::{ErrorStatus, Wire};
 use crate::pb::private::v1::nock_app_service_client::NockAppServiceClient as PrivateNockAppClient;
 use crate::pb::private::v1::*;
 
 #[derive(Clone)]
 pub struct PrivateNockAppGrpcClient {
     client: PrivateNockAppClient<Channel>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PokeResponseResult {
+    Acknowledged(bool),
+    Error(ErrorStatus),
 }
 
 impl PrivateNockAppGrpcClient {
@@ -48,7 +57,43 @@ impl PrivateNockAppGrpcClient {
     //     }
     // }
 
-    pub async fn poke(&mut self, pid: i32, wire: Wire, payload: Vec<u8>) -> Result<bool> {
+    /// Subscribe to the node's effect bus over the `WatchEffects` streaming
+    /// RPC. `head_filter` is a list of byte strings (e.g., `vec![b"mine".to_vec()]`);
+    /// the server forwards only effects whose head atom byte-equals one of
+    /// these. Empty filter ⇒ all effects.
+    ///
+    /// Each yielded item is a `NounSlab` containing the decoded effect noun.
+    pub async fn watch_effects(
+        &mut self,
+        pid: i32,
+        head_filter: Vec<Vec<u8>>,
+    ) -> Result<impl Stream<Item = Result<NounSlab>>> {
+        let request = WatchEffectsRequest { pid, head_filter };
+        let response = self.client.watch_effects(request).await?;
+        let inner = response.into_inner();
+        let stream = inner.map(|item| match item {
+            Ok(msg) => {
+                let mut slab = NounSlab::new();
+                match slab.cue_into(Bytes::from(msg.effect)) {
+                    Ok(_) => Ok(slab),
+                    Err(e) => Err(NockAppGrpcError::Serialization(format!(
+                        "JAM decoding of WatchEffects payload failed: {e:?}"
+                    ))),
+                }
+            }
+            Err(status) => Err(NockAppGrpcError::Internal(format!(
+                "WatchEffects stream error: {status}"
+            ))),
+        });
+        Ok(stream)
+    }
+
+    pub async fn poke_response(
+        &mut self,
+        pid: i32,
+        wire: Wire,
+        payload: Vec<u8>,
+    ) -> Result<PokeResponseResult> {
         let request = PokeRequest {
             pid,
             wire: Some(wire),
@@ -59,11 +104,18 @@ impl PrivateNockAppGrpcClient {
         let response = response.into_inner();
 
         match response.result {
-            Some(poke_response::Result::Acknowledged(ack)) => Ok(ack),
-            Some(poke_response::Result::Error(error)) => {
-                Err(NockAppGrpcError::Internal(error.message))
+            Some(poke_response::Result::Acknowledged(ack)) => {
+                Ok(PokeResponseResult::Acknowledged(ack))
             }
+            Some(poke_response::Result::Error(error)) => Ok(PokeResponseResult::Error(error)),
             None => Err(NockAppGrpcError::Internal("Empty response".to_string())),
+        }
+    }
+
+    pub async fn poke(&mut self, pid: i32, wire: Wire, payload: Vec<u8>) -> Result<bool> {
+        match self.poke_response(pid, wire, payload).await? {
+            PokeResponseResult::Acknowledged(ack) => Ok(ack),
+            PokeResponseResult::Error(error) => Err(NockAppGrpcError::Internal(error.message)),
         }
     }
 }
