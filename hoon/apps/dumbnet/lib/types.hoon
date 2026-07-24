@@ -498,9 +498,14 @@
       [%command p=command]  ::  originate locally
   ==
 ::
++$  pow-variant
+  $+  pow-variant
+  $%  [%dumb-zkpow prf=proof:sp dig=tip5-hash-atom:zeke bc=noun-digest:tip5:zeke nonce=noun-digest:tip5:zeke]
+  ==
+::
 +$  command
   $+  command
-  $%  [%pow prf=proof:sp dig=tip5-hash-atom:zeke bc=noun-digest:tip5:zeke nonce=noun-digest:tip5:zeke] :: check if a proof of work is good for the next block, issue a block if so
+  $%  [%pow pv=pow-variant]  :: check a ZK proof of work and issue its block
       [%set-mining-key v0=@t v1=@t]  ::  set $lock for coinbase in mined blocks
       [%set-mining-key-advanced v0=(list [share=@ m=@ keys=(list @t)]) v1=(list [share=@ phk=@t])]  :: multisig and/or split coinbases
       [%enable-mining p=?]  ::  switch for generating candidate blocks for mining
@@ -551,7 +556,7 @@
       [%request p=request]  :: request specific tx or block
       [%track p=track]  :: runtime tracking of blocks for %liar-block-id effect
       [%seen p=seen]    ::  seen so don't reprocess
-      [%mine mine-start]
+      [%mine-zk mine-start]
       lie
       span-effect
       [%exit code=@]

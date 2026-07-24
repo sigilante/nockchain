@@ -1,31 +1,24 @@
 //! End-to-end mock-node integration test for the zk-pow-miner.
 //!
 //! Spins up a private `NockAppService` gRPC server backed by a hand-built
-//! `NockAppHandle` (no real chain kernel), runs `zk_pow_miner::run::run_with_pool`
-//! against it with a **real** `SerfWorker` pool (loaded with `assets/miner.jam`),
-//! publishes one synthetic `%mine-zk` effect with `target = 2^400` so any
-//! digest passes, and asserts that within 60 seconds the mock observes a
-//! `ZkPowMinerWire::Mined`-wire poke whose payload begins with
-//! `[%command %pow …]` — proving the miner ran the real STARK and routed
-//! the solution back over gRPC.
+//! `NockAppHandle`, runs `zk_pow_miner::run::run_with_pool` against it with a
+//! real `SerfWorker` pool loaded from `assets/miner.jam`, then publishes one
+//! synthetic `%mine-zk` effect with `target = 2^400`.  It asserts that within
+//! 60 seconds the mock receives a `ZkPowMinerWire::Mined` poke whose payload
+//! is `[%command %pow %dumb-zkpow …]`.
 //!
-//! This is the strongest end-to-end validation that doesn't depend on
-//! `nockchain`'s fakenet bootstrap (which has a pre-existing
-//! `BlockchainConstants` ↔ `blockchain-constants:v1` schema-mismatch bug;
-//! see `scripts/fakenet-zk-pow-smoke.sh` header for details). It pairs with:
+//! The test isolates the external miner's gRPC and miner-kernel protocol from
+//! consensus bootstrap. It complements:
 //!
 //! - `crates/nockapp-grpc/src/tests.rs::watch_effects_round_trip_with_head_filter`
-//!   (proves the node-side `WatchEffects` RPC works end-to-end)
+//!   for the node-side `WatchEffects` RPC;
 //! - `crates/zk-pow-miner/src/worker.rs::tests::serf_worker_mines_trivial_target`
-//!   (proves the SerfWorker runs the STARK at trivial target in ~1.3s)
-//! - `crates/zk-pow-miner/src/run.rs::tests::run_loop_*`
-//!   (proves the run loop wires NodeClient ↔ Pool correctly with stubs)
+//!   for an individual worker's STARK proof; and
+//! - `crates/zk-pow-miner/src/run.rs::tests::run_loop_*` for run-loop control
+//!   flow.
 //!
-//! Together those four tests fully cover the zk-pow-miner integration up
-//! to the chain-bring-up boundary.
-//!
-//! Marked `#[ignore]` because spawning a real `SerfThread` + running the
-//! STARK takes ~5–10 s. Run with:
+//! Marked `#[ignore]` because spawning a real `SerfThread` and running the
+//! STARK takes several seconds. Run with:
 //!
 //!   cargo test -p zk-pow-miner --test end_to_end_mock_node --release -- --ignored
 
@@ -198,7 +191,7 @@ async fn miner_finds_and_submits_block_against_mock_node() {
         !got_pokes.is_empty(),
         "miner did not submit a %mined poke within 60s; total pokes observed = {total_pokes}"
     );
-    // Validate the first %mined poke's shape: [%command %pow ...].
+    // Validate the first %mined poke: [%command %pow %dumb-zkpow ...].
     use nockvm::noun::NounAllocator;
     let first = &got_pokes[0];
     let space = first.noun_space();
@@ -220,7 +213,17 @@ async fn miner_finds_and_submits_block_against_mock_node() {
         tail_cell.head().eq_bytes("pow"),
         "%mined poke command should be %pow"
     );
-    eprintln!("[test] PASS: %mined poke shape is [%command %pow ...]");
+    let variant_cell = tail_cell
+        .tail()
+        .noun()
+        .in_space(&space)
+        .as_cell()
+        .expect("poke variant is a cell");
+    assert!(
+        variant_cell.head().eq_bytes("dumb-zkpow"),
+        "%mined poke command should be tagged %dumb-zkpow"
+    );
+    eprintln!("[test] PASS: %mined poke shape is [%command %pow %dumb-zkpow ...]");
 }
 
 /// Build a synthetic `[%mine-zk version commit target pow-len]` effect with

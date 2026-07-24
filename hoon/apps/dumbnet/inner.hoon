@@ -757,7 +757,7 @@
       ::~&  "inner dumbnet cause: {<[-.cause -.+.cause]>}"
       =^  effs  k
         ?+    wir  ~|("Unsupported wire: {<wir>}" !!)
-            [%poke src=?(%nc %timer %sys %miner %grpc) ver=@ *]
+            [%poke src=?(%nc %timer %sys %zk-pow-miner %grpc) ver=@ *]
           ?-  -.cause
             %command  (handle-command now eny p.cause)
             %fact     (handle-fact wir eny our now p.cause)
@@ -777,9 +777,9 @@
       =/  target  ~(target get:page:t candidate-block.m.k)
       =/  commit  (block-commitment:page:t candidate-block.m.k)
       ?-  version
-        %0  [%mine %0 commit target pow-len:t]
-        %1  [%mine %1 commit target pow-len:t]
-        %2  [%mine %2 commit target pow-len:t]
+        %0  [%mine-zk %0 commit target pow-len:t]
+        %1  [%mine-zk %1 commit target pow-len:t]
+        %2  [%mine-zk %2 commit target pow-len:t]
       ==
     ::
     ::  +heard-genesis-block: check if block is a genesis block and decide whether to keep it
@@ -1455,12 +1455,9 @@
         ~|  'liar-effect: ATTN: received a bad block or tx via grpc driver'
         !!
       ::
-          [%poke %miner *]
-        ::  this indicates that the mining module built a bad block and then
-        ::  told the kernel about it. alternatively, +do-genesis produced
-        ::  a bad genesis block. this should never happen, it indicates
-        ::  a serious bug otherwise.
-        ~|  'liar-effect: ATTN: miner or +do-genesis produced a bad block!'
+          [%poke %zk-pow-miner *]
+        ::  A failed ZK-miner block is a local construction failure.
+        ~|  'liar-effect: ATTN: zk-pow-miner or +do-genesis produced a bad block!'
         !!
       ::
           [%poke %sys *]
@@ -1585,19 +1582,22 @@
       ++  do-pow
         ^-  [(list effect:dk) kernel-state:dk]
         ?>  ?=([%pow *] command)
-        =/  commit=block-commitment:t
-          (block-commitment:page:t candidate-block.m.k)
-        ?.  =(bc.command commit)
-          ~>  %slog.[1 'do-pow: Mined for wrong (old) block commitment']
+        ?-  -.pv.command
+            %dumb-zkpow
+          =/  commit=block-commitment:t
+            (block-commitment:page:t candidate-block.m.k)
+          ?.  =(bc.pv.command commit)
+            ~>  %slog.[1 'do-pow: Mined for wrong (old) block commitment']
+            [~ k]
+          ?:  %+  check-target:mine  dig.pv.command
+              ~(target get:page:t candidate-block.m.k)
+            =.  m.k  (set-pow:min prf.pv.command)
+            =.  m.k  set-digest:min
+            =^  heard-block-effs  k  (heard-block /poke/zk-pow-miner now candidate-block.m.k eny)
+            :_  k
+            heard-block-effs
           [~ k]
-        ?:  %+  check-target:mine  dig.command
-            ~(target get:page:t candidate-block.m.k)
-          =.  m.k  (set-pow:min prf.command)
-          =.  m.k  set-digest:min
-          =^  heard-block-effs  k  (heard-block /poke/miner now candidate-block.m.k eny)
-          :_  k
-          heard-block-effs
-        [~ k]
+        ==
       ::
       ++  do-set-mining-key
         ^-  [(list effect:dk) kernel-state:dk]
@@ -1626,12 +1626,10 @@
         ?:  (gth (lent v1.command) 2)
         ~>  %slog.[1 'do-set-mining-key-advanced: Coinbase split for more than two public-key hashes not yet supported, exiting']
           [[%exit 1]~ k]
-        ?~  v0.command
-        ~>  %slog.[1 'do-set-mining-key-advanced: Empty list of sigs, exiting.']
-          [[%exit 1]~ k]
-        ::
-        ?~  v1.command
-        ~>  %slog.[1 'do-set-mining-key-advanced: Empty list of public key hashes, exiting.']
+        ::  A standalone v1 miner supplies no legacy v0 signatures; only an
+        ::  entirely empty reward configuration is invalid.
+        ?:  ?&(?=(~ v0.command) ?=(~ v1.command))
+          ~>  %slog.[1 'do-set-mining-key-advanced: No keys provided, exiting.']
           [[%exit 1]~ k]
         ::
         =/  [v0-shares=(list [sig:t @]) crash=?]
@@ -1660,8 +1658,8 @@
         ?:  crash
           ~>  %slog.[1 'do-set-mining-key-advanced: Invalid public keys provided, exiting']
           [[%exit 1]~ k]
-        =.  m.k  (set-v0-shares:min v0-shares)
-        =.  m.k  (set-shares:min shares)
+        =?  m.k  ?=(^ v0-shares)  (set-v0-shares:min v0-shares)
+        =?  m.k  ?=(^ shares)     (set-shares:min shares)
         `k
       ::
       ++  do-enable-mining
@@ -1689,7 +1687,9 @@
         ::~&  >  'generation of candidate blocks enabled.'
         =.  m.k  (set-mining:min p.command)
         =.  m.k  (heard-new-block:min c.k now)
-        `k
+        ::  Enabling an external miner emits its first candidate without waiting
+        ::  for the periodic candidate refresh.
+        do-mine
       ::
       ++  do-timer
         ::TODO post-dumbnet: only rerequest transactions a max of once/twice (maybe an admin param)
@@ -1773,7 +1773,7 @@
             %2  [%2 commit target pow-len:t]
           ==
         :_  k
-        [%mine mine-start]~
+        [%mine-zk mine-start]~
       ::
       ::  only send a %elders request for reasonable heights
       ++  missing-parent-effects
