@@ -23,7 +23,7 @@
   =/  m=@  (lent pks)
   =/  [root=hash:t sc=spend-condition:v1:t *]
     (make-coinbase-lock:v1:h m pks)
-  =/  fee=coins:t  0
+  =/  fee=coins:t  sufficient-fee
   =/  sed=seed:v1:t
     (make-seed:v1:h root (sub assets.coin fee) (hash:nnote:t coin))
   =/  seds=seeds:v1:t  (~(put z-in:zoon *seeds:v1:t) sed)
@@ -251,7 +251,17 @@
 :::
 :::  +setup-v1-spendable-tx: a valid v1 tx spending the coinbase of a 2-block
 :::  chain, plus the kernel that chain lives in.
+::  a fee a block will accept. base-fee is zero under these constants, so
+::  +calculate-min-fee reduces to the flat .min-fee floor, whatever the tx
+::  weighs. the accept tests below fail if this ever stops sufficing.
+++  sufficient-fee  ^-(coins:t 256)
+::
 ++  setup-v1-spendable-tx
+  ^-  [_nockchain:h raw-tx:t]
+  (setup-v1-tx-with-fee sufficient-fee)
+::
+++  setup-v1-tx-with-fee
+  |=  fee=coins:t
   ^-  [_nockchain:h raw-tx:t]
   =+  [nockchain genesis]=init-nockchain:h
   =^  pages  nockchain
@@ -265,7 +275,6 @@
   =/  m=@  (lent pks)
   =/  [root=hash:t sc=spend-condition:v1:t *]
     (make-coinbase-lock:v1:h m pks)
-  =/  fee=coins:t  0
   =/  sed=seed:v1:t
     (make-seed:v1:h root (sub assets.coin fee) (hash:nnote:t coin))
   =/  seds=seeds:v1:t  (~(put z-in:zoon *seeds:v1:t) sed)
@@ -344,5 +353,43 @@
           (~(has z-in:zoon (filter-heard-tx-effects:h timer-effs)) raw)
           (~(has z-in:zoon (filter-heard-tx-effects:h block-effs)) raw)
           (~(has-raw-tx k-by:h nockchain) tx-id)
+      ==
+::
+::::  A tx admitted to the mempool must be one some block can carry.
+::::
+::::  +v1-to-v1 requires the fee to reach +calculate-min-fee, which is at least
+::::  .min-fee.data whatever the tx weighs. +heard-tx never applies that bound,
+::::  so a tx paying less is admitted, gossiped, retained, re-gossiped on every
+::::  new heaviest block, and re-processed by the miner on every candidate
+::::  refresh -- while no block carrying it can ever validate. Its inputs stay
+::::  pinned in .spent-by, so the sender cannot replace it either.
+++  test-v1-mempool-rejects-tx-no-block-can-carry
+  =+  [nockchain raw]=(setup-v1-tx-with-fee 0)
+  =/  tx-id=tx-id:t  ~(id get:raw-tx:t raw)
+  ::  the height a block carrying this tx would be at
+  =/  next-height=page-number:t  3
+  =/  paid-fee=coins:t
+    ?^  -.raw  0
+    (roll-fees:spends:t spends.raw)
+  =/  required-fee=coins:t
+    ?^  -.raw  0
+    (calculate-min-fee:spends:t [spends.raw next-height])
+  ::  sanity: this tx really does underpay, so a rejection below is the fee
+  ::  bound firing and not some other check
+  ?>  (lth paid-fee required-fee)
+  ::  and that no block could carry it, via the same arm consensus and the
+  ::  miner both run
+  =/  acc=tx-acc:t
+    (new:tx-acc:t `~(get-cur-balance k-by:h nockchain) next-height)
+  ?>  =([%.n %v1-insufficient-fee] (process:tx-acc:t acc raw))
+  ::
+  =^  effs=(list effect:h)  nockchain
+    (pok:h [%fact %0 %heard-tx raw] nockchain)
+  ::  not held, not gossiped, and its inputs left free for a replacement
+  %+  expect-eq
+    !>([%.n %.n %.n])
+  !>  :*  (~(has-raw-tx k-by:h nockchain) tx-id)
+          (~(has z-in:zoon (filter-heard-tx-effects:h effs)) raw)
+          (~(has-excluded k-by:h nockchain) tx-id)
       ==
 --

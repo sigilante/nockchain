@@ -1238,6 +1238,23 @@
         ~>  %slog.[1 (cat 3 'heard-tx: Transaction context invalid: ' +.ctx-valid)]
         `k
       ::
+      ::  a tx must pay what a block carrying it will require. +v1-to-v1
+      ::  applies this bound during block validation and candidate packing, so
+      ::  a tx paying less can never be mined; admitting one anyway leaves it
+      ::  gossiped, retained, re-gossiped on every new heaviest block and
+      ::  re-processed by the miner on every candidate refresh, with its
+      ::  inputs pinned in .spent-by so the sender cannot replace it. the bound
+      ::  is measured at the earliest height that could carry the tx, which is
+      ::  the height +v1-to-v1 will measure it at.
+      =/  fee-sufficient=?
+        ?^  -.raw  %.y
+        =/  next-height=page-number:t  +(get-cur-height:con)
+        %+  gte  (roll-fees:spends:t spends.raw)
+        (calculate-min-fee:spends:t [spends.raw next-height])
+      ?.  fee-sufficient
+        ~>  %slog.[1 'heard-tx: Fee below what a block would require, discarding']
+        `k
+      ::
       =^  work  c.k
         (add-raw-tx:con raw)
       :: no blocks were depending on this so work should be empty
