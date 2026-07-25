@@ -41,6 +41,20 @@ const ELDERS_REQUEST_COOLDOWN_CAP: usize = 8_192;
 /// every duplicate-block poke, which without damping turns into a burst of
 /// redundant outbound requests.
 pub(crate) const ELDERS_REQUEST_COOLDOWN: Duration = Duration::from_secs(5);
+/// Upper bound on how long one peer's elders slot is held.
+///
+/// A peer gets at most one elders request in flight. The block id the kernel
+/// names comes off a gossiped page whose digest and proof of work it has not
+/// checked yet, so it is attacker-chosen and cannot bound anything; the peer
+/// the page arrived on is the only part of the trigger an attacker cannot
+/// forge. Without this, each junk page buys an equix solve (~7ms, on the swarm
+/// loop) for a gossip message that costs the sender nothing.
+///
+/// The recovery walk is sequential -- each response drives the next request --
+/// so it never wants two at once and is not slowed. This exceeds the req-res
+/// timeout so a live request is never double-issued, and expiring the slot
+/// keeps a peer that never answers from wedging recovery.
+pub(crate) const ELDERS_INFLIGHT_TTL: Duration = Duration::from_secs(35);
 /// Upper bound on how long an in-flight processing claim is honored. A
 /// kernel poke completes in milliseconds, so any claim older than this was
 /// leaked by a delivery path that never released it. Expiring stale claims
@@ -607,6 +621,9 @@ pub struct P2PState {
     elders_negative_cache_order: VecDeque<String>,
     elders_request_last_sent: BTreeMap<String, Instant>,
     elders_request_last_sent_order: VecDeque<String>,
+    /// Peers with an elders request outstanding, and when it was issued.
+    /// Bounded by the connected peer set.
+    elders_inflight: BTreeMap<PeerId, Instant>,
     peer_request_health: BTreeMap<PeerId, PeerRequestHealth>,
     deferred_heard_blocks: BTreeMap<u64, BTreeMap<String, DeferredHeardBlock>>,
     deferred_heard_block_count_by_peer: BTreeMap<PeerId, usize>,
@@ -716,6 +733,7 @@ impl P2PState {
             elders_negative_cache_order: VecDeque::new(),
             elders_request_last_sent: BTreeMap::new(),
             elders_request_last_sent_order: VecDeque::new(),
+            elders_inflight: BTreeMap::new(),
             peer_request_health: BTreeMap::new(),
             deferred_heard_blocks: BTreeMap::new(),
             deferred_heard_block_count_by_peer: BTreeMap::new(),
@@ -1503,6 +1521,7 @@ impl P2PState {
         self.non_range_capable_peers.remove(peer_id);
         self.prefetch_peer_range_stats.remove(peer_id);
         self.prefetch_bandwidth_window.remove(peer_id);
+        self.elders_inflight.remove(peer_id);
         self.discard_deferred_blocks_for_peer(peer_id);
         if clear_replay_cache {
             self.clear_inbound_replay_cache_for_peer(peer_id);
@@ -2156,16 +2175,34 @@ impl P2PState {
     }
 
     /// Returns true when an elders request identified by `key` (block id +
-    /// target peer) may be sent now, recording the send time. Returns false
-    /// when an identical request went out within `cooldown` — the kernel
-    /// re-emits the same elders request on every duplicate-block poke, and
-    /// only the first one per window is useful.
+    /// target peer) may be sent to `peer_id` now, claiming that peer's elders
+    /// slot and recording the send time.
+    ///
+    /// Two independent gates. An identical request inside `cooldown` is always
+    /// redundant — the kernel re-emits it on every duplicate-block poke, and
+    /// only the first per window is useful. Beyond that, a peer gets one
+    /// elders request in flight at a time: the block id in the trigger is read
+    /// off a page whose digest and proof of work are still unchecked, so it
+    /// bounds nothing, while the peer it arrived on cannot be forged. The
+    /// recovery walk issues its next request only once the previous response
+    /// lands, so it never contends for the slot.
     pub fn should_send_elders_request(
         &mut self,
+        peer_id: PeerId,
         key: &str,
         now: Instant,
         cooldown: Duration,
+        inflight_ttl: Duration,
     ) -> bool {
+        if let Some(claimed_at) = self.elders_inflight.get(&peer_id) {
+            if now.duration_since(*claimed_at) < inflight_ttl {
+                return false;
+            }
+            trace!(
+                peer = %peer_id,
+                "Expiring stale elders slot; the peer never answered"
+            );
+        }
         if let Some(last_sent) = self.elders_request_last_sent.get(key) {
             if now.duration_since(*last_sent) < cooldown {
                 return false;
@@ -2181,7 +2218,19 @@ impl P2PState {
             }
         }
         self.elders_request_last_sent.insert(key.to_owned(), now);
+        self.elders_inflight.insert(peer_id, now);
         true
+    }
+
+    /// Release `peer_id`'s elders slot: its response landed, or the session
+    /// ended. Idempotent.
+    pub fn clear_elders_inflight(&mut self, peer_id: &PeerId) {
+        self.elders_inflight.remove(peer_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn elders_inflight_len(&self) -> usize {
+        self.elders_inflight.len()
     }
 
     pub fn try_start_processing_block(&mut self, block_id: &str) -> bool {
@@ -3221,33 +3270,125 @@ mod tests {
         let metrics = isolated_test_metrics();
         let mut state = P2PState::new(metrics, LIBP2P_CONFIG.seen_tx_clear_interval);
         let cooldown = Duration::from_secs(5);
+        let ttl = Duration::from_secs(35);
         let start = Instant::now();
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
         let key_a = "block-a:peer-1";
         let key_b = "block-a:peer-2";
 
         assert!(
-            state.should_send_elders_request(key_a, start, cooldown),
+            state.should_send_elders_request(peer_a, key_a, start, cooldown, ttl),
             "first elders request for a key should send"
         );
+        state.clear_elders_inflight(&peer_a);
         assert!(
-            !state.should_send_elders_request(key_a, start + Duration::from_secs(1), cooldown),
+            !state.should_send_elders_request(
+                peer_a,
+                key_a,
+                start + Duration::from_secs(1),
+                cooldown,
+                ttl
+            ),
             "identical elders request inside the cooldown window should be suppressed"
         );
         assert!(
-            state.should_send_elders_request(key_b, start, cooldown),
+            state.should_send_elders_request(peer_b, key_b, start, cooldown, ttl),
             "same block toward a different peer is a distinct key and should send"
         );
+        state.clear_elders_inflight(&peer_a);
         assert!(
-            state.should_send_elders_request(key_a, start + cooldown, cooldown),
+            state.should_send_elders_request(peer_a, key_a, start + cooldown, cooldown, ttl),
             "elders request after the cooldown elapses should send again"
         );
+        state.clear_elders_inflight(&peer_a);
         assert!(
             !state.should_send_elders_request(
+                peer_a,
                 key_a,
                 start + cooldown + Duration::from_secs(1),
-                cooldown
+                cooldown,
+                ttl
             ),
             "resend should re-arm the cooldown window"
+        );
+    }
+
+    /// One elders request in flight per peer, whatever block id it names.
+    ///
+    /// The kernel reads that block id off a gossiped page before checking its
+    /// digest or proof of work, so an attacker picks it freely and the
+    /// per-(block id, peer) cooldown never engages. Each request that gets
+    /// through costs an equix solve on the swarm loop.
+    #[test]
+    fn elders_slot_gates_distinct_block_ids_from_one_peer() {
+        let metrics = isolated_test_metrics();
+        let mut state = P2PState::new(metrics, LIBP2P_CONFIG.seen_tx_clear_interval);
+        let cooldown = Duration::from_secs(5);
+        let ttl = Duration::from_secs(35);
+        let start = Instant::now();
+        let peer = PeerId::random();
+        let other = PeerId::random();
+
+        assert!(
+            state.should_send_elders_request(peer, "forged-1:p", start, cooldown, ttl),
+            "the first elders request to a peer should send"
+        );
+        for (i, at) in [1u64, 2, 30].iter().enumerate() {
+            assert!(
+                !state.should_send_elders_request(
+                    peer,
+                    &format!("forged-{}:p", i + 2),
+                    start + Duration::from_secs(*at),
+                    cooldown,
+                    ttl
+                ),
+                "a fresh block id must not buy another elders request while the peer's slot is held"
+            );
+        }
+        assert!(
+            state.should_send_elders_request(other, "forged-2:q", start, cooldown, ttl),
+            "the slot is per peer, so another peer is unaffected"
+        );
+
+        // The walk's next step goes out as soon as the response lands.
+        state.clear_elders_inflight(&peer);
+        assert!(
+            state.should_send_elders_request(
+                peer,
+                "next-step:p",
+                start + Duration::from_millis(20),
+                cooldown,
+                ttl
+            ),
+            "releasing the slot on the response must not delay the sequential walk"
+        );
+
+        // A peer that never answers frees its slot at the TTL.
+        assert!(
+            state.should_send_elders_request(peer, "after-ttl:p", start + ttl * 2, cooldown, ttl),
+            "a silent peer must not hold its slot forever"
+        );
+    }
+
+    #[test]
+    fn elders_slot_is_released_when_the_peer_session_ends() {
+        let metrics = isolated_test_metrics();
+        let mut state = P2PState::new(metrics, LIBP2P_CONFIG.seen_tx_clear_interval);
+        let peer = PeerId::random();
+        assert!(state.should_send_elders_request(
+            peer,
+            "b:p",
+            Instant::now(),
+            Duration::from_secs(5),
+            Duration::from_secs(35)
+        ));
+        assert_eq!(state.elders_inflight_len(), 1);
+        state.remove_peer(&peer);
+        assert_eq!(
+            state.elders_inflight_len(),
+            0,
+            "a disconnected peer must not leave its elders slot claimed"
         );
     }
 

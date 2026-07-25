@@ -1285,6 +1285,7 @@ async fn handle_effect_with_dispatcher(
             let mut requested_block_height = None;
             let mut raw_tx_reopen_id = None;
             let mut elders_cooldown_key = None;
+            let mut elders_target_peer = None;
             let mut request_desc: String;
 
             let target_peers = {
@@ -1318,6 +1319,7 @@ async fn handle_effect_with_dispatcher(
                                 ) {
                                     elders_cooldown_key =
                                         Some(format!("{block_id}:{}", peer_id.to_base58()));
+                                    elders_target_peer = Some(peer_id);
                                 }
                                 vec![peer_id]
                             }
@@ -1367,17 +1369,25 @@ async fn handle_effect_with_dispatcher(
             };
 
             if let Some(cooldown_key) = elders_cooldown_key.as_deref() {
+                let Some(elders_peer) = elders_target_peer else {
+                    debug!(cooldown_key, "Dropping elders request with no target peer");
+                    return Ok(());
+                };
                 let mut state_guard = driver_state.lock().await;
                 if !state_guard.should_send_elders_request(
+                    elders_peer,
                     cooldown_key,
                     std::time::Instant::now(),
                     crate::p2p_state::ELDERS_REQUEST_COOLDOWN,
+                    crate::p2p_state::ELDERS_INFLIGHT_TTL,
                 ) {
                     drop(state_guard);
                     debug!(
                         cooldown_key,
-                        "Suppressing duplicate elders request inside cooldown window"
+                        peer = %elders_peer,
+                        "Suppressing elders request: duplicate, or the peer's slot is in use"
                     );
+                    metrics.elders_requests_suppressed.increment();
                     return Ok(());
                 }
             }

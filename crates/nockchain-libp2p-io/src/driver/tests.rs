@@ -3960,7 +3960,10 @@ fn liar_peer_reasons_from_effects(effects: &[NounSlab]) -> Vec<String> {
         .iter()
         .filter_map(|effect_slab| {
             let space = effect_slab.noun_space();
-            let effect_cell = unsafe { *effect_slab.root() }.in_space(&space).as_cell().ok()?;
+            let effect_cell = unsafe { *effect_slab.root() }
+                .in_space(&space)
+                .as_cell()
+                .ok()?;
             if !effect_cell.head().eq_bytes(b"liar-peer") {
                 return None;
             }
@@ -4034,10 +4037,7 @@ async fn heard_elders_window_ending_at_our_own_genesis_is_not_a_differing_genesi
         other => panic!("expected fake genesis heard-block fact, got {other:?}"),
     };
     let _ = poke_fact_direct(
-        &mut checkpoint_app.app,
-        peer,
-        &genesis_fact,
-        "accept fakenet genesis",
+        &mut checkpoint_app.app, peer, &genesis_fact, "accept fakenet genesis",
     )
     .await;
     assert!(
@@ -8079,6 +8079,86 @@ async fn test_elders_request_targets_source_peer_and_applies_cooldown() {
     assert!(
         swarm_rx.try_recv().is_err(),
         "duplicate elders request inside the cooldown must not be sent"
+    );
+}
+
+/// A peer cannot buy an unbounded stream of elders requests by varying the
+/// block id.
+///
+/// `+heard-block` emits the elders request from a gossiped page before
+/// checking its digest or proof of work, so the block id in the effect is
+/// attacker-chosen and the per-(block id, peer) cooldown never fires. Each
+/// request that gets through costs an equix solve on the swarm loop, against a
+/// gossip message that cost the sender nothing.
+#[tokio::test]
+async fn elders_requests_from_one_peer_are_bounded_by_its_slot() {
+    use tokio::sync::mpsc;
+
+    let source_peer = PeerId::random();
+    let peers = vec![PeerId::random(), source_peer];
+    let metrics = isolated_test_metrics();
+    let state_arc = Arc::new(Mutex::new(P2PState::new(
+        metrics.clone(),
+        LIBP2P_CONFIG.seen_tx_clear_interval,
+    )));
+    let (swarm_tx, mut swarm_rx) = mpsc::channel(16);
+
+    // Each effect names a different block id, as a forged page would.
+    let elders_effect_for = |seed: u64| {
+        let mut slab = NounSlab::new();
+        let block_id = T(&mut slab, &[D(seed), D(102), D(103), D(104), D(105)]);
+        let peer_atom =
+            Atom::from_value(&mut slab, source_peer.to_base58()).expect("peer ID should encode");
+        let elders = T(&mut slab, &[block_id, peer_atom.as_noun()]);
+        let block_request = T(&mut slab, &[D(tas!(b"elders")), elders]);
+        let request = T(&mut slab, &[D(tas!(b"block")), block_request]);
+        let effect = T(&mut slab, &[D(tas!(b"request")), request]);
+        slab.set_root(effect);
+        slab
+    };
+
+    for seed in 0..6u64 {
+        handle_effect(
+            elders_effect_for(seed),
+            swarm_tx.clone(),
+            peers.clone(),
+            false,
+            state_arc.clone(),
+            metrics.clone(),
+        )
+        .await
+        .expect("elders request should be accepted");
+    }
+
+    let mut queued = 0usize;
+    while let Ok(action) = swarm_rx.try_recv() {
+        if matches!(action, SwarmAction::QueueKernelRequest { .. }) {
+            queued += 1;
+        }
+    }
+    assert_eq!(
+        queued, 1,
+        "six forged block ids from one peer must yield one outbound elders request, not six"
+    );
+
+    // The walk's next step goes out as soon as the peer's response lands.
+    state_arc.lock().await.clear_elders_inflight(&source_peer);
+    handle_effect(
+        elders_effect_for(6),
+        swarm_tx,
+        peers,
+        false,
+        state_arc,
+        metrics,
+    )
+    .await
+    .expect("elders request after the response should be accepted");
+    assert!(
+        matches!(
+            swarm_rx.try_recv(),
+            Ok(SwarmAction::QueueKernelRequest { .. })
+        ),
+        "releasing the slot on the response must not delay the sequential recovery walk"
     );
 }
 
