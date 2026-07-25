@@ -311,6 +311,8 @@
     ~|  %missing-asert-anchor  !!
   =/  anchor-height=@  (dec activation-height.u.anchor)
   =/  anchor-min-ts=@
+    ?^  min-timestamp.u.anchor
+      u.min-timestamp.u.anchor
     ?:  =(child-height +(anchor-height))
       (~(got h-by min-timestamps.c) parent-digest)
     (get-asert-anchor-min-timestamp puzzle-type anchor-height parent-digest)

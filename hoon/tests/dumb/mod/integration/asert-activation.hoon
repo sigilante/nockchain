@@ -96,6 +96,28 @@
     ==
   (expect-eq !>(expected-atom) !>((merge:bignum got-bn)))
 ::
+::  Fixed anchor timestamps are consensus constants, not retained-state lookups.
+++  test-asert-fixed-anchor-does-not-walk-state
+  =/  bc  bc-asert
+  =/  con  (initial-consensus-state-custom:h bc)
+  =^  par=page:t  con  (add-n-pages:h 5 con default-retain:h)
+  =/  parent-digest  ~(digest get:page:t par)
+  =/  parent-min-ts  (~(got h-by min-timestamps.con) parent-digest)
+  =.  con  con(blocks *(h-map block-id:t local-page:t))
+  =/  got-bn
+    (~(compute-target-asert dcon con bc) %zk 6 parent-digest)
+  =/  expected-atom
+    %-  compute-target:asert
+    :*  asert-anchor-target-atom.bc
+        asert-anchor-min-timestamp.bc
+        asert-anchor-height.bc
+        parent-min-ts
+        6
+        asert-ideal-block-time.bc
+        asert-half-life.bc
+        max-target-atom.bc
+    ==
+  (expect-eq !>(expected-atom) !>((merge:bignum got-bn)))
 ::  +test-asert-anchor-min-ts-matches-observed: the bc-pinned constant
 ::    must equal the median-of-11 the consensus state actually wrote for
 ::    the canonical anchor block when it was accepted. this is the load-
