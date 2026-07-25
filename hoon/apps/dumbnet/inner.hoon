@@ -945,6 +945,14 @@
         ::  either oldest is genesis OR we must have received exactly 24 ids
         :_  k
         [[%liar-peer u.peer-id %less-than-24-parent-hashes]~]
+      ::  +get-elders seeds its accumulator with the block at the top of the
+      ::  window, so an elders response naming no ancestor at all is not one
+      ::  this kernel can produce. Rejecting it also keeps the walk below,
+      ::  which starts at .oldest + .ids-lent - 1, from decrementing zero.
+      ?:  =(0 ids-lent)
+        ~>  %slog.[1 'heard-elders: No parent hashes received']
+        :_  k
+        [[%liar-peer u.peer-id %no-parent-hashes]~]
       ::
       =/  log-message
         %^  cat  3
@@ -956,9 +964,12 @@
         =/  height  (dec (add oldest ids-lent))
         |-
         ?~  ids  ~
-        ?:  =(height 0)  ~
         ?:  (~(has h-by blocks.c.k) i.ids)
           `[i.ids height]
+        ::  a window reaching genesis intersects there or not at all: genesis is
+        ::  the last id such a window carries, and its height cannot be
+        ::  decremented. the membership test must therefore precede this.
+        ?:  =(height *page-number:t)  ~
         $(ids t.ids, height (dec height))
       ?~  latest-known
         ?:  =(oldest *page-number:t)

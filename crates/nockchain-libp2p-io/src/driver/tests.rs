@@ -3954,6 +3954,168 @@ async fn heard_elders_re_emits_same_recovery_window_until_progress() {
     );
 }
 
+/// Reason term of every `%liar-peer` effect in `effects`.
+fn liar_peer_reasons_from_effects(effects: &[NounSlab]) -> Vec<String> {
+    effects
+        .iter()
+        .filter_map(|effect_slab| {
+            let space = effect_slab.noun_space();
+            let effect_cell = unsafe { *effect_slab.root() }.in_space(&space).as_cell().ok()?;
+            if !effect_cell.head().eq_bytes(b"liar-peer") {
+                return None;
+            }
+            let body = effect_cell.tail().as_cell().ok()?;
+            let reason = body.tail().as_atom().ok()?.to_bytes_until_nul().ok()?;
+            Some(String::from_utf8_lossy(&reason).into_owned())
+        })
+        .collect()
+}
+
+/// An elders response naming no ancestor is rejected, at any `oldest`.
+///
+/// `+get-elders` always names at least the block at the top of its window, so
+/// an empty list is a lie. It is also the one input that would drive the
+/// ancestor walk's starting height, `oldest + len - 1`, to decrement zero: the
+/// arm computes that height before inspecting the list, and a bailed event
+/// emits no effects at all, since every reachable branch emits at least one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heard_elders_empty_ancestor_list_at_genesis_does_not_bail_the_event() {
+    let mut checkpoint_app = start_nockchain_app().await;
+    seed_fakenet_pre_genesis_direct(&mut checkpoint_app.app).await;
+    let _ = send_born_direct(&mut checkpoint_app.app).await;
+    let peer = PeerId::random();
+
+    // Control: an empty list above genesis is rejected as a lie, with an effect.
+    let control = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &heard_elders_fact(1, &[]),
+        "heard-elders oldest=1 ids=~",
+    )
+    .await;
+    assert_eq!(
+        liar_peer_reasons_from_effects(&control),
+        vec![String::from("less-than-24-parent-hashes")],
+        "oldest=1 with an empty list should be answered with %liar-peer"
+    );
+
+    let effects = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &heard_elders_fact(0, &[]),
+        "heard-elders oldest=0 ids=~",
+    )
+    .await;
+    assert_eq!(
+        liar_peer_reasons_from_effects(&effects),
+        vec![String::from("no-parent-hashes")],
+        "oldest=0 with an empty ancestor list should be answered with %liar-peer, \
+         not bail the event (decrement-underflow); effects: {:?}",
+        effects.iter().map(describe_effect).collect::<Vec<_>>()
+    );
+}
+
+/// An elders window bottoming out at a genesis block we hold intersects there.
+///
+/// The ancestor walk must test membership at height 0 before it gives up, or a
+/// window ending at the shared genesis reports no intersection and earns the
+/// peer a `%differing-genesis` ban for agreeing with us. Windows reach height 0
+/// on any fork inside the first 24 blocks of a chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heard_elders_window_ending_at_our_own_genesis_is_not_a_differing_genesis() {
+    let mut checkpoint_app = start_nockchain_app().await;
+    seed_fakenet_pre_genesis_direct(&mut checkpoint_app.app).await;
+    let _ = send_born_direct(&mut checkpoint_app.app).await;
+    let peer = PeerId::random();
+
+    let genesis_fact = fake_genesis_block_message_fact();
+    let genesis_id = match &genesis_fact {
+        NockchainFact::HeardBlock(block_id, _) => block_id.clone(),
+        other => panic!("expected fake genesis heard-block fact, got {other:?}"),
+    };
+    let _ = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &genesis_fact,
+        "accept fakenet genesis",
+    )
+    .await;
+    assert!(
+        checkpoint_has_block(&mut checkpoint_app.app, 0)
+            .await
+            .expect("genesis peek should succeed"),
+        "the test needs the genesis block accepted before asking about elders"
+    );
+
+    let effects = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &heard_elders_fact(0, &[genesis_id]),
+        "heard-elders window ending at our own genesis",
+    )
+    .await;
+
+    assert_eq!(
+        liar_peer_reasons_from_effects(&effects),
+        Vec::<String>::new(),
+        "a peer whose elders window ends at the genesis block we hold was banned; \
+         effects: {:?}",
+        effects.iter().map(describe_effect).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        request_effect_block_heights_from_effects(&effects),
+        vec![1],
+        "intersecting at genesis should request the next block by height"
+    );
+}
+
+/// A window whose genesis is not ours is still a `%differing-genesis` peer.
+///
+/// The membership test at height 0 narrows the ban to real disagreement; it
+/// must not retire it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn heard_elders_window_ending_at_a_foreign_genesis_is_a_differing_genesis() {
+    let mut checkpoint_app = start_nockchain_app().await;
+    seed_fakenet_pre_genesis_direct(&mut checkpoint_app.app).await;
+    let _ = send_born_direct(&mut checkpoint_app.app).await;
+    let peer = PeerId::random();
+
+    let _ = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &fake_genesis_block_message_fact(),
+        "accept fakenet genesis",
+    )
+    .await;
+    assert!(
+        checkpoint_has_block(&mut checkpoint_app.app, 0)
+            .await
+            .expect("genesis peek should succeed"),
+        "the test needs the genesis block accepted before asking about elders"
+    );
+
+    let foreign_genesis = {
+        let mut slab = NounSlab::new();
+        let noun = tip5_tuple(&mut slab, 90_002);
+        let space = slab.noun_space();
+        tip5_hash_to_base58(noun, &space).expect("foreign genesis should convert to base58")
+    };
+    let effects = poke_fact_direct(
+        &mut checkpoint_app.app,
+        peer,
+        &heard_elders_fact(0, &[foreign_genesis]),
+        "heard-elders window ending at a foreign genesis",
+    )
+    .await;
+
+    assert_eq!(
+        liar_peer_reasons_from_effects(&effects),
+        vec![String::from("differing-genesis")],
+        "a peer whose genesis we do not hold should still be reported; effects: {:?}",
+        effects.iter().map(describe_effect).collect::<Vec<_>>()
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn route_response_fact_repeated_heard_elders_re_emits_recovery_window_until_progress() {
     let live_traffic = build_live_traffic_cop(start_nockchain_app().await);
