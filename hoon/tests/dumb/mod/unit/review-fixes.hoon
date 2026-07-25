@@ -74,7 +74,7 @@
   =/  cand=page:t   candidate-block.new-m
   =/  cand-height   ~(height get:page:t cand)
   =/  parent-digest  ~(parent get:page:t cand)
-  =/  expected  (~(compute-target-asert dcon con bc) cand-height parent-digest)
+  =/  expected  (~(compute-target-asert dcon con bc) %zk cand-height parent-digest)
   =/  got       ~(target get:page:t cand)
   %+  expect-eq  !>(expected)  !>(got)
 ::

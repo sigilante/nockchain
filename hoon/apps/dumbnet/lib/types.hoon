@@ -18,6 +18,7 @@
       kernel-state-7
       kernel-state-8
       kernel-state-9
+      kernel-state-10
   ==
 ::
 +$  kernel-state-0
@@ -165,8 +166,19 @@
       d=derived-state-9
       constants=blockchain-constants:v1:dt
   ==
+:::
+::  kernel-state-10 records scheduled re-anchor median timestamps per accepted branch.
++$  kernel-state-10
+  $:  %10
+      c=consensus-state-10
+      a=admin-state-9
+      m=mining-state-9
+    ::
+      d=derived-state-9
+      constants=blockchain-constants:v1:dt
+  ==
 ::
-+$  kernel-state  kernel-state-9
++$  kernel-state  kernel-state-10
 ::
 +$  consensus-state-0
   $+  consensus-state-0
@@ -353,9 +365,54 @@
         =genesis-seal:dt  ::  desired seal for genesis block
     ==
   ==
+:::
++$  consensus-state-10
+  $+  consensus-state-10
+  ::
+  ::  indexes and not-fully-validated state
+  $:
+    $:
+    :: keys in raw-txs must be in EXACTLY ONE OF blocks-needed-by or excluded-txs
+        blocks-needed-by=(h-jug tx-id:dt block-id:dt) :: dependencies
+        excluded-txs=(h-set tx-id:dt) :: transactions unneeded by any block
+    ::
+    ::  every tx-id in spent-by must be in raw-txs and vice-versa
+        spent-by=(h-jug nname:dt tx-id:dt)
+    ::
+        pending-blocks=(h-map block-id:dt [=page:dt heard-at=@])  :: pending blocks
+    ==
+  ::
+  ::  core consensus state
+    $:  balance=(h-mip block-id:dt nname:dt nnote:dt)
+        txs=(h-mip block-id:dt tx-id:dt tx:dt) ::  fully validated transactions
+      ::
+      :: keys in raw-txs must be in EXACTLY ONE OF blocks-needed-by or excluded-txs
+        raw-txs=(h-map tx-id:dt [=raw-tx:dt heard-at=@]) :: raw transactions
+      ::
+        blocks=(h-map block-id:dt local-page:dt)  ::  fully validated blocks
+      ::
+        heaviest-block=(unit block-id:dt) ::  most recent heaviest block
+      ::
+      ::  min timestamp of block that is a child of this block
+        min-timestamps=(h-map block-id:dt @)
+      ::  dynamic scheduled ASERT anchor timestamps, isolated by puzzle type
+        asert-anchor-min-timestamps=(map @tas (h-map block-id:dt @))
+      ::  this map is used to calculate epoch duration. it is a map of each
+      ::  block-id to the first block-id in that epoch.
+        epoch-start=(h-map block-id:dt block-id:dt)
+      ::  this map contains the expected target for the child
+      ::  of a given block-id.
+        targets=(h-map block-id:dt bignum:bignum:dt)
+      ::
+      ::  Bitcoin block hash for genesis block
+      ::>)  TODO: change face to btc-hash?
+        btc-data=(unit (unit btc-hash:dt))
+        =genesis-seal:dt  ::  desired seal for genesis block
+    ==
+  ==
 
 ::
-+$  consensus-state  consensus-state-9
++$  consensus-state  consensus-state-10
 ::
 ::  you will not have lost any chain state if you lost pending state, you'd just have to
 ::  request data again from peers and reset your mining state
@@ -498,6 +555,23 @@
       [%command p=command]  ::  originate locally
   ==
 ::
+::  At activation, proof hashes bind one encoding of each Horner-evaluated polynomial.
+++  canonical-pow-polynomial-height  112.500
+++  canonical-pow-polynomials
+  |=  proof=proof:sp
+  ^-  ?
+  %+  levy  objects.proof
+  |=  pd=proof-data:sp
+  ?+  -.pd  %.y
+    %poly  =(p.pd (bpcan:zeke p.pd))
+  ==
+++  canonical-pow-proof
+  |=  [height=@ proof=proof:sp]
+  ^-  ?
+  ?:  (lth height canonical-pow-polynomial-height)
+    %.y
+  (canonical-pow-polynomials proof)
+:::
 +$  pow-variant
   $+  pow-variant
   $%  [%dumb-zkpow prf=proof:sp dig=tip5-hash-atom:zeke bc=noun-digest:tip5:zeke nonce=noun-digest:tip5:zeke]

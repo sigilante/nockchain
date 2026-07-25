@@ -55,7 +55,7 @@
   =/  parent-min-ts  (~(got h-by min-timestamps.con) parent-digest)
   =/  anchor-min-ts  asert-anchor-min-timestamp.bc
   =/  got-bn
-    (~(compute-target-asert dcon con bc) 5 parent-digest)
+    (~(compute-target-asert dcon con bc) %zk 5 parent-digest)
   =/  expected-atom
     %-  compute-target:asert
     :*  asert-anchor-target-atom.bc
@@ -82,7 +82,7 @@
   =/  parent-min-ts  (~(got h-by min-timestamps.con) parent-digest)
   =/  anchor-min-ts  asert-anchor-min-timestamp.bc
   =/  got-bn
-    (~(compute-target-asert dcon con bc) 6 parent-digest)
+    (~(compute-target-asert dcon con bc) %zk 6 parent-digest)
   =/  expected-atom
     %-  compute-target:asert
     :*  asert-anchor-target-atom.bc
@@ -122,7 +122,58 @@
   =^  par=page:t  con  (add-n-pages:h 4 con default-retain:h)
   =/  parent-digest  ~(digest get:page:t par)
   =/  got-bn
-    (~(compute-target-asert dcon con bc) 5 parent-digest)
+    (~(compute-target-asert dcon con bc) %zk 5 parent-digest)
   (expect-eq !>(asert-anchor-target-atom.bc) !>((merge:bignum got-bn)))
 ::
+:::
+::  The %zk schedule starts at the canonical anchor and changes at 112.500.
+::  At activation, the anchor's timestamp remains available before its cache exists.
+++  test-asert-reanchor-rate-and-timestamp-capture
+  =/  bc  bc-asert
+  =/  con  (initial-consensus-state-custom:h bc)
+  =^  par=page:t  con  (add-n-pages:h 4 con default-retain:h)
+  =/  before=(unit asert-anchor:dcon)
+    (~(active-asert-anchor dcon con bc) %zk 112.499)
+  =/  active=(unit asert-anchor:dcon)
+    (~(active-asert-anchor dcon con bc) %zk 112.500)
+  =/  wrong-type=(unit asert-anchor:dcon)
+    (~(active-asert-anchor dcon con bc) %other 112.500)
+  =/  expected-original=asert-anchor:dcon
+    [asert-phase.bc asert-anchor-target-atom.bc `asert-anchor-min-timestamp.bc]
+  =/  expected-reanchor=asert-anchor:dcon
+    [112.500 (div max-target-atom.bc (mul 3.000.000 asert-ideal-block-time.bc)) ~]
+  =/  anchor=page:t
+    ?^  -.par
+      par(height 112.499)
+    par(height 112.499)
+  =/  anchor-id=block-id:t  ~(digest get:page:t anchor)
+  =/  anchor-min-ts=@  (~(got h-by min-timestamps.con) anchor-id)
+  =/  raw-child=page:t  (make-empty-page:h par)
+  =/  child=page:t
+    ?^  -.raw-child
+      raw-child(height 112.500)
+    raw-child(height 112.500)
+  =/  child-id=block-id:t  ~(digest get:page:t child)
+  =/  recovered-target
+    (~(compute-target-asert dcon con bc) %zk 112.500 anchor-id)
+  =.  con  (~(update-asert-anchor-min-timestamps dcon con bc) %zk child)
+  =/  got-bn
+    (~(compute-target-asert dcon con bc) %zk 112.500 anchor-id)
+  =/  expected-target
+    (div max-target-atom.bc (mul 3.000.000 asert-ideal-block-time.bc))
+  %+  expect-eq
+    !>  :*  %.y
+              %.y
+              %.y
+              expected-target
+              expected-target
+              anchor-min-ts
+          ==
+  !>  :*  =(before `expected-original)
+            =(active `expected-reanchor)
+            =(wrong-type ~)
+            (merge:bignum recovered-target)
+            (merge:bignum got-bn)
+            (~(get-asert-anchor-min-timestamp dcon con bc) %zk 112.499 child-id)
+        ==
 --

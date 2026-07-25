@@ -41,8 +41,8 @@
     ::  print unlabelled, are attributable
     ~>  %slog.[0 'load: begin']
     =/  ks=kernel-state:dk
-      ~>  %slog.[0 'load: [1/5] state-n-to-9: migrating state to version 9']
-      ~>  %bout  (state-n-to-9 arg)
+      ~>  %slog.[0 'load: [1/5] state-n-to-10: migrating state to version 10']
+      ~>  %bout  (state-n-to-10 arg)
     =.  ks
       ~>  %slog.[0 'load: [2/5] check-checkpoints: verifying checkpointed digests']
       ~>  %bout  (check-checkpoints ks)
@@ -60,10 +60,10 @@
     ~>  %slog.[0 'load: complete']
     k
     ::  this arm should be renamed each state upgrade to state-n-to-[latest] and extended to loop through all upgrades
-    ++  state-n-to-9
+    ++  state-n-to-10
       |=  arg=load-kernel-state:dk
       ^-  kernel-state:dk
-      ?.  ?=(%9 -.arg)
+      ?.  ?=(%10 -.arg)
         ~>  %slog.[0 'load: State upgrade required']
         ?-  -.arg
             ::
@@ -76,9 +76,39 @@
           %6  $(arg (state-6-to-7 arg))
           %7  $(arg (state-7-to-8 arg))
           %8  $(arg (state-8-to-9 arg))
+          %9  $(arg (state-9-to-10 arg))
         ==
       arg
     ::
+    ::  upgrade kernel state 9 to kernel state 10 with typed dynamic anchor timestamps
+    ++  state-9-to-10
+      |=  arg=kernel-state-9:dk
+      ^-  kernel-state-10:dk
+      =/  new-c=consensus-state-10:dk
+        %*  .  *consensus-state-10:dk
+          blocks-needed-by                blocks-needed-by.c.arg
+          excluded-txs                    excluded-txs.c.arg
+          spent-by                        spent-by.c.arg
+          pending-blocks                  pending-blocks.c.arg
+          balance                         balance.c.arg
+          txs                             txs.c.arg
+          raw-txs                         raw-txs.c.arg
+          blocks                          blocks.c.arg
+          heaviest-block                  heaviest-block.c.arg
+          min-timestamps                  min-timestamps.c.arg
+          asert-anchor-min-timestamps    *(map @tas (h-map block-id:t @))
+          epoch-start                     epoch-start.c.arg
+          targets                         targets.c.arg
+          btc-data                        btc-data.c.arg
+          genesis-seal                    genesis-seal.c.arg
+        ==
+      :*  %10
+          c=new-c
+          a=a.arg
+          m=m.arg
+          d=d.arg
+          constants=constants.arg
+      ==
     ::  upgrade kernel state 8 to kernel state 9
     ::    h-zoon replaces the remaining consensus z containers with
     ::    digest-keyed h containers. kernel-state-8 already carries the
@@ -1093,6 +1123,7 @@
       ::
       ::  validate that powork puzzle in the proof is correct.
       ?&  (check-pow-puzzle u.pow pag)
+          (canonical-pow-proof:dk [~(height get:page:t pag) u.pow])
           ::
           ::  validate the powork. this is done separately since the
           ::  other checks are much cheaper.

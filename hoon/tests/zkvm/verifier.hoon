@@ -5,6 +5,7 @@
 /=  bp  /tests/loki/bad-pow
 /=  nv  /common/nock-verifier
 /=  np  /common/nock-prover
+/=  dk  /apps/dumbnet/lib/types
 ::
 =<
 |_  pf=proof
@@ -676,6 +677,24 @@
       m-path(leaf.p (twiddle-fpoly:bp leaf.p.m-path 0))
       +(idx)
   ==
+++  test-extra-composition-poly-canonicality
+  =/  poly
+    =/  m  (grab-proof-entry:bp pf %poly 1)
+    ?>  ?=(%poly -.m)  m
+  =/  padded=bpoly  (init-bpoly (snoc (bpoly-to-list p.poly) 0))
+  =/  padded-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %poly
+        [%poly padded]
+        1
+    ==
+  %+  expect-eq  !>  [%.y %.n]
+  !>
+  :*  (canonical-pow-proof:dk [112.499 padded-proof])
+      (canonical-pow-proof:dk [canonical-pow-polynomial-height:dk padded-proof])
+  ==
+:::
 ++  test-bad-proof-poly-wrong
   =/  poly
     =/  m  (grab-proof-entry:bp pf %poly 1)

@@ -298,32 +298,10 @@
   =/  parent-local=local-page:t  (~(got h-by blocks.c) u.heaviest-block.c)
   =/  parent=page:t  (to-page:local-page:t parent-local)
   ::  determine the target the candidate (child of .parent) must have.
-  ::    post-activation: compute aserti3-2d fresh from the anchor and the
-  ::    parent's stored median-of-11. pre-activation: read the next target
-  ::    stored at parent.digest by the epoch rule.
   =/  candidate-height=@  +(~(height get:page:t parent))
   =/  candidate-target=bignum:bignum:t
     ?:  (post-asert-activation:t candidate-height)
-      =/  parent-min-ts=@
-        (~(got h-by min-timestamps.c) u.heaviest-block.c)
-      ::  phase 2 of 014-aletheia: the anchor's median-of-11 is a
-      ::  hardcoded protocol constant. paired with the [%65.499 ...]
-      ::  checkpoint, only the canonical anchor block is admissible
-      ::  at the anchor height, so reading the constant is consensus-
-      ::  identical to the phase-1 parent-walk.
-      =/  anchor-min-ts=@
-        asert-anchor-min-timestamp.blockchain-constants
-      %-  chunk:bignum:t
-      %-  compute-target:asert
-      :*  asert-anchor-target-atom.blockchain-constants
-          anchor-min-ts
-          asert-anchor-height.blockchain-constants
-          parent-min-ts
-          candidate-height
-          asert-ideal-block-time.blockchain-constants
-          asert-half-life.blockchain-constants
-          max-target-atom:t
-      ==
+      (~(compute-target-asert dumb-consensus c blockchain-constants) %zk candidate-height u.heaviest-block.c)
     (~(got h-by targets.c) u.heaviest-block.c)
   =.  candidate-block.m
     ?^  -.parent

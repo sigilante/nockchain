@@ -221,8 +221,77 @@
   ~>  %slog.[0 (cat 3 'compute-target: New target: ' (rsh [3 2] (scot %ui next-target-atom)))]
   next-target-bn
 ::
+:::
++$  asert-anchor  [activation-height=@ target=@ min-timestamp=(unit @)]
+:::
+::  Rows are [first child height, target, fixed anchor timestamp or ~].
+::  The predecessor is the anchor; add future rows newest first.
+++  asert-target-for-rate
+  |=  proofs-per-second=@
+  ^-  @
+  (div max-target-atom:t (mul proofs-per-second asert-ideal-block-time.blockchain-constants))
+:::
+++  asert-anchor-schedule
+  ^-  (list asert-anchor)
+  :~  [112.500 (asert-target-for-rate 3.000.000) ~]
+      [asert-phase.blockchain-constants asert-anchor-target-atom.blockchain-constants `asert-anchor-min-timestamp.blockchain-constants]
+  ==
+:::
+++  asert-anchor-schedules
+  ^-  (map @tas (list asert-anchor))
+  (~(put by *(map @tas (list asert-anchor))) %zk asert-anchor-schedule)
+:::
+++  active-asert-anchor
+  |=  [puzzle-type=@tas child-height=@]
+  ^-  (unit asert-anchor)
+  =/  schedule=(unit (list asert-anchor))
+    (~(get by asert-anchor-schedules) puzzle-type)
+  ?~  schedule  ~
+  =/  anchors=(list asert-anchor)  u.schedule
+  |-
+  ?~  anchors  ~
+  =/  anchor=asert-anchor  i.anchors
+  ?:  (gte child-height activation-height.anchor)
+    `anchor
+  $(anchors t.anchors)
+:::
+++  get-asert-anchor-min-timestamp
+  |=  [puzzle-type=@tas anchor-height=@ block-id=block-id:t]
+  ^-  @
+  =/  timestamps=(unit (h-map block-id:t @))
+    (~(get by asert-anchor-min-timestamps.c) puzzle-type)
+  ?~  timestamps
+    (find-asert-anchor-min-timestamp anchor-height block-id)
+  =/  timestamp=(unit @)  (~(get h-by u.timestamps) block-id)
+  ?~  timestamp
+    (find-asert-anchor-min-timestamp anchor-height block-id)
+  u.timestamp
+:::
+::  The anchor timestamp remains derivable from a validated branch.
+++  find-asert-anchor-min-timestamp
+  |=  [anchor-height=@ block-id=block-id:t]
+  ^-  @
+  =/  local=(unit local-page:t)  (~(get h-by blocks.c) block-id)
+  ?~  local
+    ~|  %missing-asert-anchor-block  !!
+  =/  pag=page:t  (to-page:local-page:t u.local)
+  =/  height=@  ~(height get:page:t pag)
+  ?:  =(height anchor-height)
+    (~(got h-by min-timestamps.c) block-id)
+  ?.  (gth height anchor-height)
+    ~|  %asert-anchor-after-tip  !!
+  $(block-id ~(parent get:page:t pag))
+:::
+++  delete-asert-anchor-min-timestamps
+  |=  [block-id=block-id:t timestamps=(map @tas (h-map block-id:t @))]
+  ^-  (map @tas (h-map block-id:t @))
+  %+  roll  ~(tap by timestamps)
+  |=  [[puzzle-type=@tas timestamp-map=(h-map block-id:t @)] updated=_timestamps]
+  (~(put by updated) puzzle-type (~(del h-by timestamp-map) block-id))
+:::
 ::  +compute-target-asert: aserti3-2d target for a post-asert-activation block
-::
+:::
+::    .puzzle-type selects one independently anchored puzzle schedule.
 ::    .child-height is the height the block is (or will be) at;
 ::    .parent-digest identifies its parent so we can read the parent's
 ::    median-of-11 from .min-timestamps (written during parent acceptance).
@@ -232,29 +301,55 @@
 ::    target for a candidate block still being constructed.
 ++  compute-target-asert
   ~/  %compute-target-asert
-  |=  [child-height=@ parent-digest=block-id:t]
+  |=  [puzzle-type=@tas child-height=@ parent-digest=block-id:t]
   ^-  bignum:bignum:t
   =/  parent-min-ts=@
     (~(got h-by min-timestamps.c) parent-digest)
-  ::  phase 2 of 014-aletheia: the anchor's median-of-11 is a hardcoded
-  ::  protocol constant captured at the canonical anchor block (height
-  ::  65,499). paired with the [%65.499 ...] checkpoint in
-  ::  +checkpointed-digests, only one block at the anchor height is
-  ::  admissible network-wide, so reading the constant is consensus-
-  ::  identical to walking ancestry.
+  =/  anchor=(unit asert-anchor)
+    (active-asert-anchor puzzle-type child-height)
+  ?~  anchor
+    ~|  %missing-asert-anchor  !!
+  =/  anchor-height=@  (dec activation-height.u.anchor)
   =/  anchor-min-ts=@
-    asert-anchor-min-timestamp.blockchain-constants
+    ?:  =(child-height +(anchor-height))
+      (~(got h-by min-timestamps.c) parent-digest)
+    (get-asert-anchor-min-timestamp puzzle-type anchor-height parent-digest)
   %-  chunk:bignum:t
   %-  compute-target:asert
-  :*  asert-anchor-target-atom.blockchain-constants
+  :*  target.u.anchor
       anchor-min-ts
-      asert-anchor-height.blockchain-constants
+      anchor-height
       parent-min-ts
       child-height
       asert-ideal-block-time.blockchain-constants
       asert-half-life.blockchain-constants
       max-target-atom:t
   ==
+:::
+::  Dynamic anchors are retained in an independent block map per puzzle type.
+++  update-asert-anchor-min-timestamps
+  |=  [puzzle-type=@tas pag=page:t]
+  ^-  consensus-state:dk
+  =/  height=@  ~(height get:page:t pag)
+  =/  child-anchor=(unit asert-anchor)
+    (active-asert-anchor puzzle-type +(height))
+  ?~  child-anchor
+    c
+  ?^  min-timestamp.u.child-anchor
+    c
+  =/  anchor-height=@  (dec activation-height.u.child-anchor)
+  =/  block-id=block-id:t  ~(digest get:page:t pag)
+  =/  anchor-min-ts=@
+    ?:  =(height anchor-height)
+      (~(got h-by min-timestamps.c) block-id)
+    ?:  =(height +(anchor-height))
+      (~(got h-by min-timestamps.c) ~(parent get:page:t pag))
+    (get-asert-anchor-min-timestamp puzzle-type anchor-height ~(parent get:page:t pag))
+  =/  timestamp-map=(h-map block-id:t @)
+    ?~  existing=(~(get by asert-anchor-min-timestamps.c) puzzle-type)
+      *(h-map block-id:t @)
+    u.existing
+  c(asert-anchor-min-timestamps (~(put by asert-anchor-min-timestamps.c) puzzle-type (~(put h-by timestamp-map) block-id anchor-min-ts)))
 ::
 ::  +compute-epoch-duration: computes the duration of an epoch in seconds
 ::
@@ -345,6 +440,7 @@
     :-  ~(digest get:page:t pag)
     (~(got h-by epoch-start.c) ~(parent get:page:t pag))
   =.  min-timestamps.c  (update-min-timestamps now pag)
+  =.  c  (update-asert-anchor-min-timestamps %zk pag)
   ::
   =.  targets.c
     ?:  (post-asert-activation:t ~(height get:page:t pag))
@@ -354,7 +450,7 @@
       ::  keep the map shape consistent across the activation boundary.
       %-  ~(put h-by targets.c)
       :-  ~(digest get:page:t pag)
-      (compute-target-asert ~(height get:page:t pag) ~(parent get:page:t pag))
+      (compute-target-asert %zk ~(height get:page:t pag) ~(parent get:page:t pag))
     ?:  =(+(~(epoch-counter get:page:t pag)) blocks-per-epoch:t)
       ::  last block of an epoch means update to target
       %-  ~(put h-by targets.c)
@@ -444,7 +540,7 @@
   ::  check target
   =/  expected-target
     ?:  (post-asert-activation:t ~(height get:page:t pag))
-      (compute-target-asert ~(height get:page:t pag) ~(parent get:page:t pag))
+      (compute-target-asert %zk ~(height get:page:t pag) ~(parent get:page:t pag))
     (~(got h-by targets.c) ~(parent get:page:t pag))
   ?.  =(~(target get:page:t pag) expected-target)
     [%.n %page-target-invalid]
@@ -965,7 +1061,7 @@
 ::    with `got`, so any retained block naming a deleted one crashes the kernel
 ::    as soon as a child of it arrives.
 ::
-::    All six maps or none. A partial delete of .balance alone would not crash:
+:::    All seven maps or none. A partial delete of .balance alone would not crash:
 ::    +validate-page-with-txs reads balance[parent] with `get`, so the block's
 ::    children validate against an empty utxo set and are silently rejected.
 ::
@@ -983,6 +1079,8 @@
   =.  balance.c         (~(del h-by balance.c) block-id)
   =.  txs.c             (~(del h-by txs.c) block-id)
   =.  min-timestamps.c  (~(del h-by min-timestamps.c) block-id)
+  =.  asert-anchor-min-timestamps.c
+    (delete-asert-anchor-min-timestamps block-id asert-anchor-min-timestamps.c)
   =.  epoch-start.c     (~(del h-by epoch-start.c) block-id)
   =.  targets.c         (~(del h-by targets.c) block-id)
   c
