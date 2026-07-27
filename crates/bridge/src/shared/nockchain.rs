@@ -191,13 +191,7 @@ pub fn validate_blockchain_constants_match(
 }
 
 fn format_blockchain_constants(constants: &BlockchainConstants) -> String {
-    format!(
-        "v1_phase={}, bythos_phase={}, base_fee={}, coinbase_timelock_min={}",
-        constants.v1_phase,
-        constants.bythos_phase,
-        constants.base_fee,
-        constants.coinbase_timelock_min,
-    )
+    format!("{constants:?}")
 }
 
 fn decode_blockchain_constants_response(
@@ -1293,12 +1287,13 @@ mod tests {
     fn validate_blockchain_constants_match_rejects_mismatch() {
         let expected = default_fakenet_blockchain_constants();
         let mut actual = expected.clone();
-        actual.base_fee += 1;
+        actual.asert_anchor_min_timestamp += 1;
 
         let err = validate_blockchain_constants_match(&expected, &actual)
             .expect_err("mismatched constants should fail");
         let message = err.to_string();
         assert!(message.contains("bridge kernel state"));
+        assert!(message.contains("asert_anchor_min_timestamp"));
         assert!(message.contains("expected("));
         assert!(message.contains("got("));
     }
