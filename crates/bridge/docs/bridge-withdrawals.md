@@ -121,12 +121,12 @@ This spec focuses on:
      node rather than guessing mainnet/fakenet tx-engine constants
    - if bridge kernel state does not already contain `blockchain-constants`,
      the handshake result is written there for the withdrawal tx-builder seam
-   - if bridge kernel state already contains `blockchain-constants`, the
-     bridge validates the connected private node against that existing kernel
-     value during boot and any mismatch is a hard stop
-   - because the current bridge state shape is still undeployed, this
-     constants-bearing state was batched into the existing live design without
-     introducing another bridge-state version bump
+   - an existing kernel value must match the connected node during normal boot;
+     a mismatch is a hard stop
+   - `--migrate-blockchain-constants` is an explicit maintenance operation for
+     an interval in which withdrawals are disabled; it replaces the stored
+     value with the connected node's value and verifies that the kernel
+     persisted it before continuing
    - the ingress-side withdrawal proposal transport remains in the main bridge
      process, while the sequencer gRPC surface is now hosted on the Nockchain
      API node process
@@ -238,8 +238,10 @@ This spec focuses on:
 20. On startup, the bridge peeks `blockchain-constants` from bridge kernel
     state first. If the kernel has no value yet, the bridge fetches constants
     from the connected private Nockchain node and seeds kernel state. If the
-    kernel already has a value, the bridge compares the connected node against
-    that existing kernel value and stops on mismatch rather than overwriting it.
+    kernel already has a value, normal boot compares it with the connected node
+    and stops on mismatch. `--migrate-blockchain-constants` is an explicit
+    maintenance-only replacement path while withdrawals are disabled; it reads
+    the stored value back before continuing.
 21. The sequencer service observes transaction-to-block inclusion directly from
     the colocated public Nockchain API and durably records confirmation for
     the authorized withdrawal before clearing its authoritative in-flight

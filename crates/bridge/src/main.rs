@@ -101,6 +101,12 @@ struct BridgeCli {
         help = "Number of days of logs to maintain (default: 7, disable with 0)"
     )]
     log_retention_days: Option<usize>,
+
+    #[arg(
+        long,
+        help = "Replace stored blockchain constants with the connected Nockchain node's values; use only while withdrawals are disabled"
+    )]
+    migrate_blockchain_constants: bool,
 }
 
 const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../bridge-conf.example.toml");
@@ -556,17 +562,29 @@ mod planner_fee_tests {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum KernelBlockchainConstantsBootAction {
     InitializeKernel,
+    MigrateKernel,
     UseExistingKernel,
 }
 
 fn resolve_effective_blockchain_constants(
     kernel_blockchain_constants: Option<BlockchainConstants>,
     connected_blockchain_constants: BlockchainConstants,
+    migrate_blockchain_constants: bool,
 ) -> Result<(BlockchainConstants, KernelBlockchainConstantsBootAction), BridgeError> {
     match kernel_blockchain_constants {
+        Some(kernel_blockchain_constants)
+            if kernel_blockchain_constants != connected_blockchain_constants
+                && migrate_blockchain_constants =>
+        {
+            Ok((
+                connected_blockchain_constants,
+                KernelBlockchainConstantsBootAction::MigrateKernel,
+            ))
+        }
         Some(kernel_blockchain_constants) => {
             validate_blockchain_constants_match(
-                &kernel_blockchain_constants, &connected_blockchain_constants,
+                &kernel_blockchain_constants,
+                &connected_blockchain_constants,
             )?;
             Ok((
                 kernel_blockchain_constants,
@@ -772,19 +790,41 @@ async fn main() -> Result<(), BridgeError> {
         bootstrap_blockchain_constants(config_toml.grpc_address()).await?;
     let existing_kernel_blockchain_constants = peek_kernel_blockchain_constants(&mut app).await?;
     let (effective_blockchain_constants, boot_action) = resolve_effective_blockchain_constants(
-        existing_kernel_blockchain_constants, connected_blockchain_constants,
+        existing_kernel_blockchain_constants,
+        connected_blockchain_constants,
+        cli.migrate_blockchain_constants,
     )?;
-    if boot_action == KernelBlockchainConstantsBootAction::InitializeKernel {
-        set_kernel_blockchain_constants(&mut app, &effective_blockchain_constants).await?;
-        info!(
-            target: "bridge.withdrawal",
-            "initialized bridge kernel blockchain-constants from connected private nockchain node"
-        );
-    } else {
-        info!(
-            target: "bridge.withdrawal",
-            "confirmed bridge kernel blockchain-constants match the connected private nockchain node"
-        );
+    match boot_action {
+        KernelBlockchainConstantsBootAction::InitializeKernel => {
+            set_kernel_blockchain_constants(&mut app, &effective_blockchain_constants).await?;
+            info!(
+                target: "bridge.withdrawal",
+                "initialized bridge kernel blockchain-constants from connected private nockchain node"
+            );
+        }
+        KernelBlockchainConstantsBootAction::MigrateKernel => {
+            set_kernel_blockchain_constants(&mut app, &effective_blockchain_constants).await?;
+            let persisted = peek_kernel_blockchain_constants(&mut app).await?.ok_or_else(|| {
+                BridgeError::Runtime(
+                    "bridge kernel did not persist migrated blockchain constants".to_owned(),
+                )
+            })?;
+            if persisted != effective_blockchain_constants {
+                return Err(BridgeError::Runtime(
+                    "bridge kernel did not persist migrated blockchain constants".to_owned(),
+                ));
+            }
+            info!(
+                target: "bridge.withdrawal",
+                "migrated bridge kernel blockchain-constants from connected private nockchain node"
+            );
+        }
+        KernelBlockchainConstantsBootAction::UseExistingKernel => {
+            info!(
+                target: "bridge.withdrawal",
+                "confirmed bridge kernel blockchain-constants match the connected private nockchain node"
+            );
+        }
     }
     let (active_bridge_lock_root, spend_authority_spend_condition) =
         resolve_validated_bridge_spend_authority(
@@ -1410,8 +1450,9 @@ mod tests {
     fn resolve_effective_blockchain_constants_initializes_kernel_when_missing() {
         let connected = default_fakenet_blockchain_constants();
 
-        let (effective, action) = resolve_effective_blockchain_constants(None, connected.clone())
-            .expect("missing kernel constants should initialize");
+        let (effective, action) =
+            resolve_effective_blockchain_constants(None, connected.clone(), false)
+                .expect("missing kernel constants should initialize");
 
         assert_eq!(effective, connected);
         assert_eq!(
@@ -1426,7 +1467,7 @@ mod tests {
         let connected = kernel.clone();
 
         let (effective, action) =
-            resolve_effective_blockchain_constants(Some(kernel.clone()), connected)
+            resolve_effective_blockchain_constants(Some(kernel.clone()), connected, false)
                 .expect("matching kernel constants should be accepted");
 
         assert_eq!(effective, kernel);
@@ -1442,9 +1483,23 @@ mod tests {
         let mut connected = kernel.clone();
         connected.coinbase_timelock_min += 1;
 
-        let err = resolve_effective_blockchain_constants(Some(kernel), connected)
+        let err = resolve_effective_blockchain_constants(Some(kernel), connected, false)
             .expect_err("mismatched kernel constants should fail");
         assert!(err.to_string().contains("bridge kernel state"));
+    }
+
+    #[test]
+    fn resolve_effective_blockchain_constants_migrates_mismatch_only_when_explicit() {
+        let kernel = default_fakenet_blockchain_constants();
+        let mut connected = kernel.clone();
+        connected.coinbase_timelock_min += 1;
+
+        let (effective, action) =
+            resolve_effective_blockchain_constants(Some(kernel), connected.clone(), true)
+                .expect("explicit migration should accept a mismatch");
+
+        assert_eq!(effective, connected);
+        assert_eq!(action, KernelBlockchainConstantsBootAction::MigrateKernel);
     }
 
     #[test]
