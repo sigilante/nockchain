@@ -6,7 +6,9 @@
 /=  *   /common/zose
 /=  *  /common/zeke
 /=  wt  /apps/wallet/lib/types
-|_  bug=?
+~%  %wallet-utils  ..ut  ~
+|_  [bug=? bc=blockchain-constants:transact]
++*  t  ~(. transact bc)
 ::
 ::  print helpers
 ++  warn
@@ -35,37 +37,94 @@
 ::
 ++  estimate-fee
   |%
+  ::  Commonly used constants
+  ::  - 13 leaves for the key which is a schnorr-pubkey:
+  ::    - 6 for x, 6 for y, 1 for inf flag
+  ::  - 16 leaves for the signature
+  ++  pubkey-count  13
+  ++  signature-count  16
+  ++  hash-count  5
+  ++  pkh-spend
+    |=  $:  =note-data:t
+            num-input-notes=@
+            m=@
+            signers=(z-set:zo schnorr-pubkey:t)
+        ==
+    =/  seed-count=@
+      =/  data-size=@
+        %-  num-of-leaves:shape
+        %-  ~(rep z-by:zo note-data)
+        |=  [[k=@tas v=*] tree=*]
+        [k v tree]
+      ::  each seed is a spend from an input note into output note(s).
+      ::  note-data is attached to the output of each seed.
+      ::  note-data size is calculated from the inputs even though it should not be.
+      (mul data-size num-input-notes)
+    =/  witness-count=@
+      =/  pkh-count
+        =/  num-sigs-required  (mul m num-input-notes)
+        (map-words num-sigs-required hash-count (add signature-count pubkey-count))
+      =/  lmp-count
+        ::  1 for the sig at the end of the list, 1 for the number of signers (m),
+        ::  added to the number of leaves in the set of valid signers
+        =/  pkh-spend-condition  :(add 1 1 (set-words hash-count pubkey-count))
+        =/  merk-proof  (add hash-count 1)
+        =/  axis-count  1
+        :(add pkh-spend-condition merk-proof axis-count)
+      :(add hax-count=1 tim-count=1 pkh-count lmp-count)
+    =/  fee  (mul base-fee.bc (add witness-count seed-count))
+    (max fee min-fee.data.bc)
+  ::
+  ++  transaction
+    |=  [=transaction:wt page-num=page-number:transact]
+    (spends spends.transaction inputs.metadata.transaction page-num)
   ++  spends
-    |=  [raw-spends=spends:v1:transact =input-display:wt]
-    =+  bc=*blockchain-constants:transact
-    =/  word-count=@
-      %-  ~(rep z-by:zo raw-spends)
-      |=  [[nam=nname:transact sp=spend:v1:transact] acc=@]
-      %+  add  acc
-      %+  add
-        (witness-words sp nam input-display)
-      (count-seed-words:spend-v1:transact sp)
-    =/  word-fee=@  (mul word-count base-fee.bc)
+    |=  [raw-spends=spends:v1:transact =input-metadata:wt page-num=page-number:transact]
+    =/  bythos-active=?  (gte page-num bythos-phase.bc)
+    =/  seeds-count=@
+      :: count seeds against the tx-engine instance already bound to this wallet's constants
+      (count-seed-words:spends:t [raw-spends page-num])
+    =/  witness-count=@
+      (count-witness-words [raw-spends input-metadata page-num])
+    ::  match consensus formula:
+    ::    - pre-bythos: legacy base-fee (2x current base-fee), no input discount
+    ::    - post-bythos: configured base-fee with discounted input fees
+    =/  effective-base-fee=@  ?:(bythos-active base-fee.bc (mul 2 base-fee.bc))
+    =/  witness-divisor=@  ?:(bythos-active input-fee-divisor.bc 1)
+    =/  seed-fee=@  (mul seeds-count effective-base-fee)
+    =/  witness-fee=@  (div (mul witness-count effective-base-fee) witness-divisor)
+    =/  word-fee=@  (add seed-fee witness-fee)
     (max word-fee min-fee.data.bc)
+  ::
+  ++  count-witness-words-raw
+    |=  [raw-spends=spends:v1:transact =input-metadata:wt]
+    ^-  @
+    %-  ~(rep z-by:zo raw-spends)
+    |=  [[nam=nname:transact sp=spend:v1:transact] acc=@]
+    %+  add  acc
+    (witness-words sp nam input-metadata)
+  ::
+  ++  count-witness-words
+    |=  [raw-spends=spends:v1:transact =input-metadata:wt page-num=page-number:transact]
+    ?:  (gte page-num bythos-phase.bc)
+      (count-witness-words-raw [raw-spends input-metadata])
+    (count-witness-words-raw [raw-spends input-metadata])
   ::
   ::  +witness-words: estimate the number of words in a witness
   ++  witness-words
-    |=  [=spend:v1:transact nam=nname:transact =input-display:wt]
+    |=  [=spend:v1:transact nam=nname:transact =input-metadata:wt]
     ?-    -.spend
         %0
-      ?>  ?=(%0 -.input-display)
+      ?>  ?=(%0 -.input-metadata)
       =/  signature-leaves=@
-        ::  - 13 leaves for the key which is a schnorr-pubkey:
-        ::    - 6 for x, 6 for y, 1 for inf flag
-        ::  - 16 leaves for the signature
         =/  num-sigs-required=@
-          =/  =sig:transact  (~(got z-by:zo p.input-display) nam)
+          =/  =sig:transact  (~(got z-by:zo p.input-metadata) nam)
           m.sig
-        (map-words num-sigs-required 13 16)
+        (map-words num-sigs-required signature-count pubkey-count)
       signature-leaves
     ::
         %1
-      ?>  ?=(%1 -.input-display)
+      ?>  ?=(%1 -.input-metadata)
       =/  =witness:transact  witness.+.spend
       ?>  ?&  !=(*lock-merkle-proof:v1:transact lmp.witness)
               =(~ tim.witness)
@@ -75,18 +134,15 @@
       =/  tim-count=@  (num-of-leaves:shape tim.witness)
       =/  hax-count=@  (num-of-leaves:shape hax.witness)
       =/  pkh-count=@
-        ::  5 leaves for the key which is a hash
-        ::  13 leaves for the schnorr-pubkey: 6 for x, 6 for y, 1 for inf flag
-        ::  16 leaves for the signature
         =/  num-sigs-required=@
-          =/  sc=spend-condition:transact  (~(got z-by:zo p.input-display) nam)
+          =/  sc=spend-condition:transact  (~(got z-by:zo p.input-metadata) nam)
           %+  roll  sc
           |=  [lp=lock-primitive:transact acc=@]
           ::  TODO handle hax lock primitives size contribution. for now we will just do pkhs
           ?.  ?=(%pkh -.lp)
             acc
           (add acc m.lp)
-        (map-words num-sigs-required 5 (add 13 16))
+        (map-words num-sigs-required hash-count (add pubkey-count signature-count))
       :(add lmp-count pkh-count tim-count hax-count)
     ==
   ::
@@ -107,6 +163,13 @@
     =+  per-node-count=(add key-leaves val-leaves)
     %+  add  (mul entries per-node-count)
     (add entries 1)
+  ::
+  ++  set-words
+    |=  $:  entries=@
+            val-leaves=@
+        ==
+    ^-  @
+    (map-words entries 0 val-leaves)
   --
 ++  locks
   |%
@@ -120,7 +183,7 @@
       =/  simple-lock  [(simple-pkh-lp:v1:first-name:transact u.pkh)]~
       ?:  =((first:nname:transact (hash:lock:transact simple-lock)) -.nn)
         (some simple-lock)
-      =/  coinbase-lock  (coinbase-pkh-sc:v1:first-name:transact u.pkh)
+      =/  coinbase-lock  (coinbase-pkh-sc:v1:first-name:t u.pkh)
       ?:  =((first:nname:transact (hash:lock:transact coinbase-lock)) -.nn)
         (some coinbase-lock)
       ~>  %slog.[2 'unsupported lock type']
@@ -133,6 +196,16 @@
   ++  pull
     |=  [nd=note-data:v1:transact nn=nname:transact pkh=(unit hash:transact)]
     ^-  (unit spend-condition:transact)
+    ::  Protocol-fund coinbase notes (014-aletheia) wrap an unsatisfiable %pkh
+    ::  lock; their spend-condition cannot be recovered from the first-name by
+    ::  the normal path below, because the real 3-of-4 multisig hashes to
+    ::  fund-address whose first-name (3SnB...) differs from the note's wrapped
+    ::  first-name (+fund-note-firstname). Resolve them directly to the multisig
+    ::  so the wallet builds an LMP revealing it and signs with the participant
+    ::  keys; the kernel's +check-multisig-lock binds that revealed
+    ::  spend-condition back to fund-address. See tx-engine-1.
+    ?:  =(-.nn fund-note-firstname:t)
+      (some fund-multisig-lock:t)
     ?~  lok=(pull-inner [nd nn pkh])
       ~
     ?:  =((first:nname:transact (hash:lock:transact u.lok)) -.nn)
@@ -179,6 +252,7 @@
   --
 ::
 ++  vault
+  ~%  %wvault  ..vault  ~
   |_  =state:wt
   ::
   ++  base-path  ^-  trek
@@ -304,6 +378,28 @@
         'N/A'
       (lock:v1:display u.lock.meta)
     ::
+    ++  watch-first-name-locks
+      ^-  (list [name=hash:transact lock=(unit lock:transact)])
+      =+  subtree=(~(kids of keys.state) watch-path)
+      %+  murn
+        ~(tap by kid.subtree)
+      |=  [=trek =meta:wt]
+      ?.  ?=(%first-name -.meta)
+        ~
+      %-  some
+      [name.meta lock.meta]
+    ::
+    ::  Resolve a base58 first-name to its watched first-name entry (a multisig
+    ::  lock imported via `watch multisig`). Returns ~ if not currently watched.
+    ++  watch-first-name-by-b58
+      |=  first-name-b58=@t
+      ^-  (unit [name=hash:transact lock=(unit lock:transact)])
+      =/  =trek  (welp watch-path ~[t/first-name-b58])
+      =/  meta=(unit meta:wt)  (~(get of keys.state) trek)
+      ?~  meta  ~
+      ?.  ?=(%first-name -.u.meta)  ~
+      `[name.u.meta lock.u.meta]
+    ::
     ++  watch-first-names
       ^-  (list @t)
       =+  subtree=(~(kids of keys.state) watch-path)
@@ -316,8 +412,8 @@
         ?:  (gte (met 3 addr) 132)
           acc
         =+  pubkey-hash=(from-b58:hash:transact addr)
-        =+  simple-name=(simple:v1:first-name:transact pubkey-hash)
-        =+  coinbase-name=(coinbase:v1:first-name:transact pubkey-hash)
+        =+  simple-name=(simple:v1:first-name:t pubkey-hash)
+        =+  coinbase-name=(coinbase:v1:first-name:t pubkey-hash)
         :+  (to-b58:hash:transact simple-name)
           (to-b58:hash:transact coinbase-name)
         acc
@@ -386,6 +482,7 @@
     --
   ::
   ++  get-note
+    ~/  %get-note
     |=  name=nname:transact
     ^-  nnote:transact
     ?:  (~(has z-by:zo notes.balance.state) name)
@@ -489,6 +586,7 @@
   -- ::vault
   ::
   ++  display
+    ~%  %wdisp  ..display  ~
     |%
     ++  common
       |%
@@ -496,6 +594,23 @@
           |=  @
           ^-  @t
           (rsh [3 2] (scot %ui +<))
+        ::  render a nick amount in nocks (whole nocks + remainder nicks),
+        ::  on cords only -- 1 nock = 2^16 nicks.
+        ++  format-nocks
+          |=  nicks=@
+          ^-  @t
+          =/  d  (dvr nicks 65.536)
+          %+  rap  3
+          :~  (format-ui p.d)
+              ' nocks '
+              (format-ui q.d)
+              ' nicks'
+          ==
+        ++  format-ux
+          |=  @ux
+          ^-  @t
+          %-  crip
+          (z-co:co +<)
         ::
         ++  poke
           |=  =cause:wt
@@ -613,6 +728,7 @@
       ::
       --  ::  +v0
     ++  v1
+      ~%  %wdisp-v1  ..v1  ~
       |%
       ++  name
         |=  name=nname:transact
@@ -621,6 +737,7 @@
         :((cury cat 3) '[' first ' ' last ']')
       ::
       ++  lock
+        ~/  %disp-lock
         |=  lk=lock:transact
         ^-  @t
         =/  cond=(unit spend-condition:transact)
@@ -632,8 +749,6 @@
       ++  lock-primitive
         |=  prim=lock-primitive:transact
         ^-  cord
-        =;  txt=@t
-          (cat 3 txt '\0a---')
         ?-    -.prim
             %pkh
           =/  participants=(list hash:transact)  ~(tap z-in:zo h.prim)
@@ -672,9 +787,9 @@
             ?~  min.abs.prim  'N/A'
             (format-ui:common u.min.abs.prim)
           =/  abs-max=@t
-            ?~  max.abs.prim  'N/A'
             %^  cat  3
               '\0a      - Max Absolute Height: '
+            ?~  max.abs.prim  'N/A'
             (format-ui:common u.max.abs.prim)
           ;:  (cury cat 3)
               '\0a    - Time Lock'
@@ -689,6 +804,7 @@
         ==
       ::
       ++  spend-condition
+        ~/  %disp-sc
         |=  cond=spend-condition:transact
         ^-  @t
         %+  roll  cond
@@ -699,6 +815,7 @@
         ==
       ::
       ++  lock-data
+        ~/  %disp-lockdata
         |=  data=note-data:v1:transact
         ^-  @t
         ?~  lock-data=(~(get z-by:zo data) %lock)
@@ -733,14 +850,50 @@
       ++  lock-metadata
         |=  data=lock-metadata:wt
         ^-  @t
-        =/  cond=(unit spend-condition:transact)
-          ((soft spend-condition:transact) lock.data)
-        ?~  cond
-          '\0a  - Lock data not displayable'
-        ;:  (cury cat 3)
-          '\0a  - Lock data included in note: '
-          (bool-text include-data.data)
-          (spend-condition u.cond)
+        =?  data  ?=(^ -.data)
+          [%1 %lock data]
+        ?>  ?=(@ -.data)
+        ?-    -.+.data
+            %lock
+          =/  cond=(unit spend-condition:transact)
+            ((soft spend-condition:transact) lock.data)
+          ?~  cond
+            '\0a  - Lock data not displayable'
+          ;:  (cury cat 3)
+            '\0a  - Lock data included in note: '
+            (bool-text include-data.data)
+            (spend-condition u.cond)
+          ==
+        ::
+            %lock-root
+          ;:  (cury cat 3)
+            '\0a  - Lock data included in note: '
+            (bool-text %.n)
+            '\0a  - Assets should go to lock script root: '
+            (to-b58:hash:transact root.data)
+          ==
+        ::
+            %bridge-deposit
+          ;:  (cury cat 3)
+            '\0a  - Lock data included in note: '
+            (bool-text %.n)
+            '\0a  - Bridge Deposit: '
+            '\0a          - Assets should go to lock script root (this should be bridge operator lock root): '
+            (to-b58:hash:transact root.data)
+            '\0a          - EVM recipient address (tokens should mint to this address): '
+            (format-ux:common evm-addr.data)
+          ==
+        ::
+            %bridge-withdrawal
+          ;:  (cury cat 3)
+            '\0a  - Lock data included in note: '
+            (bool-text %.n)
+            '\0a  - Bridge Withdrawal: '
+            '\0a          - Assets should go to lock script root: '
+            (to-b58:hash:transact root.data)
+            '\0a          - Base batch end: '
+            (format-ui:common base-batch-end.data)
+          ==
         ==
     ::
       ++  note-from-balance
@@ -748,6 +901,7 @@
         (^note note (lock-data note-data.note) %.n)
     ::
       ++  note-from-output
+        ~/  %disp-nfo
         |=  $:  note=nnote-1:v1:transact
                 metadata=(unit lock-metadata:wt)
             ==
@@ -759,6 +913,7 @@
         (^note note lock-info %.y)
     ::
       ++  note-from-input
+        ~/  %disp-nfi
         |=  $:  note=nnote-1:v1:transact
                 sc=spend-condition:transact
             ==
@@ -769,6 +924,7 @@
       ::  +note: display note. Sometimes lock data is not included in note, it can be passed in
       ::    separately in the output-lock-map which is accumulated in the tx-builder.
       ++  note
+        ~/  %disp-note
         |=  $:  note=nnote-1:v1:transact
                 lock-info=@t
                 output=?
@@ -784,8 +940,8 @@
            (name name.note)
            '\0a- Version: '
            (format-ui:common 1)
-           '\0a- Assets (nicks): '
-           (format-ui:common assets.note)
+           '\0a- Assets: '
+           (format-nocks:common assets.note)
            '\0a- Block Height: '
            ?:  output
              'N/A (output note has not been submitted yet)'
@@ -795,6 +951,7 @@
          ==
     ::
       ++  witness-data
+        ~/  %disp-wd
         |=  wd=witness-data:wt
         ^-  @t
         =;  signers=(set @t)
@@ -849,60 +1006,77 @@
     ::
     ::  show-tx should require sync now
       ++  transaction
+        ~/  %disp-tx
         |=  $:  name=@t
                 outs=outputs:v1:transact
                 fees=@
-                display=transaction-display:wt
+                metadata=metadata:wt
                 get-note=$-(nname:transact nnote:transact)
                 wd=(unit witness-data:wt)
             ==
         ^-  @t
-        =/  input-notes=tape
-          ?:  ?=(%0 -.inputs.display)
-            %-  zing
+        ::  Build the markdown report entirely on cords (cat/rap, bloq 3) with no
+        ::  {} interpolation and no +trip. Interpolating the large input/output
+        ::  note cords with {} dominated create-tx time (~22s at 100 inputs);
+        ::  cord concatenation is linear.
+        =/  input-notes=@t
+          ?:  ?=(%0 -.inputs.metadata)
+            %+  rap  3
             %+  turn
-            ~(tap z-in:zo ~(key z-by:zo p.inputs.display))
+              ~(tap z-in:zo ~(key z-by:zo p.inputs.metadata))
             |=  =nname:transact
-            =+  note=(get-note nname)
+            ::  Tolerate inputs missing from the synced balance (already spent,
+            ::  or not owned by this wallet) instead of bailing the whole
+            ::  display -- show a placeholder line so `show-tx`/`send-tx` still
+            ::  render a confirmed or partially-spent tx.
+            =/  m-note=(unit nnote:transact)  (mole |.((get-note nname)))
+            ?~  m-note
+              %+  rap  3
+              :~  '\0a- '  (name:v1:display nname)
+                  ': input note not in synced balance (already spent or not owned)'
+              ==
+            =/  note=nnote:transact  u.m-note
             ?@  -.note
               ~|  %expected-v0-note-but-got-v1-note  !!
-            "\0a{(trip (note:v0 note))}"
-          %-  zing
+            (cat 3 '\0a' (note:v0 note))
+          %+  rap  3
           %+  turn
-            ~(tap z-by:zo p.inputs.display)
+            ~(tap z-by:zo p.inputs.metadata)
           |=  [name=nname:transact sc=spend-condition:transact]
-          =/  out-note=nnote:transact  (get-note name)
+          =/  m-note=(unit nnote:transact)  (mole |.((get-note name)))
+          ?~  m-note
+            %+  rap  3
+            :~  '\0a- '  (name:v1:display name)
+                ': input note not in synced balance (already spent or not owned)'
+            ==
+          =/  out-note=nnote:transact  u.m-note
           ?^  -.out-note
             ~|  %expected-v1-note-but-got-v0-note  !!
-          "\0a{(trip (note-from-input out-note sc))}"
-        =/  output-notes=tape
-          %-  zing
+          (cat 3 '\0a' (note-from-input out-note sc))
+        =/  output-notes=@t
+          %+  rap  3
           %+  turn
             ~(tap z-in:zo outs)
           |=  out=output:v1:transact
           =/  out-note=nnote:v1:transact  note.out
           =+  fn=~(first-name get:nnote:transact out-note)
-          =+  metadata=(~(get z-by:zo outputs.display) fn)
+          =+  out-metadata=(~(get z-by:zo outputs.metadata) fn)
           ?^  -.out-note
-            "\0a{(trip (note:v0 out-note))}"
-          "\0a{(trip (note-from-output out-note metadata))}"
-        %-  crip
-        """
-        ## Transaction Information
-        - Name: {(trip name)}
-        - Fee: {(trip (format-ui:common fees))}
-
-        ### Input Notes
-        {input-notes}
-
-        ### Output Notes
-        {output-notes}
-
-        ### Witness Data
-        {(trip ?~(wd 'N/A' (witness-data u.wd)))}
-        ---
-
-        """
+            (cat 3 '\0a' (note:v0 out-note))
+          (cat 3 '\0a' (note-from-output out-note out-metadata))
+        %+  rap  3
+        :~  '\0a### Transaction Information\0a- Name: '
+            name
+            '\0a- Fee: '
+            (format-nocks:common fees)
+            '\0a\0a### Input Notes\0a'
+            input-notes
+            '\0a\0a### Output Notes\0a'
+            output-notes
+            '\0a\0a### Witness Data\0a'
+            ?~(wd 'N/A' (witness-data u.wd))
+            '\0a---\0a\0a'
+        ==
       --  ::  +v1
     --  ::  +display
   ::
@@ -952,7 +1126,8 @@
           Wallet balance from block {(trip block-b58)} at height {<height.balance.state>}
           - Wallet Version: {<-.state>}
           - Number of Notes: {(trip (format-ui:common:display total-notes))}
-          - Balance: {(trip (format-ui:common:display total-nicks))} nicks
+          - Balance: {(trip (format-nocks:common:display total-nicks))}
+          - Balance (raw): {(trip (format-ui:common:display total-nicks))} nicks
           """
         (make-markdown-effect nodes)
       ::
@@ -976,4 +1151,10 @@
       ^-  tape
       %-  trip
       (rsh [3 2] (scot %ui +<))
+  ::
+  ++  ux-to-tape
+      |=  @
+      ^-  tape
+      %-  trip
+      (rsh [3 2] (scot %ux +<))
   --

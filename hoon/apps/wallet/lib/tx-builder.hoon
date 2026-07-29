@@ -1,23 +1,30 @@
 /=  transact  /common/tx-engine
-/=  utils  /apps/wallet/lib/utils
+/=  wutils  /apps/wallet/lib/utils
 /=  wt  /apps/wallet/lib/types
 /=  zo  /common/zoon
+/=  bridge  /apps/bridge/types
 ::
-::  Builds a fan-in transaction that can emit both simple PKH and multisig locks.
+::  Builds m-to-n transaction that can emit both simple PKH and multisig locks.
+|_  bc=blockchain-constants:transact
++*  t  ~(. transact bc)
+    utils  ~(. wutils %.y bc)
+++  build
+::>)  TODO: change the function signature to accept a set of notes
 |=  $:  names=(list nname:transact)
         orders=(list order:wt)
         fee=coins:transact
+        allow-low-fee=?
         sign-keys=(list schnorr-seckey:transact)
         refund-pkh=(unit hash:transact)
         get-note=$-(nname:transact nnote:transact)
-        include-data=?
+        supplied-input-lock=(unit lock:transact)
+        include-lock-data=?
         note-selection=selection-strategy:wt
+        height=page-number:transact
     ==
 |^
-^-  $:  spends:v1:transact
-        witness-data:wt
-        display=transaction-display:wt
-    ==
+::  TODO: return the bundled transaction type
+^-  transaction:wt
 =+  orders-valid=(orders-valid orders)
 ?:  ?=(%.n -.orders-valid)
   ~|("One or more orders are invalid. Reason: {<p.orders-valid>}" !!)
@@ -33,7 +40,7 @@
 =/  notes=(list nnote:transact)  (turn names get-note)
 =/  ascending=?  ?=(%asc note-selection)
 ::  If all notes are v0
-=/  [raw-spends=spends:v1:transact =witness-data:wt display=transaction-display:wt]
+=/  [raw-spends=spends:v1:transact =witness-data:wt metadata=metadata:wt]
   ?:  (levy notes |=(=nnote:transact ?=(^ -.nnote)))
     ?~  refund-pkh
       ~|('Need to specify a refund address if spending from v0 notes. Use the `--refund-pkh` flag in the create-tx command' !!)
@@ -59,7 +66,7 @@
       %+  sort  notes-v1
       |=  [a=nnote-1:v1:transact b=nnote-1:v1:transact]
       ?:(ascending (lth assets.a assets.b) (gth assets.a assets.b))
-    =/  multisig-lock=(unit lock:transact)
+    =/  multisig-lock-from-notes=(unit lock:transact)
       ::
       ::  ensure that all multisig locks are the same in the input notes
       |-
@@ -72,58 +79,74 @@
           lok
         ~|('Multisig detected in input. When a multisig is present, all inputs must share the same lock.' !!)
       $(notes-v1 t.notes-v1)
+    =/  multisig-lock=(unit lock:transact)
+      ?^  multisig-lock-from-notes
+        multisig-lock-from-notes
+      supplied-input-lock
     =/  refund-lock=lock:transact
       ?^  refund-pkh
         [%pkh [m=1 (z-silt:zo ~[u.refund-pkh])]]~
       %+  fall  multisig-lock
       [%pkh [m=1 (z-silt:zo ~[sender-pkh])]]~
-    (create-spends-1 notes-v1 orders fee sender-pkh refund-lock)
+    (create-spends-1 notes-v1 orders fee sender-pkh refund-lock supplied-input-lock)
 ::
 ~>  %slog.[0 'Notes must all be the same version!!!']  !!
 ::
-=+  min-fee=(spends:estimate-fee:utils raw-spends inputs.display)
+=+  min-fee=(spends:estimate-fee:utils raw-spends inputs.metadata height)
 :: uncomment to debug out of band fee estimation
-:: =+  min-fee-ref=(calculate-min-fee:spends:transact (apply:witness-data:wt witness-data raw-spends))
+:: =+  min-fee-ref=(calculate-min-fee:spends:transact (apply:transaction:wt witness-data raw-spends))
 :: ~&  min-fee-est+min-fee
 :: ~&  min-fee-ref+min-fee-ref
 ?:  (lth fee min-fee)
-  ~|("Min fee not met. This transaction requires at least: {(trip (format-ui:common:display:utils min-fee))} nicks" !!)
-  [raw-spends witness-data display]
+  ?:  =(allow-low-fee %.n)
+    ~|("Min fee not met. This transaction requires at least: {(trip (format-ui:common:display:utils min-fee))} nicks" !!)
+  %*  .  *transaction:wt
+    name     (to-b58:hash:transact id:(new:raw-tx:v1:transact raw-spends))
+    spends   raw-spends
+    metadata  metadata
+    witness-data  witness-data
+  ==
+%*  .  *transaction:wt
+  name     (to-b58:hash:transact id:(new:raw-tx:v1:transact raw-spends))
+  spends   raw-spends
+  metadata  metadata
+  witness-data  witness-data
+==
 ::
-::  helpers for building display metadata
+::  helpers for building transaction metadata
 ::
-++  update-display-0
+++  update-metadata-0
   |=  $:  note=nnote:v0:transact
-          display=transaction-display:wt
+          metadata=metadata:wt
           addition=output-lock-map:wt
       ==
-  ^-  transaction-display:wt
-  ?>  ?=(%0 -.inputs.display)
-  %=    display
+  ^-  metadata:wt
+  ?>  ?=(%0 -.inputs.metadata)
+  %=    metadata
       outputs
-    (~(uni z-by:zo outputs.display) addition)
+    (~(uni z-by:zo outputs.metadata) addition)
   ::
       inputs
     :-  %0
-    %-  ~(put z-by:zo p.inputs.display)
+    %-  ~(put z-by:zo p.inputs.metadata)
     [name.note sig.note]
   ==
 ::
-++  update-display-1
+++  update-metadata-1
   |=  $:  name=nname:transact
-          display=transaction-display:wt
+          metadata=metadata:wt
           addition=output-lock-map:wt
           =lock:transact
       ==
-  ^-  transaction-display:wt
-  ?>  ?=(%1 -.inputs.display)
-  %=    display
+  ^-  metadata:wt
+  ?>  ?=(%1 -.inputs.metadata)
+  %=    metadata
       outputs
-    (~(uni z-by:zo outputs.display) addition)
+    (~(uni z-by:zo outputs.metadata) addition)
   ::
       inputs
     :-  %1
-    %-  ~(put z-by:zo p.inputs.display)
+    %-  ~(put z-by:zo p.inputs.metadata)
     ::  assert that the lock is a spend-condition
     ?>  ?=(^ -.lock)
     [name lock]
@@ -136,13 +159,13 @@
           pubkey=schnorr-pubkey:transact
           refund-lock=lock:transact
       ==
-  ^-  [=spends:v1:transact witness-data:wt transaction-display:wt]
+  ^-  [=spends:v1:transact witness-data:wt metadata:wt]
   =/  initial-state=spend-build-state:wt
     %*  .  *spend-build-state:wt
       fee      fee
       orders   orders
       wd       [%0 ~]
-      display  [[%0 ~] ~]
+      metadata  [[%0 ~] ~]
     ==
   =/  final-state
     (process-spends-0 notes initial-state pubkey refund-lock)
@@ -152,7 +175,7 @@
           =(0 remaining-fee)
       ==
     ~|('Insufficient funds to pay fee and gift' !!)
-  [spends.final-state wd.final-state display.final-state]
+  [spends.final-state wd.final-state metadata.final-state]
 ::
 ++  process-spends-0
   |=  $:  notes=(list nnote:v0:transact)
@@ -195,7 +218,7 @@
     spends.state   (~(put z-by:zo spends.state) [name.note [%0 spend]])
     fee.state      new-fee
     orders.state   pending-orders
-    display.state  (update-display-0 note display.state output-map)
+    metadata.state  (update-metadata-0 note metadata.state output-map)
     wd.state       (sign-spend name.note [%0 spend] wd.state)
   ==
 ::
@@ -205,30 +228,46 @@
           fee=@
           sender-pkh=hash:transact
           refund-lock=lock:transact
+          supplied-input-lock=(unit lock:transact)
       ==
-  ^-  [=spends:v1:transact witness-data:wt transaction-display:wt]
+  ^-  [=spends:v1:transact witness-data:wt metadata:wt]
   =/  initial-state=spend-build-state:wt
     %*  .  *spend-build-state:wt
       fee      fee
       orders   orders
       wd       [%1 ~]
-      display  [[%1 ~] ~]
+      metadata  [[%1 ~] ~]
     ==
+  ::  Spread the fee evenly across the input notes so that every spent note
+  ::  retains value for at least one output seed. A consensus spend requires
+  ::  >=1 seed (validate-basic:spend-1), so a note whose entire value would go
+  ::  to fee cannot be represented and was previously dropped uncredited --
+  ::  leaving the fee unpaid (remaining-fee != 0) and the spend rejected. Charging
+  ::  ~ceil(fee/n) per note keeps each note's fee-portion below its value.
+  =/  num-notes=@  (lent notes)
+  =/  fee-per-note=@
+    ?:  =(0 num-notes)  0
+    =/  base=@  (div fee num-notes)
+    ?:  =(0 (mod fee num-notes))  base  +(base)
   =/  final-state
-    (process-spends-1 notes initial-state sender-pkh refund-lock)
+    %:  process-spends-1
+      notes  initial-state  fee-per-note  sender-pkh  refund-lock  supplied-input-lock
+    ==
   =+  remaining-orders=orders.final-state
   =+  remaining-fee=fee.final-state
   ?.  ?&  =(~ remaining-orders)
           =(0 remaining-fee)
       ==
     ~|('Insufficient funds to pay fee and gift' !!)
-  [spends.final-state wd.final-state display.final-state]
+  [spends.final-state wd.final-state metadata.final-state]
 ::
 ++  process-spends-1
   |=  $:  notes=(list nnote-1:v1:transact)
           state=spend-build-state:wt
+          fee-per-note=@
           sender-pkh=hash:transact
           refund-lock=lock:transact
+          supplied-input-lock=(unit lock:transact)
       ==
   ^-  spend-build-state:wt
   ?~  notes
@@ -238,12 +277,15 @@
     ((soft note-data:v1:transact) note-data.note)
   ?~  nd
     ~>  %slog.[0 'error: note-data malformed in note!']  !!
-  =+  pulled=(pull:locks:utils [u.nd name.note (some sender-pkh)])
-  ?~  pulled
+  =/  resolved-lock=(unit spend-condition:transact)
+    ?^  supplied-input-lock
+      ((soft spend-condition:transact) u.supplied-input-lock)
+    (pull:locks:utils [u.nd name.note (some sender-pkh)])
+  ?~  resolved-lock
     =+  name-cord=(name:v1:display:utils name.note)
     ~|  "Error processing note {<name-cord>}. Reason: first-name did not correspond to a supported lock."  !!
   =/  pkh=(unit pkh:v1:transact)
-    =/  input-lock=spend-condition:transact  u.pulled
+    =/  input-lock=spend-condition:transact  u.resolved-lock
     |-
     ?~  input-lock
       ~
@@ -266,25 +308,32 @@
             '.'
         ==
     !!
-  =/  input-lock=lock:transact  u.pulled
-  =/  allocation  (allocate-orders orders.state assets.note)
-  =/  [pending-orders=(list order:wt) specs=(list order:wt) remainder=@]
-    allocation
-  =/  fee-portion=@  (min fee.state remainder)
+  =/  input-lock=lock:transact  u.resolved-lock
+  ::  Take this note's even share of the fee first, capped to leave at least one
+  ::  nick for an output seed (a v1 spend must carry >=1 seed). The gift is then
+  ::  drawn from what remains and any leftover becomes change. This keeps every
+  ::  spent note representable instead of stranding a fee-only note (which was
+  ::  previously dropped uncredited, leaving the fee unpaid and the tx rejected).
+  =/  fee-portion=@  (min fee.state (min fee-per-note (dec assets.note)))
   =/  new-fee=@  (sub fee.state fee-portion)
-  =/  refund=@  (sub remainder fee-portion)
+  =/  after-fee=@  (sub assets.note fee-portion)
+  =/  allocation  (allocate-orders orders.state after-fee)
+  =/  [pending-orders=(list order:wt) specs=(list order:wt) refund=@]
+    allocation
   =/  specs-with-refund=(list order:wt)
     ?:  =(refund 0)
       specs
     [(build-refund-order refund refund-lock) specs]
-  ?:  =(~ specs-with-refund)
-    $(notes t.notes)
   =/  [=seeds:v1:transact output-map=output-lock-map:wt]
     (seeds-from-specs specs-with-refund note fee-portion)
   ?~  seeds
     ~|('No seeds were provided' !!)
+  =/  bythos-active=?
+    (gte origin-page.note bythos-phase.bc)
   =/  lmp=lock-merkle-proof:transact
-    (build-lock-merkle-proof:lock:transact input-lock 1)
+    ?:  bythos-active
+      (build-lock-merkle-proof-full:lock:transact input-lock 1)
+    (build-lock-merkle-proof-stub:lock:transact input-lock 1)
   =/  spend=spend-1:v1:transact
     %*  .  *spend-1:v1:transact
       seeds  seeds
@@ -299,7 +348,7 @@
     spends.state   (~(put z-by:zo spends.state) [name.note [%1 spend]])
     fee.state      new-fee
     orders.state   pending-orders
-    display.state  (update-display-1 name.note display.state output-map input-lock)
+    metadata.state  (update-metadata-1 name.note metadata.state output-map input-lock)
     wd.state       (sign-spend name.note [%1 spend] wd.state)
   ==
 ++  sign-spend
@@ -357,8 +406,9 @@
       ==
   ^-  [seeds:v1:transact output-lock-map:wt]
   =;  [seeds=(list seed:v1:transact) total-gifts=@ =output-lock-map:wt]
-    ~|  "assets in must equal gift + fee + refund"
-    ?>  =(assets.note (add total-gifts fee-portion))
+    ?.  =(assets.note (add total-gifts fee-portion))
+      ~&  [assets+assets.note total-gifts+total-gifts fee-portion+fee-portion]
+      ~|  "assets in must equal gift + fee + refund"  !!
     [(z-silt:zo seeds) output-lock-map]
   %+  roll  specs
   |=  $:  spec=order:wt
@@ -366,23 +416,38 @@
           gifts=@
           =output-lock-map:wt
       ==
-  =/  output-lock=lock:transact  (order-lock spec)
-  =?  include-data  ?=(%multisig -.spec)
+  =/  metadata=lock-metadata-1:wt  (extract-metadata spec)
+  =?  include-lock-data  ?=(%multisig -.spec)
     %.y
-  =/  nd=note-data:v1:transact
-    ?.  include-data
-      ~
-    %-  ~(put z-by:zo *note-data:v1:transact)
-    [%lock ^-(lock-data:wt [%0 output-lock])]
+  =|  nd=note-data:v1:transact
+  =/  [lock-root=hash:transact nd=note-data:v1:transact]
+    ?-    -.+.metadata
+        %lock
+      =?  nd  include-lock-data
+        %-  ~(put z-by:zo nd)
+        [%lock ^-(lock-data:wt [%0 lock.metadata])]
+      [(hash:lock:transact lock.metadata) nd]
+    ::
+        %lock-root
+      [root.metadata nd]
+    ::
+        %bridge-deposit
+      :-  root.metadata
+      %-  ~(put z-by:zo nd)
+      [%bridge [%0 %base (evm-address-to-based:bridge evm-addr.metadata)]]
+    ::
+        %bridge-withdrawal
+      :-  root.metadata
+      %-  ~(put z-by:zo nd)
+      [%bridge-w [%0 beid.metadata base-hash.metadata root.metadata base-batch-end.metadata]]
+    ==
   =/  seed=seed:v1:transact
     :*  output-source=~
-        lock-root=(hash:lock:transact output-lock)
+        lock-root=lock-root
         note-data=nd
         gift=(order-gift spec)
         parent-hash=(hash:nnote:transact note)
     ==
-  =/  metadata=lock-metadata:wt
-    [output-lock include-data]
   :*  [seed seeds]
       (add gifts (order-gift spec))
       %-  ~(put z-by:zo output-lock-map)
@@ -394,8 +459,11 @@
   ^-  (reason:transact ~)
   ?:  =(0 (lent orders))
     [%.n 'cannot create transaction with no orders']
+  =|  num-bridge-orders=@
   |-
   ?~  orders
+    ?:  (gth num-bridge-orders 1)
+      [%.n %bridge-orders-exceeds-one]
     [%.y ~]
   =/  ord=order:wt  i.orders
   ?-    -.ord
@@ -419,6 +487,21 @@
     ?:  =(0 gift.ord)
       [%.n 'order must include a gift greater than 0']
     $(orders t.orders)
+  ::
+     %bridge-deposit
+   ?.  (gte gift.ord (mul *minimum-event-nocks:bridge nicks-per-nock:transact))
+     [%.n %gift-amount-is-less-than-minimum-bridge-deposit]
+   $(orders t.orders, num-bridge-orders +(num-bridge-orders))
+  ::
+     %bridge-withdrawal
+    ?:  =(0 gift.ord)
+      [%.n %gift-cannot-be-zero]
+    $(orders t.orders)
+  ::
+     %lock-root
+    ?:  =(0 gift.ord)
+      [%.n %gift-cannot-be-zero]
+    $(orders t.orders)
   ==
 ::
 ++  order-gift
@@ -427,27 +510,44 @@
   ?-    -.ord
       %pkh       gift.ord
       %multisig  gift.ord
+      %lock-root  gift.ord
+      %bridge-deposit  gift.ord
+      %bridge-withdrawal  gift.ord
     ==
 ::
 ++  with-gift
   |=  [ord=order:wt gift=coins:transact]
   ^-  order:wt
   ?-    -.ord
-      %pkh       [%pkh recipient=recipient.ord gift=gift]
-      %multisig  [%multisig threshold=threshold.ord participants=participants.ord gift=gift]
+      %pkh       ord(gift gift)
+      %multisig  ord(gift gift)
+      %lock-root  ord(gift gift)
+      %bridge-deposit  ord(gift gift)
+      %bridge-withdrawal  ord(gift gift)
     ==
 ::
-++  order-lock
+++  extract-metadata
   |=  ord=order:wt
-  ^-  lock:transact
+  ^-  lock-metadata-1:wt
+  :-  %1
   ?-    -.ord
+      %bridge-deposit
+    [%bridge-deposit root=root.ord evm-addr=evm-addr.ord]
+  ::
+      %bridge-withdrawal
+    [%bridge-withdrawal root=root.ord beid=(from-atom:blist:bridge base-event-id.ord) base-hash=base-hash.ord base-batch-end=base-batch-end.ord]
+  ::
+      %lock-root
+    [%lock-root root=root.ord]
+  ::
       %pkh
-        [%pkh [m=1 (z-silt:zo ~[recipient.ord])]]~
+    [%lock [%pkh [m=1 (z-silt:zo ~[recipient.ord])]]~ include-lock-data]
+    ::
       %multisig
-        =/  participants=(list hash:transact)  participants.ord
-        =/  allowed=(z-set:zo hash:transact)  (z-silt:zo participants)
-        [%pkh [m=threshold.ord allowed]]~
-    ==
+    =/  participants=(list hash:transact)  participants.ord
+    =/  allowed=(z-set:zo hash:transact)  (z-silt:zo participants)
+    [%lock [%pkh [m=threshold.ord allowed]]~ include-data=%.y]
+  ==
 ::
 ++  order-from-lock
   |=  [lok=lock:transact gift=@]
@@ -491,4 +591,5 @@
    ~
   `pulled
 ::
+--
 --

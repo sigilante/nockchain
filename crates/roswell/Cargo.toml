@@ -1,0 +1,24 @@
+[package]
+name = "roswell"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "roswell"
+path = "src/main.rs"
+
+[features]
+default = []
+bazel_build = []
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+kernels-roswell = { workspace = true }
+nockapp.workspace = true
+nockvm.workspace = true
+noun-serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tracing.workspace = true
+zkvm-jetpack.workspace = true

@@ -2,6 +2,7 @@
 name = "zkvm-jetpack"
 version.workspace = true
 edition.workspace = true
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 argon2.workspace = true
@@ -12,6 +13,7 @@ either.workspace = true
 hex-literal.workspace = true
 ibig.workspace = true
 nockchain-math.workspace = true
+nockchain-types.workspace = true
 nockvm.workspace = true
 nockvm_macros.workspace = true
 noun-serde.workspace = true
@@ -19,9 +21,11 @@ num-traits.workspace = true
 once_cell.workspace = true
 quickcheck.workspace = true
 rayon.workspace = true
-smallvec.workspace = true
 strum.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 quickcheck.workspace = true
+
+[lints]
+workspace = true

@@ -1,12 +1,38 @@
 # Nockchain
 
+Status: Active
+Owner: Nockchain Maintainers
+Last Reviewed: 2026-02-19
+Canonical/Legacy: Canonical (quickstart lane; protocol authority routes through [`PROTOCOL.md`](./PROTOCOL.md))
+
 **Nockchain is programmable gold that scales.**
 
 Nockchain is a ZK-Proof of Work blockchain that combines sound money incentives with modern research into data availability, app-rollups, and intent-based composability.
 
+For a guide to the open Rust crates, see [open/TOC.md](./TOC.md).
 
 *Nockchain is entirely experimental and many parts are unaudited. We make no representations or guarantees as to the behavior of this software.*
 
+> [!IMPORTANT]
+> For docs read order, trust policy, and canonical sources, start with [`START_HERE.md`](./START_HERE.md).
+> Consensus/protocol authority is indexed in [`PROTOCOL.md`](./PROTOCOL.md), with canonical upgrade source files in [`changelog/protocol/`](./changelog/protocol/).
+> This README remains a quickstart for setup and operations.
+> Operators upgrading to a PMA-enabled release should also read [`PMA-FAQ.md`](./PMA-FAQ.md).
+
+## This is the first release of the persistent memory arena
+
+The PMA is a major re-architecting of `nockvm`, the runtime for Nockchain, and it significantly reduces the steady-state memory requirements of Nockchain peers and NockApps. We have tested it and run it ourselves but please report any bugs or problems.
+
+High-level take-aways for PMA:
+- Steady-state RAM (RSS) usage has dropped from ~20 GiB to ~1.8 GiB
+- Maximum RAM usage has dropped from ~40 GiB to ~20 GiB. This is much less frequent in the PMA version, but it will happen temporarily with the checkpoint bootstrap on the first post-PMA boot and to a lesser extent garbage collection. During the first boot you will see the RSS be elevated initially (~12-16 GiB) until your first garbage collection, then you should see ~1.8 GiB RSS typically.
+- You should still provision a swap partition of at least 32 GiB as the PMA enables paging out without swapping for the Arvo (persistent state, which includes the entirety of the chain state) but not `nockvm`'s NockStack itself, this is by design to conserve predictable and efficient execution performance in the NockStack.
+- Transaction throughput is improved, 600-700 milliseconds of per-event overhead has been traded down to 2-4 milliseconds of per-event durability overhead. This has a particularly noticeable impact for cheap interstitial events like the timer, duplicate blocks, etc. When we tested baseline against PMA the PMA instance managed to get more than 1,000 blocks ahead of the baseline in a few hours of syncing blocks in the 52k-62k range. This improvement is because the PMA moves the Arvo out of the NockStack and spares the NockStack compacting the entirety of the chain state after every event.
+- Write-through burden on SSD disks is markedly lower, about 2x, than the pre-PMA baseline's behavior. This is based on procfs statistics and not our own measurements so the numbers should be sound. This will vary depending on how you configure the snapshot and garbage collection intervals.
+- No more 2-3 minute checkpoints bookending one after another. Incremental, efficient persistence to disk through the PMA slab.
+- Garbage collection causes a ~5-10 second spike in RSS but it's a lower peak than checkpointing and shouldn't be nearly as susceptible to OOMs as checkpointing was.
+- NockStack gets `madvise` trimmed after every event with a high watermark higher than 512 MiB to align the pages allocated for the Nockchain/NockApp process with what's actually needed/used in practice.
+- PMA includes the PMA slab and .meta sidecar itself, a sqlite3 event log, and snapshots of the slabs aligned to event log positions. Durability is considerably more robust and efficient now. `fsync`/`fdatasync` ordering during post-event the durability cycle is strictly and carefully designed to make the detection of corrupted PMA slabs due to `SIGKILL`, power cuts, etc. trivially cheap and highly reliable.
 
 ## Setup
 
@@ -19,7 +45,7 @@ sudo apt install clang llvm-dev libclang-dev make protobuf-compiler
 ```
 Clone the repo and cd into it:
 ```
-git clone https://github.com/zorp-corp/nockchain.git && cd nockchain
+git clone https://github.com/nockchain/nockchain.git && cd nockchain
 ```
 
 Copy the example environment file and rename it to `.env`:
@@ -51,6 +77,11 @@ export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
 (If you build manually with `cargo build`, be sure to use `--release` for `hoonc`.)
+
+
+## Roswell proof and test harness
+
+Roswell is a NockApp kernel for public Nockchain proof conformance and Hoon test execution. Build the public jam with `make assets/roswell.jam`, then run `cargo run --release --bin roswell -- --new --ephemeral run-suite` for the public suite, `cargo run --release --bin roswell -- --new --ephemeral prove-puzzle 2 1 --filename proof-v2-len1` to generate a complete proof jam, `cargo run --release --bin roswell -- --new --ephemeral make-proof-snapshot 2 1 --filename proof-v2-len1-snapshot` to generate a proof-state snapshot for conformance/debugging, `cargo run --release --bin roswell -- --new --ephemeral make-proof-stream-window 2 1 0 --filename proof-v2-len1-stream` to generate a proof stream window, `cargo run --release --bin roswell -- --new --ephemeral assemble-proof-stream --window proof-v2-len1-stream.jam --filename proof-v2-len1-from-stream` to assemble a proof from stream windows, `cargo run --release --bin roswell -- --new --ephemeral assemble-proof-continuation --snapshot proof-snapshot.jam --window continuation-window.jam --filename proof-from-continuation` to assemble a proof from a snapshot and continuation windows, and `cargo run --release --bin roswell -- --new --ephemeral check-proof --proof proof-v2-len1.jam` to verify a proof.
 
 ## Install Wallet
 
@@ -86,11 +117,11 @@ This will print a new public/private key pair + chain code to the console, as we
 To track a watch-only address or pubkey without importing private material:
 
 ```
-nockchain-wallet watch-address <base58-pkh-or-pubkey>
+nockchain-wallet watch address <base58-pkh-or-pubkey>
 ```
 
 The wallet normalizes the identifier so you can supply either a v1 payee hash or a schnorr pubkey.
-Once added, watch-only addresses/first names are synced automatically alongside your signing keys, so their balances appear in all sync-heavy commands without additional flags.
+Once added, watch-only addresses are synced automatically alongside your signing keys, so their balances appear in all sync-heavy commands without additional flags.
 
 Use `.env_example` as a template and copy your pkh to the `.env` file.
 
@@ -194,7 +225,7 @@ Nockchain requires:
    - Use `--bind` to specify your public IP/domain
    - Example: `nockchain --bind /ip4/1.2.3.4/udp/$PEER_PORT/quic-v1`
 
-### Why aren't Zorp peers connecting?
+### Why aren't peers connecting?
 
 Common reasons for peer connection failures:
 
@@ -295,13 +326,30 @@ You can also add this to your `.env` file if you're running with the Makefile:
 RUST_LOG=info
 ```
 
+### How do I change the HTTP port?
+
+When the HTTP driver runs in local mode (i.e. `HTTPS_DOMAIN` is unset or set to a
+local domain such as `localhost`, `127.*`, `192.168.*`, or `*.local`), it binds to
+`127.0.0.1:8080` by default. You can override the port with the `HTTP_PORT`
+environment variable:
+
+```bash
+# Serve the local HTTP interface on port 3000 instead of 8080
+HTTP_PORT=3000 nockchain
+```
+
+`HTTP_PORT` must be a valid port number (0–65535); an invalid value causes the
+driver to fail at startup. In production mode (a non-local `HTTPS_DOMAIN`), the
+driver continues to use the standard ports 80 (for ACME challenges) and 443 (for
+HTTPS), which are not affected by `HTTP_PORT`.
+
 ### How do profile for performance?
 
 Here's a demo video for the Tracy integration in Nockchain: https://x.com/nockchain/status/1948109668171051363
 
 The main change since the video is tracing is now enabled by default. If you want to disable it you can [disable](https://doc.rust-lang.org/cargo/reference/features.html#the-default-feature) the `tracing-tracy` feature here. The tracing is [inhibited](https://www.google.com/search?q=inhibit+definition&sca_esv=677f3ddbc8bf65e8&ei=hnSCaJuSGIGlqtsP96qM0QE&ved=0ahUKEwib7Z60idaOAxWBkmoFHXcVIxoQ4dUDCBA&uact=5&oq=inhibit+definition&gs_lp=Egxnd3Mtd2l6LXNlcnAiEmluaGliaXQgZGVmaW5pdGlvbjITEAAYgAQYkQIYsQMYigUYRhj5ATIGEAAYFhgeMgYQABgWGB4yBhAAGBYYHjIGEAAYFhgeMgYQABgWGB4yBhAAGBYYHjIGEAAYFhgeMgYQABgWGB4yBhAAGBYYHjItEAAYgAQYkQIYsQMYigUYRhj5ARiXBRiMBRjdBBhGGPkBGPQDGPUDGPYD2AEBSIgaUMgFWIgZcAR4AJABAJgBeaAB7AqqAQQxOS4yuAEDyAEA-AEBmAIZoAKpC8ICDhAAGIAEGLADGIYDGIoFwgILEAAYgAQYsAMYogTCAhAQABiABBiRAhiKBRhGGPkBwgIKEAAYgAQYQxiKBcICCxAAGIAEGJECGIoFwgILEAAYgAQYsQMYgwHCAg4QABiABBixAxiDARiKBcICBRAuGIAEwgIREC4YgAQYsQMY0QMYgwEYxwHCAioQABiABBiRAhiKBRhGGPkBGJcFGIwFGN0EGEYY-QEY9AMY9QMY9gPYAQHCAg8QABiABBhDGIoFGEYY-QHCAikQABiABBhDGIoFGEYY-QEYlwUYjAUY3QQYRhj5ARj0Axj1Axj2A9gBAcICCBAuGIAEGLEDwgIIEAAYgAQYsQPCAi0QABiABBiRAhixAxiKBRhGGPkBGJcFGIwFGN0EGEYY-QEY9AMY9QMY9gPYAQHCAg0QABiABBixAxhDGIoFwgIFEAAYgATCAhEQABiABBiRAhixAxiDARiKBcICChAuGIAEGLEDGArCAgcQABiABBgKwgIKEAAYgAQYsQMYCsICBxAuGIAEGArCAg0QABiABBixAxiDARgKwgIOEAAYgAQYkQIYsQMYigXCAggQABgWGAoYHpgDAIgGAZAGBboGBggBEAEYE5IHBDIzLjKgB_ePArIHBDE5LjK4B6ALwgcGMC4yNC4xyAc5&sclient=gws-wiz-serp) by default, it only collects traces when a [Tracy profiler client](https://github.com/wolfpld/tracy) connects to the application. This means minimal (9% or less for the nockvm, shouldn't impact jetted mining) performance impact but the profiling data is available any time you'd like to connect your Nockchain instance.
 
-There are two main kinds of performance data Tracy will gather from your application. Instrumentation and samples. Instrumentation comes from the [tracing crate's](https://docs.rs/tracing/latest/tracing/) spans. The integration with [nockvm](https://github.com/zorp-corp/nockchain/tree/master/crates/nockvm) is via the same `tracing` spans. Samples are _stack samples_, so it's not a perfectly and minutely traced picture of where your time was spent. However, the default sampling rate for Tracy is _very_ high but very efficient. You should expect a problematic performance impact from connecting Tracy to an instance if every single core and hyperthread is maxed out on your machine. You should be leaving some spare threads unoccupied even on a mining instance for the Serf thread and the kernel anyway. We (Zorp Corp) generally left 4 threads unused on each mining server.
+There are two main kinds of performance data Tracy will gather from your application. Instrumentation and samples. Instrumentation comes from the [tracing crate's](https://docs.rs/tracing/latest/tracing/) spans. The integration with [nockvm](https://github.com/nockchain/nockchain/tree/master/crates/nockvm) is via the same `tracing` spans. Samples are _stack samples_, so it's not a perfectly and minutely traced picture of where your time was spent. However, the default sampling rate for Tracy is _very_ high but very efficient. You should expect a problematic performance impact from connecting Tracy to an instance if every single core and hyperthread is maxed out on your machine. You should be leaving some spare threads unoccupied even on a mining instance for the Serf thread and the kernel anyway. We generally left 4 threads unused on each mining server.
 
 Stack samples are roughly speaking the "native" or Rust part of the application whereas instrumentation is the nockvm spans showing how much time you're spending in your Hoon arms plus any Rust functions that were also instrumented. You can tell them apart because the spans for Hoon will have weird paths like `blart/boop/snoot/goof/slam/woof` and no source location in the Tracy profiler UI. The Rust spans will have much plainer names mapping onto whatever the function was named, so a function like `fn slam()` will show up in the instrumentation as `slam` and have a source location path ending in a `*.rs` file.
 

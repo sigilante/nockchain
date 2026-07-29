@@ -1,0 +1,47 @@
+--- a/build.rs
++++ b/build.rs
+@@ -5,7 +5,24 @@ macro_rules! docs_rs {
+         option_env!("DOCS_RS") == Some("1")
+     };
+ }
+ 
++fn bazel_nix_clangxx() -> Option<std::path::PathBuf> {
++    let cxx = std::env::var_os("CXX")?;
++    if std::path::Path::new(&cxx)
++        .file_name()
++        .and_then(|name| name.to_str())
++        != Some("cc_wrapper.sh")
++    {
++        return None;
++    }
++
++    std::env::var_os("PATH").and_then(|path| {
++        std::env::split_paths(&path)
++            .map(|dir| dir.join("clangxx-with-sysroot"))
++            .find(|candidate| candidate.is_file())
++    })
++}
++
+ fn link_dependencies() {
+     match std::env::var("CARGO_CFG_TARGET_OS").as_deref() {
+         Ok("linux" | "android") => println!("cargo:rustc-link-lib=dl"),
+@@ -75,6 +90,10 @@ fn build_tracy_client() {
+     if std::env::var_os("CARGO_FEATURE_ENABLE").is_some() {
+         let mut builder = set_feature_defines(cc::Build::new());
+ 
++        if let Some(compiler) = bazel_nix_clangxx() {
++            builder.compiler(compiler);
++        }
++
+         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+             // Used for synchronizing access to the `dbghelp.dll` symbol helper.
+             // See the `dbghelp` module for more information.
+@@ -99,4 +120,6 @@ fn build_tracy_client() {
++        let tracy_client = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
++            .join("tracy/TracyClient.cpp");
+         let _ = builder
+-            .file("tracy/TracyClient.cpp")
++            .file(tracy_client)
+             .cargo_warnings(false)
+             .cpp(true);
+         if let Ok(tool) = builder.try_get_compiler() {

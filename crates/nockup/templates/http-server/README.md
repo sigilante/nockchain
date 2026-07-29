@@ -1,61 +1,27 @@
 # {{project_name}}
 
-A NockApp project created with `nockup`.
+Stateful HTTP NockApp template (counter-style request handling).
 
-## Description
+## Files
 
-{{project_description}}
+- `src/main.rs`: Rust runtime with `http_driver()`.
+- `hoon/app/app.hoon`: request routing and state updates.
+- `hoon/lib/http.hoon`: HTTP nouns/helpers.
+- `hoon/common/wrapper.hoon`: wrapper core.
 
-## Building
+## Build and run
 
-To build this project:
+From the workspace directory that contains `nockapp.toml`:
 
-```bash
-nockup build {{project_name}}
+```sh
+nockup project build {{project_name}}
+nockup project run {{project_name}}
 ```
 
-Or using cargo directly:
+From this project directory directly:
 
-```bash
+```sh
 cargo build --release
+hoonc hoon/app/app.hoon
+cargo run --release
 ```
-
-## Running
-
-To run this project:
-
-```bash
-nockup run {{project_name}}
-```
-
-Or using cargo directly:
-
-```bash
-cargo run
-```
-
-## Project Structure
-
-- `src/main.rs` - Main Rust entry point
-- `src/lib.rs` - Core NockApp library code  
-- `src/app.hoon` - Hoon application logic
-- `manifest.toml` - NockApp configuration
-- `build.rs` - Build script for compiling Hoon code
-- `Cargo.toml` - Rust dependencies and configuration
-
-## Development
-
-This project uses both Rust and Hoon:
-
-- **Rust** handles the runtime, VM integration, and system interfaces
-- **Hoon** contains the core application logic that compiles to Nock
-- The `build.rs` script automatically compiles Hoon to Nock during the build process
-
-## Dependencies
-
-- [NockApp](https://github.com/nockchain/nockchain) - Nock virtual machine
-- Standard Rust crates for serialization and error handling
-
-## License
-
-This project is licensed under {{license}}.

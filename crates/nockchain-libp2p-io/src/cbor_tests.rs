@@ -1,7 +1,11 @@
+#![allow(clippy::unwrap_used)]
 use quickcheck::{Arbitrary, Gen};
 use serde_bytes::ByteBuf;
 
-use crate::messages::{NockchainRequest, NockchainResponse};
+use crate::messages::{
+    BatchErrorClass, BatchRequestItem, BatchResultItem, BatchResultStatus, EnvelopeKind,
+    NockchainRequest, NockchainResponse, ResponseEnvelope,
+};
 
 /// Test-only enum that mimics the old NockchainResponse structure before fix
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -29,15 +33,37 @@ impl Arbitrary for TestByteBuf {
 
 impl Arbitrary for NockchainRequest {
     fn arbitrary(g: &mut Gen) -> Self {
-        match bool::arbitrary(g) {
-            true => NockchainRequest::Gossip {
+        match u8::arbitrary(g) % 4 {
+            0 => NockchainRequest::Gossip {
                 message: TestByteBuf::arbitrary(g).into(),
             },
-            false => NockchainRequest::Request {
+            1 => NockchainRequest::Request {
                 pow: {
                     let mut arr = [0u8; 16];
-                    for i in 0..16 {
-                        arr[i] = u8::arbitrary(g);
+                    for elem in &mut arr {
+                        *elem = u8::arbitrary(g);
+                    }
+                    arr
+                },
+                nonce: u64::arbitrary(g),
+                message: TestByteBuf::arbitrary(g).into(),
+            },
+            2 => NockchainRequest::BatchRequest {
+                pow: {
+                    let mut arr = [0u8; 16];
+                    for elem in &mut arr {
+                        *elem = u8::arbitrary(g);
+                    }
+                    arr
+                },
+                nonce: u64::arbitrary(g),
+                items: arbitrary_batch_request_items(g),
+            },
+            _ => NockchainRequest::AuthenticatedGossip {
+                pow: {
+                    let mut arr = [0u8; 16];
+                    for elem in &mut arr {
+                        *elem = u8::arbitrary(g);
                     }
                     arr
                 },
@@ -50,13 +76,127 @@ impl Arbitrary for NockchainRequest {
 
 impl Arbitrary for NockchainResponse {
     fn arbitrary(g: &mut Gen) -> Self {
-        match bool::arbitrary(g) {
-            true => NockchainResponse::Result {
+        match u8::arbitrary(g) % 3 {
+            0 => NockchainResponse::Result {
                 message: TestByteBuf::arbitrary(g).into(),
             },
-            false => NockchainResponse::Ack {
+            1 => NockchainResponse::Ack {
                 acked: bool::arbitrary(g),
             },
+            _ => NockchainResponse::BatchResult {
+                results: arbitrary_batch_result_items(g),
+            },
+        }
+    }
+}
+
+fn arbitrary_batch_request_items(g: &mut Gen) -> Vec<BatchRequestItem> {
+    let item_count = usize::arbitrary(g) % 4;
+    (0..item_count)
+        .map(|item_id| BatchRequestItem {
+            item_id: item_id as u32,
+            message: TestByteBuf::arbitrary(g).into(),
+        })
+        .collect()
+}
+
+fn arbitrary_batch_result_items(g: &mut Gen) -> Vec<BatchResultItem> {
+    let item_count = usize::arbitrary(g) % 4;
+    (0..item_count)
+        .map(|item_id| arbitrary_batch_result_item(g, item_id as u32))
+        .collect()
+}
+
+fn arbitrary_batch_result_item(g: &mut Gen, item_id: u32) -> BatchResultItem {
+    let status = arbitrary_batch_result_status(g);
+    let error = match status {
+        BatchResultStatus::Error => Some(arbitrary_batch_error_class(g)),
+        BatchResultStatus::Result | BatchResultStatus::Ack | BatchResultStatus::NotFound => None,
+    };
+    let envelope = if bool::arbitrary(g) {
+        Some(arbitrary_response_envelope(g))
+    } else {
+        None
+    };
+
+    BatchResultItem {
+        item_id,
+        status,
+        error,
+        envelope,
+    }
+}
+
+fn arbitrary_batch_result_status(g: &mut Gen) -> BatchResultStatus {
+    match u8::arbitrary(g) % 4 {
+        0 => BatchResultStatus::Result,
+        1 => BatchResultStatus::Ack,
+        2 => BatchResultStatus::NotFound,
+        _ => BatchResultStatus::Error,
+    }
+}
+
+fn arbitrary_batch_error_class(g: &mut Gen) -> BatchErrorClass {
+    match u8::arbitrary(g) % 5 {
+        0 => BatchErrorClass::Decode,
+        1 => BatchErrorClass::Backpressure,
+        2 => BatchErrorClass::TooLarge,
+        3 => BatchErrorClass::InvalidPow,
+        _ => BatchErrorClass::Internal,
+    }
+}
+
+fn arbitrary_response_envelope(g: &mut Gen) -> ResponseEnvelope {
+    let message: ByteBuf = TestByteBuf::arbitrary(g).into();
+    match u8::arbitrary(g) % 4 {
+        0 => ResponseEnvelope {
+            kind: EnvelopeKind::HeardBlock,
+            block_id: Some(format!("block-{}", u64::arbitrary(g))),
+            tx_id: None,
+            message,
+            tx_envelopes: None,
+            unincluded_tx_ids: None,
+            range_blocks: None,
+        },
+        1 => ResponseEnvelope {
+            kind: EnvelopeKind::HeardTx,
+            block_id: None,
+            tx_id: Some(format!("tx-{}", u64::arbitrary(g))),
+            message,
+            tx_envelopes: None,
+            unincluded_tx_ids: None,
+            range_blocks: None,
+        },
+        2 => ResponseEnvelope {
+            kind: EnvelopeKind::HeardElders,
+            block_id: None,
+            tx_id: None,
+            message,
+            tx_envelopes: None,
+            unincluded_tx_ids: None,
+            range_blocks: None,
+        },
+        _ => {
+            let tx_count = (u8::arbitrary(g) % 4) as usize;
+            let unincluded_count = (u8::arbitrary(g) % 3) as usize;
+            let tx_envelopes: Vec<_> = (0..tx_count)
+                .map(|i| crate::messages::BundledTxEnvelope {
+                    tx_id: format!("bundled-tx-{}-{}", u64::arbitrary(g), i),
+                    message: TestByteBuf::arbitrary(g).into(),
+                })
+                .collect();
+            let unincluded_tx_ids: Vec<String> = (0..unincluded_count)
+                .map(|i| format!("unincluded-tx-{}-{}", u64::arbitrary(g), i))
+                .collect();
+            ResponseEnvelope {
+                kind: EnvelopeKind::HeardBlockWithTxs,
+                block_id: Some(format!("bundle-block-{}", u64::arbitrary(g))),
+                tx_id: None,
+                message,
+                tx_envelopes: Some(tx_envelopes),
+                unincluded_tx_ids: Some(unincluded_tx_ids),
+                range_blocks: None,
+            }
         }
     }
 }
@@ -140,9 +280,16 @@ impl Arbitrary for CorruptedCborData {
 #[cfg(test)]
 mod tests {
     use quickcheck::TestResult;
-    use serde_cbor;
 
     use super::*;
+
+    #[derive(serde::Serialize)]
+    struct EncodedBatchResultItem<'a> {
+        item_id: u32,
+        status: &'a str,
+        error: Option<&'a str>,
+        envelope: Option<serde_cbor::Value>,
+    }
 
     #[test]
     fn test_truncated_cbor_enum_reproduction() {
@@ -325,6 +472,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_batch_request_pow_verification_roundtrip() {
+        let mut builder = equix::EquiXBuilder::new();
+        let local_peer_id = libp2p::PeerId::random();
+        let remote_peer_id = libp2p::PeerId::random();
+        let items = vec![
+            BatchRequestItem {
+                item_id: 1,
+                message: ByteBuf::from(vec![1, 2, 3]),
+            },
+            BatchRequestItem {
+                item_id: 2,
+                message: ByteBuf::from(vec![4, 5, 6, 7]),
+            },
+        ];
+
+        let request = NockchainRequest::new_batch_request(
+            &mut builder, &local_peer_id, &remote_peer_id, items,
+        )
+        .expect("batch request should be constructed");
+
+        let result = request.verify_pow(&mut builder, &remote_peer_id, &local_peer_id);
+        assert!(
+            result.is_ok(),
+            "batch request pow verification should succeed"
+        );
+    }
+
     quickcheck::quickcheck! {
         fn prop_request_roundtrip(request: NockchainRequest) -> TestResult {
             let cbor_data = match serde_cbor::to_vec(&request) {
@@ -439,9 +614,7 @@ mod tests {
                 }
                 Err(e) => {
                     let error_msg = format!("{:?}", e);
-                    if error_msg.contains("Eof") && error_msg.contains("enum") && error_msg.contains("Small(1)") {
-                        TestResult::from_bool(true)
-                    } else if error_msg.contains("Eof") {
+                    if error_msg.contains("Eof") {
                         TestResult::from_bool(true)
                     } else {
                         TestResult::error(format!("Unexpected error type: {}", error_msg))
@@ -592,21 +765,14 @@ mod tests {
 
             match cbor4ii_serde::from_slice::<NockchainResponse>(&corrupted_data) {
                 Ok(_) => TestResult::from_bool(true),
-                Err(e) => {
-                    let error_msg = format!("{:?}", e);
-                    if error_msg.contains("Eof") && error_msg.contains("enum") && error_msg.contains("Small(1)") {
-                        TestResult::from_bool(true)
-                    } else {
-                        TestResult::from_bool(true)
-                    }
-                }
+                Err(_) => TestResult::from_bool(true),
             }
         }
     }
 
     #[test]
     fn test_comprehensive_eof_enum_search() {
-        let test_messages = vec![
+        let test_messages = [
             NockchainRequest::Gossip {
                 message: ByteBuf::from(vec![]),
             },
@@ -630,7 +796,7 @@ mod tests {
 
         let mut exact_error_found = false;
 
-        for (_msg_idx, message) in test_messages.iter().enumerate() {
+        for message in test_messages.iter() {
             let cbor_data = serde_cbor::to_vec(message).expect("Serialization should work");
 
             for corruption_type in 0..4 {
@@ -709,7 +875,8 @@ mod tests {
             }
         }
 
-        assert!(exact_error_found || !exact_error_found, "Test completed");
+        // Just ensure test executes completely
+        let _ = exact_error_found;
     }
 
     #[test]
@@ -756,7 +923,7 @@ mod tests {
 
     #[test]
     fn test_cbor_baseline_robustness() {
-        let request_cases = vec![
+        let request_cases = [
             NockchainRequest::Gossip {
                 message: ByteBuf::from(b"test message".to_vec()),
             },
@@ -767,7 +934,7 @@ mod tests {
             },
         ];
 
-        let response_cases = vec![
+        let response_cases = [
             NockchainResponse::Ack { acked: true },
             NockchainResponse::Result {
                 message: ByteBuf::from(b"response data".to_vec()),
@@ -802,12 +969,8 @@ mod tests {
 
         let ack_response = NockchainResponse::Ack { acked: true };
 
-        let serde_cbor_result = serde_cbor::to_vec(&ack_response);
-        match serde_cbor_result {
-            Ok(serde_cbor_bytes) => {
-                let _result = serde_cbor::from_slice::<NockchainResponse>(&serde_cbor_bytes);
-            }
-            Err(_) => {}
+        if let Ok(serde_cbor_bytes) = serde_cbor::to_vec(&ack_response) {
+            let _result = serde_cbor::from_slice::<NockchainResponse>(&serde_cbor_bytes);
         }
 
         let mut cbor4ii_buffer = Vec::new();
@@ -897,10 +1060,7 @@ mod tests {
             }
         }
 
-        assert!(
-            true,
-            "Test completed - documented the EOF enum error pattern"
-        );
+        // Test completed - documented the EOF enum error pattern
     }
 
     #[test]
@@ -920,7 +1080,7 @@ mod tests {
                     && error_msg.contains("enum")
                     && error_msg.contains("Small(1)")
                 {
-                    return; // Successfully reproduced the error
+                    // Successfully reproduced the error
                 } else {
                     panic!("Got EOF error but not the expected pattern: {}", error_msg);
                 }
@@ -1147,5 +1307,511 @@ mod tests {
         );
 
         println!("SUCCESS: Fix confirmed - adding boolean field resolves the EOF enum serialization issue");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ReqResCborConformanceVectors {
+        schema_version: String,
+        request_vectors: Vec<RequestVector>,
+        response_vectors: Vec<ResponseVector>,
+        invalid_vectors: Vec<InvalidVector>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct RequestVector {
+        id: String,
+        variant: RequestVariant,
+        cbor_hex: String,
+        message_hex: Option<String>,
+        pow_hex: Option<String>,
+        nonce: Option<u64>,
+        items: Option<Vec<BatchRequestItemVector>>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum RequestVariant {
+        Gossip,
+        Request,
+        AuthenticatedGossip,
+        BatchRequest,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BatchRequestItemVector {
+        item_id: u32,
+        message_hex: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ResponseVector {
+        id: String,
+        variant: ResponseVariant,
+        cbor_hex: String,
+        acked: Option<bool>,
+        message_hex: Option<String>,
+        results: Option<Vec<BatchResultItemVector>>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum ResponseVariant {
+        Ack,
+        Result,
+        BatchResult,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct BatchResultItemVector {
+        item_id: u32,
+        status: BatchResultStatusVector,
+        error: Option<BatchErrorClassVector>,
+        envelope: Option<ResponseEnvelopeVector>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum BatchResultStatusVector {
+        Result,
+        Ack,
+        NotFound,
+        Error,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum BatchErrorClassVector {
+        Decode,
+        Backpressure,
+        TooLarge,
+        InvalidPow,
+        Internal,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct ResponseEnvelopeVector {
+        kind: EnvelopeKindVector,
+        block_id: Option<String>,
+        tx_id: Option<String>,
+        message_hex: String,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum EnvelopeKindVector {
+        HeardBlock,
+        HeardTx,
+        HeardElders,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct InvalidVector {
+        id: String,
+        target: InvalidTarget,
+        cbor_hex: String,
+        error_substring: Option<String>,
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum InvalidTarget {
+        Request,
+        Response,
+    }
+
+    fn load_gen1_cbor_conformance_vectors() -> ReqResCborConformanceVectors {
+        serde_json::from_str(include_str!("../testdata/req_res_gen1_cbor_vectors.json"))
+            .expect("gen1 cbor vector fixture must be valid JSON")
+    }
+
+    fn load_gen2_cbor_conformance_vectors() -> ReqResCborConformanceVectors {
+        serde_json::from_str(include_str!("../testdata/req_res_gen2_cbor_vectors.json"))
+            .expect("gen2 cbor vector fixture must be valid JSON")
+    }
+
+    fn decode_hex(hex_value: &str) -> Vec<u8> {
+        hex::decode(hex_value).expect("vector hex must be valid")
+    }
+
+    fn batch_request_item_from_vector(vector: &BatchRequestItemVector) -> BatchRequestItem {
+        BatchRequestItem {
+            item_id: vector.item_id,
+            message: ByteBuf::from(decode_hex(&vector.message_hex)),
+        }
+    }
+
+    fn request_from_vector(vector: &RequestVector) -> NockchainRequest {
+        match vector.variant {
+            RequestVariant::Gossip => NockchainRequest::Gossip {
+                message: ByteBuf::from(decode_hex(
+                    vector
+                        .message_hex
+                        .as_ref()
+                        .expect("gossip vectors require message_hex"),
+                )),
+            },
+            RequestVariant::Request => {
+                let pow_hex = vector
+                    .pow_hex
+                    .as_ref()
+                    .expect("request vectors require pow_hex for Request variant");
+                let pow_bytes = decode_hex(pow_hex);
+                let pow: [u8; 16] = pow_bytes
+                    .try_into()
+                    .expect("pow_hex must decode to 16 bytes");
+                let nonce = vector
+                    .nonce
+                    .expect("request vectors require nonce for Request variant");
+                NockchainRequest::Request {
+                    pow,
+                    nonce,
+                    message: ByteBuf::from(decode_hex(
+                        vector
+                            .message_hex
+                            .as_ref()
+                            .expect("request vectors require message_hex"),
+                    )),
+                }
+            }
+            RequestVariant::AuthenticatedGossip => {
+                let pow_hex = vector
+                    .pow_hex
+                    .as_ref()
+                    .expect("authenticated gossip vectors require pow_hex");
+                let pow_bytes = decode_hex(pow_hex);
+                let pow: [u8; 16] = pow_bytes
+                    .try_into()
+                    .expect("pow_hex must decode to 16 bytes");
+                let nonce = vector
+                    .nonce
+                    .expect("authenticated gossip vectors require nonce");
+                NockchainRequest::AuthenticatedGossip {
+                    pow,
+                    nonce,
+                    message: ByteBuf::from(decode_hex(
+                        vector
+                            .message_hex
+                            .as_ref()
+                            .expect("authenticated gossip vectors require message_hex"),
+                    )),
+                }
+            }
+            RequestVariant::BatchRequest => {
+                let pow_hex = vector
+                    .pow_hex
+                    .as_ref()
+                    .expect("batch request vectors require pow_hex");
+                let pow_bytes = decode_hex(pow_hex);
+                let pow: [u8; 16] = pow_bytes
+                    .try_into()
+                    .expect("pow_hex must decode to 16 bytes");
+                let nonce = vector.nonce.expect("batch request vectors require nonce");
+                let items = vector
+                    .items
+                    .as_ref()
+                    .expect("batch request vectors require items")
+                    .iter()
+                    .map(batch_request_item_from_vector)
+                    .collect();
+                NockchainRequest::BatchRequest { pow, nonce, items }
+            }
+        }
+    }
+
+    fn batch_result_status_from_vector(vector: &BatchResultStatusVector) -> BatchResultStatus {
+        match vector {
+            BatchResultStatusVector::Result => BatchResultStatus::Result,
+            BatchResultStatusVector::Ack => BatchResultStatus::Ack,
+            BatchResultStatusVector::NotFound => BatchResultStatus::NotFound,
+            BatchResultStatusVector::Error => BatchResultStatus::Error,
+        }
+    }
+
+    fn batch_error_class_from_vector(vector: &BatchErrorClassVector) -> BatchErrorClass {
+        match vector {
+            BatchErrorClassVector::Decode => BatchErrorClass::Decode,
+            BatchErrorClassVector::Backpressure => BatchErrorClass::Backpressure,
+            BatchErrorClassVector::TooLarge => BatchErrorClass::TooLarge,
+            BatchErrorClassVector::InvalidPow => BatchErrorClass::InvalidPow,
+            BatchErrorClassVector::Internal => BatchErrorClass::Internal,
+        }
+    }
+
+    fn response_envelope_from_vector(vector: &ResponseEnvelopeVector) -> ResponseEnvelope {
+        let message = decode_hex(&vector.message_hex);
+        match vector.kind {
+            EnvelopeKindVector::HeardBlock => ResponseEnvelope::heard_block(
+                vector
+                    .block_id
+                    .clone()
+                    .expect("heard-block envelope vector requires block_id"),
+                message,
+            ),
+            EnvelopeKindVector::HeardTx => ResponseEnvelope::heard_tx(
+                vector
+                    .tx_id
+                    .clone()
+                    .expect("heard-tx envelope vector requires tx_id"),
+                message,
+            ),
+            EnvelopeKindVector::HeardElders => ResponseEnvelope::heard_elders(message),
+        }
+    }
+
+    fn batch_result_item_from_vector(vector: &BatchResultItemVector) -> BatchResultItem {
+        let result = BatchResultItem {
+            item_id: vector.item_id,
+            status: batch_result_status_from_vector(&vector.status),
+            error: vector.error.as_ref().map(batch_error_class_from_vector),
+            envelope: vector.envelope.as_ref().map(response_envelope_from_vector),
+        };
+        result
+            .validate()
+            .expect("batch result vector must satisfy validation invariants");
+        result
+    }
+
+    fn response_from_vector(vector: &ResponseVector) -> NockchainResponse {
+        match vector.variant {
+            ResponseVariant::Ack => {
+                let acked = vector
+                    .acked
+                    .expect("response vectors require acked for Ack variant");
+                NockchainResponse::Ack { acked }
+            }
+            ResponseVariant::Result => {
+                let message_hex = vector
+                    .message_hex
+                    .as_ref()
+                    .expect("response vectors require message_hex for Result variant");
+                NockchainResponse::Result {
+                    message: ByteBuf::from(decode_hex(message_hex)),
+                }
+            }
+            ResponseVariant::BatchResult => {
+                let results = vector
+                    .results
+                    .as_ref()
+                    .expect("batch result vectors require results")
+                    .iter()
+                    .map(batch_result_item_from_vector)
+                    .collect();
+                NockchainResponse::BatchResult { results }
+            }
+        }
+    }
+
+    fn assert_request_cbor_vectors_roundtrip(vectors: &[RequestVector]) {
+        assert!(
+            !vectors.is_empty(),
+            "request vector fixture must not be empty"
+        );
+        for vector in vectors {
+            let expected = request_from_vector(vector);
+            let encoded = serde_cbor::to_vec(&expected).expect("request should serialize");
+            assert_eq!(
+                hex::encode(&encoded),
+                vector.cbor_hex,
+                "request vector '{}' cbor mismatch",
+                vector.id
+            );
+            let decoded: NockchainRequest = serde_cbor::from_slice(&decode_hex(&vector.cbor_hex))
+                .expect("request vector cbor should deserialize");
+            decoded
+                .validate()
+                .expect("request vector should satisfy validation invariants");
+            assert_eq!(
+                decoded, expected,
+                "request vector '{}' roundtrip mismatch",
+                vector.id
+            );
+        }
+    }
+
+    fn assert_response_cbor_vectors_roundtrip(vectors: &[ResponseVector]) {
+        assert!(
+            !vectors.is_empty(),
+            "response vector fixture must not be empty"
+        );
+        for vector in vectors {
+            let expected = response_from_vector(vector);
+            let encoded = serde_cbor::to_vec(&expected).expect("response should serialize");
+            assert_eq!(
+                hex::encode(&encoded),
+                vector.cbor_hex,
+                "response vector '{}' cbor mismatch",
+                vector.id
+            );
+            let decoded: NockchainResponse = serde_cbor::from_slice(&decode_hex(&vector.cbor_hex))
+                .expect("response vector cbor should deserialize");
+            decoded
+                .validate()
+                .expect("response vector should satisfy validation invariants");
+            assert_eq!(
+                decoded, expected,
+                "response vector '{}' roundtrip mismatch",
+                vector.id
+            );
+        }
+    }
+
+    fn assert_invalid_cbor_vectors_fail_decode(vectors: &[InvalidVector]) {
+        assert!(
+            !vectors.is_empty(),
+            "invalid vector fixture must not be empty"
+        );
+        for vector in vectors {
+            let bytes = decode_hex(&vector.cbor_hex);
+            let err = match vector.target {
+                InvalidTarget::Request => serde_cbor::from_slice::<NockchainRequest>(&bytes)
+                    .expect_err("invalid request vector should fail decode"),
+                InvalidTarget::Response => serde_cbor::from_slice::<NockchainResponse>(&bytes)
+                    .expect_err("invalid response vector should fail decode"),
+            };
+            if let Some(substring) = &vector.error_substring {
+                if !substring.is_empty() {
+                    let err_text = format!("{err:?}");
+                    assert!(
+                        err_text.contains(substring),
+                        "invalid vector '{}' error mismatch. expected substring '{}', got '{}'",
+                        vector.id,
+                        substring,
+                        err_text
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gen1_cbor_vector_schema_version() {
+        let vectors = load_gen1_cbor_conformance_vectors();
+        assert_eq!(vectors.schema_version, "req_res_gen1_cbor_v1");
+    }
+
+    #[test]
+    fn test_gen1_request_cbor_vectors_roundtrip() {
+        let vectors = load_gen1_cbor_conformance_vectors();
+        assert_request_cbor_vectors_roundtrip(&vectors.request_vectors);
+    }
+
+    #[test]
+    fn test_gen1_response_cbor_vectors_roundtrip() {
+        let vectors = load_gen1_cbor_conformance_vectors();
+        assert_response_cbor_vectors_roundtrip(&vectors.response_vectors);
+    }
+
+    #[test]
+    fn test_gen1_invalid_cbor_vectors_fail_decode() {
+        let vectors = load_gen1_cbor_conformance_vectors();
+        assert_invalid_cbor_vectors_fail_decode(&vectors.invalid_vectors);
+    }
+
+    #[test]
+    fn test_gen2_cbor_vector_schema_version() {
+        let vectors = load_gen2_cbor_conformance_vectors();
+        assert_eq!(vectors.schema_version, "req_res_gen2_cbor_v1");
+    }
+
+    #[test]
+    fn test_gen2_request_cbor_vectors_roundtrip() {
+        let vectors = load_gen2_cbor_conformance_vectors();
+        assert_request_cbor_vectors_roundtrip(&vectors.request_vectors);
+    }
+
+    #[test]
+    fn test_gen2_response_cbor_vectors_roundtrip() {
+        let vectors = load_gen2_cbor_conformance_vectors();
+        assert_response_cbor_vectors_roundtrip(&vectors.response_vectors);
+    }
+
+    #[test]
+    fn test_gen2_invalid_cbor_vectors_fail_decode() {
+        let vectors = load_gen2_cbor_conformance_vectors();
+        assert_invalid_cbor_vectors_fail_decode(&vectors.invalid_vectors);
+    }
+
+    #[test]
+    fn test_unknown_request_variant_fails_without_panic() {
+        let mut variant_map = std::collections::BTreeMap::new();
+        variant_map.insert(
+            serde_cbor::Value::Text(String::from("NotARealVariant")),
+            serde_cbor::Value::Map(std::collections::BTreeMap::new()),
+        );
+        let cbor = serde_cbor::to_vec(&serde_cbor::Value::Map(variant_map))
+            .expect("unknown request variant cbor should serialize");
+
+        let err = serde_cbor::from_slice::<NockchainRequest>(&cbor)
+            .expect_err("unknown request variant should fail decode");
+        let err_text = format!("{err:?}");
+        assert!(
+            !err_text.contains("panic"),
+            "unknown request variant must fail without panic"
+        );
+    }
+
+    #[test]
+    fn test_unknown_response_variant_fails_without_panic() {
+        let mut variant_map = std::collections::BTreeMap::new();
+        variant_map.insert(
+            serde_cbor::Value::Text(String::from("NotARealVariant")),
+            serde_cbor::Value::Map(std::collections::BTreeMap::new()),
+        );
+        let cbor = serde_cbor::to_vec(&serde_cbor::Value::Map(variant_map))
+            .expect("unknown response variant cbor should serialize");
+
+        let err = serde_cbor::from_slice::<NockchainResponse>(&cbor)
+            .expect_err("unknown response variant should fail decode");
+        let err_text = format!("{err:?}");
+        assert!(
+            !err_text.contains("panic"),
+            "unknown response variant must fail without panic"
+        );
+    }
+
+    #[test]
+    fn test_unknown_batch_result_status_fails_without_panic() {
+        let cbor = serde_cbor::to_vec(&EncodedBatchResultItem {
+            item_id: 1,
+            status: "FutureStatus",
+            error: None,
+            envelope: None,
+        })
+        .expect("unknown status cbor should serialize");
+
+        let err = serde_cbor::from_slice::<BatchResultItem>(&cbor)
+            .expect_err("unknown batch result status should fail decode");
+        let err_text = format!("{err:?}");
+        assert!(
+            err_text.contains("unknown variant") || err_text.contains("FutureStatus"),
+            "decode error should mention the unknown status: {err_text}"
+        );
+        assert!(
+            !err_text.contains("panic"),
+            "unknown batch result status must fail without panic"
+        );
+    }
+
+    #[test]
+    fn test_unknown_batch_error_class_fails_without_panic() {
+        let cbor = serde_cbor::to_vec(&EncodedBatchResultItem {
+            item_id: 1,
+            status: "Error",
+            error: Some("FutureErrorClass"),
+            envelope: None,
+        })
+        .expect("unknown error class cbor should serialize");
+
+        let err = serde_cbor::from_slice::<BatchResultItem>(&cbor)
+            .expect_err("unknown batch error class should fail decode");
+        let err_text = format!("{err:?}");
+        assert!(
+            err_text.contains("unknown variant") || err_text.contains("FutureErrorClass"),
+            "decode error should mention the unknown error class: {err_text}"
+        );
+        assert!(
+            !err_text.contains("panic"),
+            "unknown batch error class must fail without panic"
+        );
     }
 }

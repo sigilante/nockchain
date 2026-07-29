@@ -1,9 +1,16 @@
 use std::net::SocketAddr;
+use std::pin::Pin;
 
+use futures::Stream;
 use nockapp::driver::{NockAppHandle, PokeResult};
 use nockapp::noun::slab::NounSlab;
+use nockvm::noun::NounAllocator;
+use tokio::sync::broadcast::error::RecvError;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
+use tonic_health::server::health_reporter;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use tracing::{debug, error, info, warn};
 
 use crate::error::{NockAppGrpcError, Result};
@@ -26,9 +33,28 @@ impl PrivateNockAppGrpcServer {
     pub async fn serve(self, addr: SocketAddr) -> Result<()> {
         info!("Starting private gRPC server on {}", addr);
 
-        let service = PrivateNockAppServer::new(self);
+        let (health_reporter, health_service) = health_reporter();
+        health_reporter
+            .set_serving::<PrivateNockAppServer<PrivateNockAppGrpcServer>>()
+            .await;
+        let reflection_service_v1 = ReflectionBuilder::configure()
+            .register_encoded_file_descriptor_set(nockapp_grpc_proto::pb::FILE_DESCRIPTOR_SET)
+            .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
+            .build_v1()
+            .map_err(|e| {
+                NockAppGrpcError::Internal(format!("Failed to build v1 reflection service: {}", e))
+            })?;
+        // Explicit message-size limits on the unauthenticated command
+        // channel: receive matches the kernel's 4 MiB artifact-jam cap (the
+        // tonic 4 MiB default, pinned so a tonic upgrade cannot silently
+        // widen it); send is bounded at 16 MiB for WatchEffects payloads.
+        let service = PrivateNockAppServer::new(self)
+            .max_decoding_message_size(4 * 1024 * 1024)
+            .max_encoding_message_size(16 * 1024 * 1024);
 
         Server::builder()
+            .add_service(health_service)
+            .add_service(reflection_service_v1)
             .add_service(service)
             .serve(addr)
             .await
@@ -111,6 +137,80 @@ impl PrivateNockApp for PrivateNockAppGrpcServer {
                 Ok(Response::new(response))
             }
         }
+    }
+
+    type WatchEffectsStream =
+        Pin<Box<dyn Stream<Item = std::result::Result<EffectMessage, Status>> + Send + 'static>>;
+
+    async fn watch_effects(
+        &self,
+        request: Request<WatchEffectsRequest>,
+    ) -> std::result::Result<Response<Self::WatchEffectsStream>, Status> {
+        let req = request.into_inner();
+        debug!(
+            "WatchEffects request: pid={} filters={}",
+            req.pid,
+            req.head_filter.len()
+        );
+
+        // One fresh broadcast subscriber per client. The bus drops effects
+        // for slow consumers; a lagging subscriber gets a terminal stream error
+        // so stateful miners reconnect and invalidate stale work.
+        let mut receiver = self.handle.effect_sender.subscribe();
+        let head_filter = req.head_filter;
+        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<EffectMessage, Status>>(64);
+
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(slab) => {
+                        let effect_noun = unsafe { *slab.root() };
+                        // Filter on the head atom of the effect cell. Empty
+                        // filter forwards everything. Use the slab noun space
+                        // when reading the effect head.
+                        let head_matches = if head_filter.is_empty() {
+                            true
+                        } else {
+                            let space = slab.noun_space();
+                            match effect_noun.in_space(&space).as_cell() {
+                                Ok(cell) => {
+                                    let head = cell.head();
+                                    head_filter.iter().any(|f| head.eq_bytes(f.as_slice()))
+                                }
+                                Err(_) => false,
+                            }
+                        };
+                        if !head_matches {
+                            continue;
+                        }
+                        let jam_bytes = slab.jam();
+                        let msg = EffectMessage {
+                            effect: jam_bytes.to_vec(),
+                        };
+                        if tx.send(Ok(msg)).await.is_err() {
+                            // Client disconnected.
+                            break;
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        warn!("WatchEffects client lagged by {n} effects; ending stream");
+                        let _ = tx
+                            .send(Err(Status::data_loss(format!(
+                                "WatchEffects client lagged by {n} effects; reconnect required"
+                            ))))
+                            .await;
+                        break;
+                    }
+                    Err(RecvError::Closed) => {
+                        debug!("WatchEffects: effect broadcast closed; ending stream");
+                        break;
+                    }
+                }
+            }
+        });
+
+        let stream = ReceiverStream::new(rx);
+        Ok(Response::new(Box::pin(stream) as Self::WatchEffectsStream))
     }
 
     async fn poke(

@@ -1,7 +1,7 @@
 use std::error::Error;
 
-use clap::Parser;
-use kernels::dumb::KERNEL;
+use chaff::Chaff;
+use kernels_open_dumb::KERNEL;
 use nockapp::kernel::boot;
 use nockchain::NockchainAPIConfig;
 use zkvm_jetpack::hot::produce_prover_hot_state;
@@ -24,7 +24,8 @@ static ALLOC: tracy_client::ProfiledAllocator<tikv_jemallocator::Jemalloc> =
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     nockvm::check_endian();
-    let mut cli = nockchain::NockchainCli::parse();
+    let mut cli =
+        nockchain::NockchainCli::parse_with_default_stack_size(boot::NockStackSize::Large);
     cli.nockapp_cli.color = clap::ColorChoice::Never;
     boot::init_default_tracing(&cli.nockapp_cli);
 
@@ -36,8 +37,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         NockchainAPIConfig::DisablePublicServer
     };
 
-    let mut nockchain: nockapp::NockApp =
-        nockchain::init_with_kernel(cli, KERNEL, prover_hot_state.as_slice(), api_config).await?;
+    let mut nockchain =
+        nockchain::init_with_kernel::<Chaff>(cli, KERNEL, prover_hot_state.as_slice(), api_config)
+            .await?;
     nockchain.run().await?;
     Ok(())
 }

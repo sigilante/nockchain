@@ -1,8 +1,42 @@
+#![allow(dead_code)]
 use std::env;
 use std::path::PathBuf;
+use std::process::Command;
+
+fn ensure_protoc() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cargo:rerun-if-env-changed=PROTOC");
+    println!("cargo:rerun-if-env-changed=PATH");
+    if let Some(protoc) = env::var_os("PROTOC") {
+        let path = PathBuf::from(protoc);
+        if !path.is_file() {
+            return Err(format!("PROTOC is set but not a file: {}", path.display()).into());
+        }
+        return Ok(());
+    }
+    match Command::new("protoc").arg("--version").status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(format!(
+            "protoc from PATH exited with status {status}; set PROTOC to a valid binary path"
+        )
+        .into()),
+        Err(_) => Err(
+            "protoc is required to build nockapp-grpc-proto but was not found.\n\n\
+             Install protoc via one of:\n\
+             \x20 nix develop             (recommended — uses the project flake)\n\
+             \x20 apt install protobuf-compiler  (Debian/Ubuntu)\n\
+             \x20 brew install protobuf          (macOS)\n\
+             \x20 PROTOC=/path/to/protoc         (manual override)\n\n\
+             The Docker build installs protobuf-compiler automatically.\n\
+             See also: flake.nix (Nix), tools/protoc (Bazel)."
+                .into(),
+        ),
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Rerun if any file in the proto directory changes
+
+    ensure_protoc()?;
 
     // Get the output directory
     let out_dir = PathBuf::from(env::var("OUT_DIR")?);
@@ -14,9 +48,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for proto_file in proto_files.clone() {
         eprintln!("cargo:rerun-if-changed={}", proto_file.display());
-        let path_string = proto_file
-            .to_str()
-            .expect("Couldn't convert proto_file path to string");
+        let path_string = proto_file.to_str().ok_or("proto path is not valid UTF-8")?;
         println!("cargo:rerun-if-changed={path_string}");
     }
     let include_dirs = ["proto"].map(PathBuf::from);

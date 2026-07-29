@@ -1,61 +1,32 @@
 # {{project_name}}
 
-A NockApp project created with `nockup`.
+gRPC demo template with two binaries:
 
-## Description
+- `listen`: gRPC server listener.
+- `talk`: client-side talker that emits `%grpc` effects.
 
-{{project_description}}
+## Files
 
-## Building
+- `src/listen.rs`, `src/talk.rs`: Rust binaries.
+- `hoon/app/listen.hoon`, `hoon/app/talk.hoon`: matching kernels.
+- `src/lib.rs`: shared helpers.
 
-To build this project:
+## Build
 
-```bash
-nockup build {{project_name}}
+From the workspace directory that contains `nockapp.toml`:
+
+```sh
+nockup project build {{project_name}}
 ```
 
-Or using cargo directly:
+This compiles Hoon apps and writes `listen.jam` and `talk.jam`.
 
-```bash
-cargo build --release
+## Run
+
+`nockup project run` is single-binary oriented. For this template, run binaries explicitly:
+
+```sh
+cd {{project_name}}
+cargo run --release --bin listen
+cargo run --release --bin talk
 ```
-
-## Running
-
-To run this project:
-
-```bash
-nockup run {{project_name}}
-```
-
-Or using cargo directly:
-
-```bash
-cargo run
-```
-
-## Project Structure
-
-- `src/main.rs` - Main Rust entry point
-- `src/lib.rs` - Core NockApp library code  
-- `src/app.hoon` - Hoon application logic
-- `manifest.toml` - NockApp configuration
-- `build.rs` - Build script for compiling Hoon code
-- `Cargo.toml` - Rust dependencies and configuration
-
-## Development
-
-This project uses both Rust and Hoon:
-
-- **Rust** handles the runtime, VM integration, and system interfaces
-- **Hoon** contains the core application logic that compiles to Nock
-- The `build.rs` script automatically compiles Hoon to Nock during the build process
-
-## Dependencies
-
-- [NockApp](https://github.com/nockchain/nockchain) - Nock virtual machine
-- Standard Rust crates for serialization and error handling
-
-## License
-
-This project is licensed under {{license}}.

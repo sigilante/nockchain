@@ -21,4 +21,20 @@
 ++  prove
   |=  input=prover-input:stark-prover
   (prove:prover input)
+::
+++  snapshot
+  |=  input=prover-input:stark-prover
+  (snapshot:prover input)
+::
+++  make-proof-stream-window
+  |=  [input=prover-input:stark-prover range=proof-stream-range:stark-prover]
+  (make-proof-stream-window:prover input range)
+::
+++  assemble-proof-stream
+  |=  windows=(list proof-stream-window:stark-prover)
+  (assemble-proof-stream:prover windows)
+:::
+++  assemble-proof-continuation
+  |=  [snapshot=proof-snapshot:stark-prover context=proof-stream-context:stark-prover windows=(list proof-stream-window:stark-prover)]
+  (assemble-proof-continuation:prover snapshot context windows)
 --

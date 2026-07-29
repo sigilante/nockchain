@@ -1,0 +1,2886 @@
+use std::path::{Path, PathBuf};
+
+use nockapp::Bytes;
+use nockchain_math::noun_ext::NounMathExtHandle;
+use nockchain_math::zoon::zmap::ZMap;
+use nockchain_types::tx_engine::common::Signature;
+use nockvm::noun::NounSpace;
+use wallet_tx_builder::types::{CandidateNote, CreateTxPlanningMode, PlanResult};
+
+use super::*;
+
+pub(crate) fn ensure_manual_planner_parity(
+    requested_names: &[Name],
+    planned_names: &[Name],
+) -> Result<(), String> {
+    let mut normalized_requested = requested_names
+        .iter()
+        .map(|name| (name.first.to_array(), name.last.to_array()))
+        .collect::<Vec<_>>();
+    let mut normalized_planned = planned_names
+        .iter()
+        .map(|name| (name.first.to_array(), name.last.to_array()))
+        .collect::<Vec<_>>();
+    normalized_requested.sort_unstable();
+    normalized_planned.sort_unstable();
+
+    if normalized_planned != normalized_requested {
+        let planned_names_arg = Wallet::format_note_names_for_create_tx(planned_names);
+        let requested_names_arg = Wallet::format_note_names_for_create_tx(requested_names);
+        return Err(format!(
+            "planner parity mismatch: selected names differ from user-provided manual names (planned='{}', requested='{}')",
+            planned_names_arg, requested_names_arg
+        ));
+    }
+    Ok(())
+}
+
+/// Normalized lookup key for a note name, independent of base58 rendering.
+type NoteNameKey = ([u64; 5], [u64; 5]);
+
+fn note_name_key(name: &Name) -> NoteNameKey {
+    (name.first.to_array(), name.last.to_array())
+}
+
+/// Trims ASCII whitespace and NUL bytes from both ends of a CSV field/line.
+///
+/// The wallet's file writer can leave trailing NUL padding (a line of `\0`
+/// bytes), which must be treated like empty space rather than note data.
+fn trim_csv(value: &str) -> &str {
+    value.trim_matches(|c: char| c == '\0' || c.is_whitespace())
+}
+
+/// Records the notes CSV path and the notes a planner run actually selected, so
+/// the spent notes can be removed from the CSV after the transaction is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CsvNoteReservation {
+    /// Notes CSV file the candidates were drawn from.
+    pub(crate) path: PathBuf,
+    /// Note names selected by the planner (the notes that get spent).
+    pub(crate) selected: Vec<Name>,
+}
+
+/// Parses a notes CSV (as written by `list-notes-by-address-csv` /
+/// `list-notes-by-multisig-csv`) into the list of note names it lists.
+///
+/// Only the `name_first` and `name_last` columns are read; every other column is
+/// ignored so the file stays a human-editable ledger. The header row and blank
+/// lines are skipped. Any row whose name columns fail to parse as base58 is a
+/// hard error, since silently dropping a note the caller listed could change
+/// which notes are eligible to spend.
+pub(crate) fn parse_notes_csv_names(path: &Path) -> Result<Vec<Name>, NockAppError> {
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        NockAppError::from(CrownError::Unknown(format!(
+            "Failed to read notes CSV {}: {}",
+            path.display(),
+            err
+        )))
+    })?;
+
+    let mut names = Vec::new();
+    for (line_idx, raw_line) in contents.lines().enumerate() {
+        let line = trim_csv(raw_line);
+        // Skip blank lines and trailing NUL padding left by the file writer.
+        if line.is_empty() {
+            continue;
+        }
+        let columns: Vec<&str> = line.split(',').collect();
+        if columns.len() < 3 {
+            return Err(NockAppError::from(CrownError::Unknown(format!(
+                "Notes CSV {} line {} has fewer than 3 columns: '{}'",
+                path.display(),
+                line_idx + 1,
+                line.escape_default()
+            ))));
+        }
+        let first = trim_csv(columns[1]);
+        let last = trim_csv(columns[2]);
+        // Skip the `version,name_first,name_last,...` header row. A real note row
+        // has a numeric version, so the literal `version` token marks the header.
+        if trim_csv(columns[0]) == "version" || (first == "name_first" && last == "name_last") {
+            continue;
+        }
+        let first_hash = Hash::from_base58(first).map_err(|err| {
+            NockAppError::from(CrownError::Unknown(format!(
+                "Notes CSV {} line {} has invalid name_first '{}': {}",
+                path.display(),
+                line_idx + 1,
+                first,
+                err
+            )))
+        })?;
+        let last_hash = Hash::from_base58(last).map_err(|err| {
+            NockAppError::from(CrownError::Unknown(format!(
+                "Notes CSV {} line {} has invalid name_last '{}': {}",
+                path.display(),
+                line_idx + 1,
+                last,
+                err
+            )))
+        })?;
+        names.push(Name::new(first_hash, last_hash));
+    }
+
+    Ok(names)
+}
+
+/// Rewrites a notes CSV with the spent notes removed, preserving the header,
+/// untouched rows, and any rows that fail to parse (a malformed row is never
+/// silently dropped). Returns the number of rows actually removed.
+pub(crate) fn remove_notes_from_csv(path: &Path, removed: &[Name]) -> Result<usize, NockAppError> {
+    let removed_keys: std::collections::BTreeSet<NoteNameKey> =
+        removed.iter().map(note_name_key).collect();
+
+    let contents = std::fs::read_to_string(path).map_err(|err| {
+        NockAppError::from(CrownError::Unknown(format!(
+            "Failed to read notes CSV {} for removal: {}",
+            path.display(),
+            err
+        )))
+    })?;
+
+    let mut kept_lines: Vec<&str> = Vec::new();
+    let mut removed_count = 0usize;
+    for raw_line in contents.lines() {
+        let line = trim_csv(raw_line);
+        // Drop blank lines and trailing NUL padding rather than rewriting them.
+        if line.is_empty() {
+            continue;
+        }
+        let columns: Vec<&str> = line.split(',').collect();
+        if columns.len() < 3 || trim_csv(columns[0]) == "version" {
+            // Header or malformed row: keep it (trimmed of any NUL padding).
+            kept_lines.push(line);
+            continue;
+        }
+        let first = trim_csv(columns[1]);
+        let last = trim_csv(columns[2]);
+        match (Hash::from_base58(first), Hash::from_base58(last)) {
+            (Ok(first_hash), Ok(last_hash)) => {
+                let key = (first_hash.to_array(), last_hash.to_array());
+                if removed_keys.contains(&key) {
+                    removed_count += 1;
+                } else {
+                    kept_lines.push(line);
+                }
+            }
+            // Unparseable name columns: keep the row rather than risk dropping it.
+            _ => kept_lines.push(line),
+        }
+    }
+
+    let mut output = kept_lines.join("\n");
+    output.push('\n');
+    std::fs::write(path, output).map_err(|err| {
+        NockAppError::from(CrownError::Unknown(format!(
+            "Failed to rewrite notes CSV {} after removing spent notes: {}",
+            path.display(),
+            err
+        )))
+    })?;
+
+    Ok(removed_count)
+}
+
+/// Network default `max-block-size` in bits. The on-chain block-inclusion check
+/// (`candidate-block-below-max-size`, miner.hoon) rejects blocks larger than
+/// this (8,000,000 bits ~= 1 MB on mainnet), so a transaction that cannot fit in
+/// a block can never be mined.
+const MAX_BLOCK_SIZE_BITS: u64 = 8_000_000;
+
+/// Returns a human-readable reason when `plan` would build a transaction too
+/// large to be mined, or `None` when it is within budget.
+///
+/// The estimate is intentionally conservative and word-count based so it scales
+/// with lock complexity: multisig inputs carry a large m-of-n witness, so the
+/// planner's `witness_words` already reflects per-input cost. We add a small
+/// per-input framing allowance (input first/last name + spend wrapper) not
+/// captured by the seed/witness word counts, convert words (64-bit field
+/// leaves) to bits, and compare against the block-size budget after reserving
+/// headroom for the block's PoW proof (~720k bits) and coinbase/header overhead.
+fn oversized_plan_reason(plan: &PlanResult) -> Option<String> {
+    const BITS_PER_WORD: u64 = 64;
+    const PER_INPUT_FRAMING_WORDS: u64 = 16;
+    /// Block budget for the transaction itself, reserving ~1,000,000 bits for the
+    /// PoW proof and coinbase/header overhead that share the block.
+    const TX_SIZE_BUDGET_BITS: u64 = MAX_BLOCK_SIZE_BITS - 1_000_000;
+
+    let input_count = plan.selected.len() as u64;
+    let estimated_words = plan
+        .word_counts
+        .seed_words
+        .saturating_add(plan.word_counts.witness_words)
+        .saturating_add(input_count.saturating_mul(PER_INPUT_FRAMING_WORDS));
+    let estimated_bits = estimated_words.saturating_mul(BITS_PER_WORD);
+    if estimated_bits <= TX_SIZE_BUDGET_BITS {
+        return None;
+    }
+    Some(format!(
+        "planned transaction is too large to mine: {input_count} inputs, ~{est_kb} KB estimated \
+         (budget ~{budget_kb} KB within the {max_kb} KB / {max_bits}-bit max block size). Large \
+         multisig spends over many small notes exceed the block-size limit and take many minutes \
+         to build. Reduce the amount or restrict --notes-csv to fewer notes, then send in batches.",
+        est_kb = estimated_bits / 8 / 1024,
+        budget_kb = TX_SIZE_BUDGET_BITS / 8 / 1024,
+        max_kb = MAX_BLOCK_SIZE_BITS / 8 / 1024,
+        max_bits = MAX_BLOCK_SIZE_BITS,
+    ))
+}
+
+#[derive(Debug, Clone, NounEncode, NounDecode)]
+/// Subset of chain note-data constants consumed by planner fee logic.
+pub(crate) struct PlannerNoteDataConstantsNoun {
+    pub(crate) _max_size: u64,
+    pub(crate) min_fee: u64,
+}
+
+#[derive(Debug, Clone, NounEncode)]
+/// Blockchain constants payload extracted from wallet state for planning.
+pub(crate) struct PlannerBlockchainConstantsNoun {
+    pub(crate) _v1_phase: u64,
+    pub(crate) bythos_phase: u64,
+    pub(crate) data: PlannerNoteDataConstantsNoun,
+    pub(crate) base_fee: u64,
+    pub(crate) input_fee_divisor: u64,
+    pub(crate) coinbase_timelock_min: u64,
+}
+
+impl NounDecode for PlannerBlockchainConstantsNoun {
+    fn from_noun(noun: &Noun, space: &NounSpace) -> Result<Self, NounDecodeError> {
+        let fields = noun.in_space(space).uncell::<6>()?;
+        let legacy_or_timelock = fields[5];
+        let coinbase_timelock_min = if let Ok(value) = u64::from_noun_handle(&legacy_or_timelock) {
+            value
+        } else {
+            let legacy_fields = match legacy_or_timelock.uncell::<13>() {
+                Ok(fields) => fields,
+                Err(_) => {
+                    let wrapped = legacy_or_timelock.as_cell()?;
+                    wrapped.head().uncell::<13>()?
+                }
+            };
+            u64::from_noun_handle(&legacy_fields[9])?
+        };
+
+        Ok(Self {
+            _v1_phase: u64::from_noun_handle(&fields[0])?,
+            bythos_phase: u64::from_noun_handle(&fields[1])?,
+            data: PlannerNoteDataConstantsNoun::from_noun_handle(&fields[2])?,
+            base_fee: u64::from_noun_handle(&fields[3])?,
+            input_fee_divisor: u64::from_noun_handle(&fields[4])?,
+            coinbase_timelock_min,
+        })
+    }
+}
+
+#[derive(Debug, Clone, NounEncode, NounDecode, PartialEq, Eq)]
+pub(crate) struct ActiveSignerEntryNoun {
+    pub(crate) child_index: Option<u64>,
+    pub(crate) hardened: bool,
+    pub(crate) absolute_index: Option<u64>,
+    pub(crate) version: u64,
+    pub(crate) pubkey: SchnorrPubkey,
+    pub(crate) address_b58: String,
+}
+
+impl ActiveSignerEntryNoun {
+    fn is_master(&self) -> bool {
+        self.child_index.is_none()
+    }
+
+    fn sign_keys(&self) -> Vec<(u64, bool)> {
+        self.child_index
+            .map(|index| vec![(index, self.hardened)])
+            .unwrap_or_default()
+    }
+
+    fn sort_key(&self) -> (u8, u64, String) {
+        (
+            if self.is_master() { 0 } else { 1 },
+            self.absolute_index.unwrap_or(0),
+            self.address_b58.clone(),
+        )
+    }
+
+    fn label(&self) -> String {
+        match self.child_index {
+            Some(index) => {
+                let hardened = if self.hardened {
+                    "hardened"
+                } else {
+                    "unhardened"
+                };
+                format!("child({index}:{hardened})")
+            }
+            None => "master".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrateV0SignerSummary {
+    pub(crate) signer: ActiveSignerEntryNoun,
+    pub(crate) note_count: usize,
+    pub(crate) selected_total: u64,
+    pub(crate) fee: Option<u64>,
+    pub(crate) migrated_amount: Option<u64>,
+    pub(crate) tx_path: Option<String>,
+    pub(crate) skip_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MigrateV0NotesSummary {
+    pub(crate) destination: String,
+    pub(crate) block_id: String,
+    pub(crate) height: u64,
+    pub(crate) examined_signers: usize,
+    pub(crate) created_count: usize,
+    pub(crate) skipped_count: usize,
+    pub(crate) signers: Vec<MigrateV0SignerSummary>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, NounDecode)]
+struct BatchWriteRequestEntry {
+    path: String,
+    contents: Bytes,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AppliedWalletEffects {
+    tx_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TxFileSnapshot {
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WrittenTxSnapshot(BTreeMap<PathBuf, TxFileSnapshot>);
+
+#[derive(Debug, Clone)]
+struct CreateTxRequest {
+    names: String,
+    recipients: Vec<RecipientSpec>,
+    fee: u64,
+    allow_low_fee: bool,
+    refund_pkh: Option<String>,
+    sign_keys: Vec<(u64, bool)>,
+    include_data: bool,
+    save_raw_tx: bool,
+    note_selection: NoteSelectionStrategyCli,
+    /// When set, the kernel reconstructs the m-of-n input lock from these
+    /// participants and supplies it as the input lock so multisig notes (whose
+    /// note-data omits the lock) can be spent.
+    multisig: Option<MultisigCausePayload>,
+}
+
+#[derive(Debug, Clone)]
+/// Threshold + base58 participant pubkey hashes forwarded to the kernel so it can
+/// rebuild the multisig input lock for a multisig spend.
+struct MultisigCausePayload {
+    threshold: u64,
+    participants_b58: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMigrationTx {
+    summary_index: usize,
+    planned_names: Vec<Name>,
+    request: CreateTxRequest,
+}
+
+pub(crate) struct PreparedMigrateV0Notes {
+    pub(crate) summary: MigrateV0NotesSummary,
+    poke: Option<(NounSlab, Operation)>,
+    pending_txs: Vec<PendingMigrationTx>,
+}
+
+impl PreparedMigrateV0Notes {
+    pub(crate) fn take_poke(&mut self) -> Option<(NounSlab, Operation)> {
+        self.poke.take()
+    }
+
+    fn normalized_name_key(names: &[Name]) -> Vec<([u64; 5], [u64; 5])> {
+        let mut key = names
+            .iter()
+            .map(|name| (name.first.to_array(), name.last.to_array()))
+            .collect::<Vec<_>>();
+        key.sort_unstable();
+        key
+    }
+
+    fn assign_tx_paths(&mut self, tx_paths: Vec<String>) -> Result<(), NockAppError> {
+        if tx_paths.len() != self.pending_txs.len() {
+            return Err(NockAppError::OtherError(format!(
+                "migrate-v0-notes expected {} saved transaction files, but found {}",
+                self.pending_txs.len(),
+                tx_paths.len()
+            )));
+        }
+
+        let mut expected_by_name_set = BTreeMap::<Vec<([u64; 5], [u64; 5])>, usize>::new();
+        for pending in &self.pending_txs {
+            let key = Self::normalized_name_key(&pending.planned_names);
+            if expected_by_name_set
+                .insert(key, pending.summary_index)
+                .is_some()
+            {
+                return Err(NockAppError::OtherError(
+                    "migrate-v0-notes found duplicate planned note sets while matching saved transactions".to_string(),
+                ));
+            }
+        }
+
+        let mut assigned = BTreeMap::<usize, String>::new();
+        for tx_path in tx_paths {
+            let spends = Wallet::decode_transaction_spends_from_path(&tx_path)?;
+            let tx_name_key = Self::normalized_name_key(
+                &spends
+                    .0
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+            );
+            let Some(summary_index) = expected_by_name_set.get(&tx_name_key).copied() else {
+                return Err(NockAppError::OtherError(format!(
+                    "migrate-v0-notes could not match saved transaction '{}' to any planned signer batch",
+                    tx_path
+                )));
+            };
+            if assigned.insert(summary_index, tx_path.clone()).is_some() {
+                return Err(NockAppError::OtherError(format!(
+                    "migrate-v0-notes matched more than one saved transaction to signer summary index {}",
+                    summary_index
+                )));
+            }
+        }
+
+        for pending in &self.pending_txs {
+            let Some(tx_path) = assigned.remove(&pending.summary_index) else {
+                return Err(NockAppError::OtherError(format!(
+                    "migrate-v0-notes did not find a saved transaction for signer summary index {}",
+                    pending.summary_index
+                )));
+            };
+            self.summary.signers[pending.summary_index].tx_path = Some(tx_path);
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn finalize(
+        mut self,
+        tx_paths: Vec<String>,
+    ) -> Result<MigrateV0NotesSummary, NockAppError> {
+        if !self.pending_txs.is_empty() {
+            self.assign_tx_paths(tx_paths)?;
+        }
+        Ok(self.summary)
+    }
+}
+
+impl PlannerBlockchainConstantsNoun {
+    /// Returns the consensus coinbase relative timelock minimum.
+    pub(crate) fn coinbase_timelock_min(&self) -> Result<u64, NockAppError> {
+        Ok(self.coinbase_timelock_min)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+/// Lock matcher for simple single-signer PKH lock resolution.
+///
+/// This matcher is intentionally scoped to single-signer PKH spend conditions
+/// that can be satisfied by locally held signer keys.
+/// Multisig or otherwise complex lock forms are intentionally not matched here.
+pub(crate) struct SigningKeyLockMatcher {
+    signer_pkhs: std::collections::BTreeSet<[u64; 5]>,
+}
+
+impl SigningKeyLockMatcher {
+    /// Builds a matcher from signer pubkey-hashes.
+    pub(crate) fn from_signer_keys(signer_keys: &[Hash]) -> Self {
+        let signer_pkhs = signer_keys
+            .iter()
+            .map(Hash::to_array)
+            .collect::<std::collections::BTreeSet<_>>();
+        Self { signer_pkhs }
+    }
+}
+
+impl LockMatcher for SigningKeyLockMatcher {
+    fn matches(&self, note_first_name: &Hash, spend_condition: &SpendCondition) -> bool {
+        let mut primitive_count = 0usize;
+        let mut tim_primitive_count = 0usize;
+        let mut signer_pkh_primitive = None;
+        for primitive in spend_condition.iter() {
+            primitive_count = primitive_count.saturating_add(1);
+            match primitive {
+                LockPrimitive::Pkh(pkh) => {
+                    if signer_pkh_primitive.is_some() {
+                        return false;
+                    }
+                    signer_pkh_primitive = Some(pkh);
+                }
+                LockPrimitive::Tim(_) => {
+                    tim_primitive_count = tim_primitive_count.saturating_add(1);
+                }
+                _ => return false,
+            }
+        }
+        let Some(pkh) = signer_pkh_primitive else {
+            return false;
+        };
+        if pkh.m != 1 || pkh.hashes.is_empty() {
+            return false;
+        }
+        if !pkh
+            .hashes
+            .iter()
+            .any(|hash| self.signer_pkhs.contains(&hash.to_array()))
+        {
+            return false;
+        }
+        let is_simple_shape = tim_primitive_count == 0 && primitive_count == 1;
+        let is_coinbase_shape = tim_primitive_count == 1 && primitive_count == 2;
+        if !is_simple_shape && !is_coinbase_shape {
+            return false;
+        }
+        let Ok(reconstructed_first_name) = spend_condition.first_name() else {
+            return false;
+        };
+        note_first_name.to_array() == reconstructed_first_name.as_hash().to_array()
+    }
+
+    fn resolve_lock(&self, request: ResolveLockRequest<'_>) -> LockResolution {
+        if let Some(lock_data) = request.decoded_note_data.first_decoded_lock() {
+            if lock_data.spend_conditions.len() == 1 {
+                let spend_condition = &lock_data.spend_conditions[0];
+                if self.matches(request.note_first_name, spend_condition) {
+                    return LockResolution {
+                        source: LockResolutionSource::NoteData,
+                        spend_condition: Some(spend_condition.clone()),
+                        spend_condition_count: None,
+                    };
+                }
+            }
+        }
+
+        for signer_pkh in self.signer_pkhs.iter().map(|hash| Hash::from_limbs(hash)) {
+            let simple = SpendCondition::simple_pkh(signer_pkh.clone());
+            if self.matches(request.note_first_name, &simple) {
+                return LockResolution {
+                    source: LockResolutionSource::ReconstructedSimplePkh,
+                    spend_condition: Some(simple),
+                    spend_condition_count: None,
+                };
+            }
+        }
+
+        if let Some(relative_min) = request.coinbase_relative_min {
+            for signer_pkh in self.signer_pkhs.iter().map(|hash| Hash::from_limbs(hash)) {
+                let coinbase = SpendCondition::coinbase_pkh(signer_pkh.clone(), relative_min);
+                if self.matches(request.note_first_name, &coinbase) {
+                    return LockResolution {
+                        source: LockResolutionSource::ReconstructedCoinbasePkh,
+                        spend_condition: Some(coinbase),
+                        spend_condition_count: None,
+                    };
+                }
+            }
+        }
+
+        LockResolution::unknown()
+    }
+}
+
+impl Wallet {
+    fn parse_note_names_as_hashes(raw: &str) -> Result<Vec<Name>, NockAppError> {
+        Self::parse_note_names(raw)?
+            .into_iter()
+            .map(|(first, last)| {
+                let first_hash = Hash::from_base58(&first).map_err(|err| {
+                    NockAppError::from(CrownError::Unknown(format!(
+                        "Invalid note first-name hash '{}': {}",
+                        first, err
+                    )))
+                })?;
+                let last_hash = Hash::from_base58(&last).map_err(|err| {
+                    NockAppError::from(CrownError::Unknown(format!(
+                        "Invalid note last-name hash '{}': {}",
+                        last, err
+                    )))
+                })?;
+                Ok(Name::new(first_hash, last_hash))
+            })
+            .collect()
+    }
+
+    /// Formats selected names into the canonical create-tx `--names` argument.
+    fn format_note_names_for_create_tx(names: &[Name]) -> String {
+        names
+            .iter()
+            .map(|name| format!("[{} {}]", name.first.to_base58(), name.last.to_base58()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Determines whether a manual note set is all-v1 or all-v0.
+    /// Missing notes are ignored here so planner manual-mode errors can report them.
+    fn manual_candidate_version_policy(
+        note_names: &[Name],
+        candidates: &[CandidateNote],
+    ) -> Result<CandidateVersionPolicy, String> {
+        if note_names.is_empty() {
+            return Err("manual mode requires at least one note name".to_string());
+        }
+
+        let mut found_v0 = false;
+        let mut found_v1 = false;
+
+        for name in note_names {
+            let Some(candidate) = candidates
+                .iter()
+                .find(|candidate| candidate.identity().name == *name)
+            else {
+                return Err(format!(
+                    "manual mode references unknown note {}/{}",
+                    name.first.to_base58(),
+                    name.last.to_base58()
+                ));
+            };
+
+            match candidate.version() {
+                nockchain_types::tx_engine::common::Version::V0 => found_v0 = true,
+                _ => found_v1 = true,
+            }
+        }
+
+        match (found_v0, found_v1) {
+            (true, false) => Ok(CandidateVersionPolicy::V0Only),
+            (false, true) => Ok(CandidateVersionPolicy::V1Only),
+            (false, false) => Err("manual mode requires at least one note name".to_string()),
+            (true, true) => Err(
+                "manual create-tx cannot mix v0 and v1 notes; select notes from only one version"
+                    .to_string(),
+            ),
+        }
+    }
+
+    /// Maps CLI ordering strategy onto planner selection order semantics.
+    fn planner_order_direction(strategy: NoteSelectionStrategyCli) -> SelectionOrder {
+        match strategy {
+            NoteSelectionStrategyCli::Ascending => SelectionOrder::Ascending,
+            NoteSelectionStrategyCli::Descending => SelectionOrder::Descending,
+        }
+    }
+
+    /// Reads the latest synced balance snapshot from wallet state.
+    async fn peek_balance_state(&mut self) -> Result<v1::BalanceUpdate, NockAppError> {
+        let mut slab = NounSlab::new();
+        let balance_tag = make_tas(&mut slab, "balance").as_noun();
+        let path = T(&mut slab, &[balance_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_balance: Option<Option<v1::BalanceUpdate>> =
+            unsafe { <Option<Option<v1::BalanceUpdate>>>::from_noun(result.root(), &space)? };
+        match maybe_balance {
+            Some(Some(balance)) => Ok(balance),
+            _ => Err(NockAppError::OtherError(
+                "wallet balance peek returned no balance payload".to_string(),
+            )),
+        }
+    }
+
+    /// Reads blockchain constants from wallet state so the planner uses live fee policy.
+    async fn peek_planner_blockchain_constants(
+        &mut self,
+    ) -> Result<PlannerBlockchainConstantsNoun, NockAppError> {
+        let mut slab = NounSlab::new();
+        let constants_tag = make_tas(&mut slab, "blockchain-constants").as_noun();
+        let path = T(&mut slab, &[constants_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_constants: Option<Option<PlannerBlockchainConstantsNoun>> = unsafe {
+            <Option<Option<PlannerBlockchainConstantsNoun>>>::from_noun(result.root(), &space)?
+        };
+        let Some(constants) = maybe_constants.flatten() else {
+            return Err(NockAppError::OtherError(
+                "wallet blockchain-constants peek returned no payload".to_string(),
+            ));
+        };
+        Ok(constants)
+    }
+
+    /// Normalizes signer key ordering and removes duplicates.
+    fn planner_signer_keys(mut signer_keys: Vec<Hash>) -> Vec<Hash> {
+        signer_keys.sort_by_key(Hash::to_array);
+        signer_keys.dedup_by(|left, right| left.to_array() == right.to_array());
+        signer_keys
+    }
+
+    /// Reads the master signer pubkey-hash from wallet tracked state.
+    async fn peek_master_signing_key(&mut self) -> Result<Hash, NockAppError> {
+        let mut slab = NounSlab::new();
+        let tracked_tag = make_tas(&mut slab, "master-signing-key").as_noun();
+        let path = T(&mut slab, &[tracked_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_signing_key: Option<Option<Hash>> =
+            unsafe { <Option<Option<Hash>>>::from_noun(result.root(), &space)? };
+        maybe_signing_key.flatten().ok_or_else(|| {
+            NockAppError::OtherError(
+                "wallet master-signing-key peek returned no payload".to_string(),
+            )
+        })
+    }
+
+    /// Reads signer pubkey-hashes from wallet tracked state for lock matching.
+    async fn peek_signing_keys(&mut self) -> Result<Vec<Hash>, NockAppError> {
+        let signer_keys = self.peek_signing_keys_at_path("signing-keys").await?;
+        Ok(Self::planner_signer_keys(signer_keys))
+    }
+
+    async fn peek_signing_keys_at_path(
+        &mut self,
+        path_tag: &str,
+    ) -> Result<Vec<Hash>, NockAppError> {
+        let mut slab = NounSlab::new();
+        let tracked_tag = make_tas(&mut slab, path_tag).as_noun();
+        let path = T(&mut slab, &[tracked_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_signing_keys: Option<Option<Vec<Hash>>> =
+            unsafe { <Option<Option<Vec<Hash>>>>::from_noun(result.root(), &space)? };
+        Ok(maybe_signing_keys.flatten().unwrap_or_default())
+    }
+
+    fn signer_pkh_from_active_signer(signer: &ActiveSignerEntryNoun) -> Result<Hash, NockAppError> {
+        Hash::from_base58(&signer.address_b58).map_err(|err| {
+            NockAppError::OtherError(format!(
+                "active signer address '{}' is not a pubkey hash: {}",
+                signer.address_b58, err
+            ))
+        })
+    }
+
+    async fn peek_active_signer_keys(&mut self) -> Result<Vec<Hash>, NockAppError> {
+        let mut signer_keys = Vec::new();
+        for signer in self.peek_active_signers().await? {
+            match Self::signer_pkh_from_active_signer(&signer) {
+                Ok(signer_pkh) => signer_keys.push(signer_pkh),
+                Err(err) => {
+                    warn!(
+                        "create-tx planner skipped active signer {} while resolving PKH signer keys: {}",
+                        signer.label(),
+                        err
+                    );
+                }
+            }
+        }
+        Ok(Self::planner_signer_keys(signer_keys))
+    }
+
+    /// Resolves the planner's effective signer key set.
+    async fn resolve_planner_signer_keys(
+        &mut self,
+        sign_keys: &[(u64, bool)],
+    ) -> Result<Vec<Hash>, NockAppError> {
+        let mut signer_keys = match self.peek_signing_keys().await {
+            Ok(keys) => keys,
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not read signing keys from wallet state: {}",
+                    err
+                );
+                Vec::new()
+            }
+        };
+
+        if signer_keys.is_empty() {
+            match self.peek_active_signer_keys().await {
+                Ok(keys) => signer_keys = keys,
+                Err(err) => {
+                    warn!(
+                        "create-tx planner could not read active signer entries from wallet state: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        if signer_keys.is_empty() {
+            match self.peek_master_signing_key().await {
+                Ok(master_signer_pkh) => signer_keys.push(master_signer_pkh),
+                Err(err) => {
+                    warn!(
+                        "create-tx planner could not read master signing key from wallet state: {}",
+                        err
+                    );
+                }
+            }
+        }
+
+        for &(index, hardened) in sign_keys {
+            let (poke, _) = Self::derive_child(index, hardened, &None)?;
+            let effects = self.app.poke(OnePunchWire::Poke.to_wire(), poke).await?;
+            let address = Self::derived_address_from_effects(&effects)?;
+            match Hash::from_base58(&address) {
+                Ok(signer_pkh) => signer_keys.push(signer_pkh),
+                Err(hash_err) => {
+                    if SchnorrPubkey::from_base58(&address).is_ok() {
+                        warn!(
+                            "create-tx planner derived legacy v0 sign-key address '{}' for child {}:{} while resolving v1 signer PKHs",
+                            address, index, hardened
+                        );
+                    } else {
+                        return Err(CrownError::Unknown(format!(
+                            "derived sign-key address '{}' for child {}:{} is neither a base58 pubkey hash nor a Schnorr pubkey: {}",
+                            address, index, hardened, hash_err
+                        ))
+                        .into());
+                    }
+                }
+            }
+        }
+
+        Ok(Self::planner_signer_keys(signer_keys))
+    }
+
+    async fn resolve_master_signer_pkh(
+        &mut self,
+        signer_keys: &[Hash],
+    ) -> Result<Hash, NockAppError> {
+        match self.peek_master_signing_key().await {
+            Ok(master_signer_pkh) => return Ok(master_signer_pkh),
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not read master signing key from wallet state: {}",
+                    err
+                );
+            }
+        }
+
+        match self.peek_active_signers().await {
+            Ok(active_signers) => {
+                if let Some(master_signer) = active_signers.iter().find(|signer| signer.is_master())
+                {
+                    match Self::signer_pkh_from_active_signer(master_signer) {
+                        Ok(master_signer_pkh) => return Ok(master_signer_pkh),
+                        Err(err) => {
+                            warn!(
+                                "create-tx planner could not parse active master signer address: {}",
+                                err
+                            );
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not read active signer entries while resolving master signer: {}",
+                    err
+                );
+            }
+        }
+
+        signer_keys.first().cloned().ok_or_else(|| {
+            NockAppError::OtherError("wallet has no signer keys for create-tx planner".to_string())
+        })
+    }
+
+    async fn peek_master_signing_pubkey(&mut self) -> Result<SchnorrPubkey, NockAppError> {
+        let mut slab = NounSlab::new();
+        let tracked_tag = make_tas(&mut slab, "master-signing-pubkey").as_noun();
+        let path = T(&mut slab, &[tracked_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_signing_pubkey: Option<Option<SchnorrPubkey>> =
+            unsafe { <Option<Option<SchnorrPubkey>>>::from_noun(result.root(), &space)? };
+        maybe_signing_pubkey.flatten().ok_or_else(|| {
+            NockAppError::OtherError(
+                "wallet master-signing-pubkey peek returned no payload".to_string(),
+            )
+        })
+    }
+
+    fn push_unique_signer_pubkey(pubkeys: &mut Vec<SchnorrPubkey>, pubkey: SchnorrPubkey) {
+        if !pubkeys.contains(&pubkey) {
+            pubkeys.push(pubkey);
+        }
+    }
+
+    async fn resolve_legacy_signer_pubkeys(
+        &mut self,
+        sign_keys: &[(u64, bool)],
+    ) -> Result<Vec<SchnorrPubkey>, NockAppError> {
+        let mut signer_pubkeys = Vec::new();
+
+        match self.peek_master_signing_pubkey().await {
+            Ok(master_signer_pubkey) => {
+                Self::push_unique_signer_pubkey(&mut signer_pubkeys, master_signer_pubkey);
+            }
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not read master signing pubkey from wallet state: {}",
+                    err
+                );
+            }
+        }
+
+        match self.peek_active_signers().await {
+            Ok(active_signers) => {
+                for signer in active_signers
+                    .into_iter()
+                    .filter(|signer| signer.version == 0)
+                {
+                    Self::push_unique_signer_pubkey(&mut signer_pubkeys, signer.pubkey);
+                }
+            }
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not read active signer entries while resolving legacy signer pubkeys: {}",
+                    err
+                );
+            }
+        }
+
+        for &(index, hardened) in sign_keys {
+            let (poke, _) = Self::derive_child(index, hardened, &None)?;
+            let effects = self.app.poke(OnePunchWire::Poke.to_wire(), poke).await?;
+            let derived_address = Self::derived_address_from_effects(&effects)?;
+            let signer_pubkey = SchnorrPubkey::from_base58(&derived_address).map_err(|err| {
+                NockAppError::OtherError(format!(
+                    "derived sign-key address '{}' for child {}:{} is not a base58 Schnorr pubkey: {}",
+                    derived_address, index, hardened, err
+                ))
+            })?;
+            Self::push_unique_signer_pubkey(&mut signer_pubkeys, signer_pubkey);
+        }
+
+        if signer_pubkeys.is_empty() {
+            return Err(NockAppError::OtherError(
+                "wallet has no legacy v0 signer pubkeys for create-tx planner".to_string(),
+            ));
+        }
+        Ok(signer_pubkeys)
+    }
+
+    async fn peek_active_signers(&mut self) -> Result<Vec<ActiveSignerEntryNoun>, NockAppError> {
+        let mut slab = NounSlab::new();
+        let tracked_tag = make_tas(&mut slab, "active-signers").as_noun();
+        let path = T(&mut slab, &[tracked_tag, SIG]);
+        slab.set_root(path);
+
+        let result = self.app.peek(slab).await?;
+        let space = result.noun_space();
+        let maybe_signers: Option<Option<Vec<ActiveSignerEntryNoun>>> = unsafe {
+            <Option<Option<Vec<ActiveSignerEntryNoun>>>>::from_noun(result.root(), &space)?
+        };
+        let mut signers = maybe_signers.flatten().unwrap_or_default();
+        signers.sort_by_key(ActiveSignerEntryNoun::sort_key);
+        signers.dedup_by(|left, right| {
+            left.child_index == right.child_index
+                && left.hardened == right.hardened
+                && left.absolute_index == right.absolute_index
+                && left.address_b58 == right.address_b58
+        });
+        Ok(signers)
+    }
+
+    #[cfg(test)]
+    fn resolve_effect_write_path(path: &str, output_path: Option<&Path>) -> PathBuf {
+        let raw_path = Path::new(path);
+        match output_path {
+            Some(base_path) if !raw_path.is_absolute() => base_path.join(raw_path),
+            _ => raw_path.to_path_buf(),
+        }
+    }
+
+    #[cfg(test)]
+    async fn apply_wallet_effects_locally(
+        effects: Vec<NounSlab>,
+        output_path: Option<&Path>,
+    ) -> Result<AppliedWalletEffects, NockAppError> {
+        let mut applied = AppliedWalletEffects::default();
+
+        for effect in effects {
+            let space = effect.noun_space();
+            let noun = unsafe { effect.root() };
+            let Ok(cell) = noun.in_space(&space).as_cell() else {
+                continue;
+            };
+            let Ok(tag) = <String>::from_noun(&cell.head().noun(), &space) else {
+                continue;
+            };
+
+            match tag.as_str() {
+                "file" => {
+                    let file_cell = cell.tail().as_cell().map_err(|err| {
+                        NockAppError::OtherError(format!(
+                            "wallet file effect payload did not decode as a cell: {err}"
+                        ))
+                    })?;
+                    let operation = <String>::from_noun(&file_cell.head().noun(), &space)?;
+                    match operation.as_str() {
+                        "write" => {
+                            let (path, contents): (String, Bytes) =
+                                <(String, Bytes)>::from_noun(&file_cell.tail().noun(), &space)?;
+                            let resolved_path = Self::resolve_effect_write_path(&path, output_path);
+                            if let Some(parent) = resolved_path.parent() {
+                                tokio_fs::create_dir_all(parent)
+                                    .await
+                                    .map_err(NockAppError::IoError)?;
+                            }
+                            tokio_fs::write(&resolved_path, contents.as_ref())
+                                .await
+                                .map_err(NockAppError::IoError)?;
+                            if resolved_path
+                                .extension()
+                                .and_then(|ext| ext.to_str())
+                                .is_some_and(|ext| ext == "tx")
+                            {
+                                applied.tx_paths.push(resolved_path.display().to_string());
+                            }
+                        }
+                        "batch-write" => {
+                            let entries: Vec<BatchWriteRequestEntry> =
+                                Vec::from_noun(&file_cell.tail().noun(), &space)?;
+                            for entry in entries {
+                                let resolved_path =
+                                    Self::resolve_effect_write_path(&entry.path, output_path);
+                                if let Some(parent) = resolved_path.parent() {
+                                    tokio_fs::create_dir_all(parent)
+                                        .await
+                                        .map_err(NockAppError::IoError)?;
+                                }
+                                tokio_fs::write(&resolved_path, entry.contents.as_ref())
+                                    .await
+                                    .map_err(NockAppError::IoError)?;
+                                if resolved_path
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .is_some_and(|ext| ext == "tx")
+                                {
+                                    applied.tx_paths.push(resolved_path.display().to_string());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                "exit" => {
+                    let code = <u64 as NounDecode>::from_noun(&cell.tail().noun(), &space)?;
+                    if code != 0 {
+                        return Err(NockAppError::OtherError(format!(
+                            "wallet command exited with code {code} while running migrate-v0-notes"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(applied)
+    }
+
+    pub(crate) async fn snapshot_written_txs(
+        tx_dir: &Path,
+    ) -> Result<WrittenTxSnapshot, NockAppError> {
+        let mut snapshots = BTreeMap::new();
+        if !tx_dir.exists() {
+            return Ok(WrittenTxSnapshot(snapshots));
+        }
+
+        let mut entries = tokio_fs::read_dir(tx_dir)
+            .await
+            .map_err(NockAppError::IoError)?;
+        while let Some(entry) = entries.next_entry().await.map_err(NockAppError::IoError)? {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("tx") {
+                continue;
+            }
+            let metadata = entry.metadata().await.map_err(NockAppError::IoError)?;
+            let modified = metadata.modified().ok();
+            snapshots.insert(
+                path,
+                TxFileSnapshot {
+                    modified,
+                    len: metadata.len(),
+                },
+            );
+        }
+
+        Ok(WrittenTxSnapshot(snapshots))
+    }
+
+    pub(crate) fn detect_written_tx_paths(
+        before: &WrittenTxSnapshot,
+        after: &WrittenTxSnapshot,
+    ) -> Result<Vec<String>, NockAppError> {
+        let changed = after
+            .0
+            .iter()
+            .filter_map(|(path, metadata)| match before.0.get(path) {
+                Some(previous) if previous == metadata => None,
+                _ => Some(path.display().to_string()),
+            })
+            .collect::<Vec<_>>();
+
+        if changed.is_empty() {
+            return Err(NockAppError::OtherError(
+                "migrate-v0-notes expected create-tx-batch to write at least one transaction file, but no tx files changed".to_string(),
+            ));
+        }
+
+        Ok(changed)
+    }
+
+    /// Returns the paths of every `.tx` file that is new or changed in `after`
+    /// relative to `before`, sorted for stable output. Unlike
+    /// [`detect_written_tx_paths`], this returns an empty vec (never an error)
+    /// when nothing changed, so callers can print next-step guidance without
+    /// coupling to the migrate-specific failure message.
+    pub(crate) fn changed_tx_paths(
+        before: &WrittenTxSnapshot,
+        after: &WrittenTxSnapshot,
+    ) -> Vec<String> {
+        let mut changed = after
+            .0
+            .iter()
+            .filter_map(|(path, metadata)| match before.0.get(path) {
+                Some(previous) if previous == metadata => None,
+                _ => Some(path.display().to_string()),
+            })
+            .collect::<Vec<_>>();
+        changed.sort();
+        changed
+    }
+
+    /// Returns true when any `.tx` file in `after` is new or changed relative to
+    /// `before`. Used to confirm a create-tx poke actually produced a
+    /// transaction (the kernel writes `./txs/<name>.tx` via `save-transaction`)
+    /// before committing side effects such as the notes-CSV reservation.
+    pub(crate) fn tx_files_changed(before: &WrittenTxSnapshot, after: &WrittenTxSnapshot) -> bool {
+        after
+            .0
+            .iter()
+            .any(|(path, metadata)| match before.0.get(path) {
+                Some(previous) => previous != metadata,
+                None => true,
+            })
+    }
+
+    fn decode_transaction_spends_from_bytes(tx_bytes: &[u8]) -> Result<v1::Spends, NockAppError> {
+        let mut slab: NounSlab = NounSlab::new();
+        let transaction_noun = slab.cue_into(Bytes::copy_from_slice(tx_bytes))?;
+        let space = slab.noun_space();
+        let transaction_cell = transaction_noun.in_space(&space).as_cell().map_err(|err| {
+            NockAppError::OtherError(format!("transaction jam root not a cell: {err}"))
+        })?;
+        let version = <u64 as NounDecode>::from_noun(&transaction_cell.head().noun(), &space)
+            .map_err(|err| {
+                NockAppError::OtherError(format!("transaction version did not decode: {err}"))
+            })?;
+        if version != 1 {
+            return Err(NockAppError::OtherError(format!(
+                "expected saved transaction version 1, got {version}"
+            )));
+        }
+        let name_and_rest = transaction_cell.tail().as_cell().map_err(|err| {
+            NockAppError::OtherError(format!("transaction jam missing name/rest cell: {err}"))
+        })?;
+        let spends_and_rest = name_and_rest.tail().as_cell().map_err(|err| {
+            NockAppError::OtherError(format!("transaction jam missing spends/rest cell: {err}"))
+        })?;
+        let mut spends =
+            v1::Spends::from_noun(&spends_and_rest.head().noun(), &space).map_err(|err| {
+                NockAppError::OtherError(format!("saved transaction spends did not decode: {err}"))
+            })?;
+        let display_and_witness = spends_and_rest.tail().as_cell().map_err(|err| {
+            NockAppError::OtherError(format!(
+                "transaction jam missing display/witness-data cell: {err}"
+            ))
+        })?;
+        let witness_data = display_and_witness.tail();
+        let witness_cell = witness_data.as_cell().map_err(|err| {
+            NockAppError::OtherError(format!("transaction jam witness-data not a cell: {err}"))
+        })?;
+        let witness_tag = <u64 as NounDecode>::from_noun(&witness_cell.head().noun(), &space)
+            .map_err(|err| {
+                NockAppError::OtherError(format!("witness-data tag did not decode: {err}"))
+            })?;
+        match witness_tag {
+            0 => {
+                let signatures =
+                    ZMap::<Name, Signature>::from_noun(&witness_cell.tail().noun(), &space)
+                        .map_err(|err| {
+                            NockAppError::OtherError(format!(
+                                "legacy witness-data signature map did not decode: {err}"
+                            ))
+                        })?;
+                for (name, signature) in signatures.into_entries() {
+                    let Some((_, v1::Spend::Legacy(spend0))) = spends
+                        .0
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == name)
+                    else {
+                        return Err(NockAppError::OtherError(format!(
+                            "legacy witness-data referenced unknown spend {} / {}",
+                            name.first.to_base58(),
+                            name.last.to_base58()
+                        )));
+                    };
+                    spend0.signature = signature;
+                }
+            }
+            1 => {
+                let witnesses =
+                    ZMap::<Name, v1::Witness>::from_noun(&witness_cell.tail().noun(), &space)
+                        .map_err(|err| {
+                            NockAppError::OtherError(format!(
+                                "v1 witness-data map did not decode: {err}"
+                            ))
+                        })?;
+                for (name, witness) in witnesses.into_entries() {
+                    let Some((_, v1::Spend::Witness(spend1))) = spends
+                        .0
+                        .iter_mut()
+                        .find(|(candidate, _)| *candidate == name)
+                    else {
+                        return Err(NockAppError::OtherError(format!(
+                            "witness-data referenced unknown spend {} / {}",
+                            name.first.to_base58(),
+                            name.last.to_base58()
+                        )));
+                    };
+                    spend1.witness = witness;
+                }
+            }
+            other => {
+                return Err(NockAppError::OtherError(format!(
+                    "unsupported witness-data tag {other}"
+                )));
+            }
+        }
+        Ok(spends)
+    }
+
+    fn decode_transaction_spends_from_path(
+        transaction_path: &str,
+    ) -> Result<v1::Spends, NockAppError> {
+        let tx_bytes = std::fs::read(transaction_path).map_err(|err| {
+            NockAppError::OtherError(format!("failed to read transaction file: {err}"))
+        })?;
+        Self::decode_transaction_spends_from_bytes(&tx_bytes)
+    }
+
+    #[cfg(test)]
+    /// Builds deterministic signer candidate list used by tests.
+    pub(crate) fn planner_signer_candidates(mut tracked_signers: Vec<Hash>) -> Vec<Option<Hash>> {
+        tracked_signers.sort_by_key(|signer| signer.to_array());
+        tracked_signers.dedup_by(|a, b| a.to_array() == b.to_array());
+        let mut candidates = Vec::with_capacity(tracked_signers.len() + 1);
+        candidates.push(None);
+        candidates.extend(tracked_signers.into_iter().map(Some));
+        candidates
+    }
+
+    /// Plans create-tx inputs/fee and dispatches final hoon create-tx poke.
+    pub(crate) async fn create_tx_with_planner(
+        &mut self,
+        synced_snapshot: Option<NormalizedSnapshot>,
+        names: Option<String>,
+        fee: Option<u64>,
+        recipients: Vec<RecipientSpec>,
+        allow_low_fee: bool,
+        refund_pkh: Option<String>,
+        sign_keys: Vec<(u64, bool)>,
+        include_data: bool,
+        save_raw_tx: bool,
+        note_selection: NoteSelectionStrategyCli,
+        multisig_lock: Option<MultisigLockContext>,
+        notes_csv: Option<PathBuf>,
+        reservation_out: &mut Option<CsvNoteReservation>,
+    ) -> CommandNoun<NounSlab> {
+        let planner_error = |reason: String| -> CommandNoun<NounSlab> {
+            Err(CrownError::Unknown(format!("create-tx planner failed: {}", reason)).into())
+        };
+
+        let mut snapshot = if let Some(snapshot) = synced_snapshot {
+            snapshot
+        } else {
+            let balance = match self.peek_balance_state().await {
+                Ok(balance) => balance,
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to read synced balance from wallet state: {err}"
+                    ));
+                }
+            };
+            match normalize_balance_pages(&[balance]) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    return planner_error(format!(
+                        "candidate normalization failed for wallet balance snapshot: {err}"
+                    ));
+                }
+            }
+        };
+
+        // When a notes CSV is supplied, restrict the planner's candidate set to
+        // the notes the CSV lists. The note *data* still comes from local wallet
+        // state (the snapshot above); the CSV only chooses which of those known
+        // notes are eligible, and acts as a reservation ledger so already-spent
+        // notes are not reselected on a later run.
+        if let Some(csv_path) = notes_csv.as_ref() {
+            let eligible = match parse_notes_csv_names(csv_path) {
+                Ok(names) => names,
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to read notes from CSV {}: {err}",
+                        csv_path.display()
+                    ));
+                }
+            };
+            let eligible_keys: std::collections::BTreeSet<NoteNameKey> =
+                eligible.iter().map(note_name_key).collect();
+            let before = snapshot.candidates.len();
+            snapshot.candidates.retain(|candidate| {
+                eligible_keys.contains(&note_name_key(&candidate.identity().name))
+            });
+            let listed_not_found = eligible_keys
+                .len()
+                .saturating_sub(snapshot.candidates.len());
+            info!(
+                "create-tx notes-csv {} listed={} matched_candidates={} dropped_from_snapshot={} listed_not_in_wallet={}",
+                csv_path.display(),
+                eligible_keys.len(),
+                snapshot.candidates.len(),
+                before.saturating_sub(snapshot.candidates.len()),
+                listed_not_found
+            );
+            if snapshot.candidates.is_empty() {
+                return planner_error(format!(
+                    "notes CSV {} lists no notes that the wallet currently holds; sync the wallet (without --notes-csv) so it knows these notes, or update the CSV",
+                    csv_path.display()
+                ));
+            }
+        }
+
+        let v1_candidate_count = snapshot
+            .candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.version() == nockchain_types::tx_engine::common::Version::V1
+            })
+            .count();
+        let candidate_preview = snapshot
+            .candidates
+            .iter()
+            .take(5)
+            .map(|candidate| {
+                let identity = candidate.identity();
+                format!(
+                    "{}/{}",
+                    identity.name.first.to_base58(),
+                    identity.name.last.to_base58()
+                )
+            })
+            .collect::<Vec<_>>();
+        info!(
+            "create-tx planner snapshot block={} height={:?} candidates_total={} candidates_v1={} preview={:?}",
+            snapshot.metadata.block_id.to_base58(),
+            snapshot.metadata.height,
+            snapshot.candidates.len(),
+            v1_candidate_count,
+            candidate_preview
+        );
+
+        let manual_note_names = match names.as_deref() {
+            Some(raw_names) => match Self::parse_note_names_as_hashes(raw_names) {
+                Ok(note_names) => Some(note_names),
+                Err(err) => {
+                    return planner_error(format!("unable to parse manual note names: {err}"));
+                }
+            },
+            None => None,
+        };
+        let selection_mode = match &manual_note_names {
+            Some(note_names) => SelectionMode::Manual {
+                note_names: note_names.clone(),
+            },
+            None => SelectionMode::Auto,
+        };
+        let parsed_refund_pkh = if let Some(refund) = refund_pkh.as_ref() {
+            match Hash::from_base58(refund) {
+                Ok(hash) => Some(hash),
+                Err(err) => {
+                    return planner_error(format!(
+                        "invalid refund pubkey hash '{}': {}",
+                        refund, err
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let candidate_version_policy = match &manual_note_names {
+            Some(note_names) => {
+                match Self::manual_candidate_version_policy(note_names, &snapshot.candidates) {
+                    Ok(policy) => policy,
+                    Err(err) => {
+                        return planner_error(err);
+                    }
+                }
+            }
+            None => CandidateVersionPolicy::V1Only,
+        };
+        if candidate_version_policy == CandidateVersionPolicy::V0Only && parsed_refund_pkh.is_none()
+        {
+            return planner_error(
+                "manual create-tx spending legacy v0 notes requires --refund-pkh".to_string(),
+            );
+        }
+        let signer_keys = match self.resolve_planner_signer_keys(&sign_keys).await {
+            Ok(keys) => keys,
+            Err(err) => {
+                warn!(
+                    "create-tx planner could not resolve signing keys from wallet state/CLI: {}",
+                    err
+                );
+                return planner_error(
+                    "wallet has no signer keys for create-tx planner".to_string(),
+                );
+            }
+        };
+        if signer_keys.is_empty() && candidate_version_policy != CandidateVersionPolicy::V0Only {
+            return planner_error("wallet has no signer keys for create-tx planner".to_string());
+        }
+        let signer_pkh_for_planner = if candidate_version_policy == CandidateVersionPolicy::V0Only {
+            None
+        } else {
+            let master_signer_pkh = match self.resolve_master_signer_pkh(&signer_keys).await {
+                Ok(key) => key,
+                Err(err) => {
+                    return planner_error(err.to_string());
+                }
+            };
+            info!(
+                "create-tx planner master-signer-pkh={}",
+                master_signer_pkh.to_base58()
+            );
+            Some(master_signer_pkh)
+        };
+        info!(
+            "create-tx planner signer-keys entries={} signer-pkhs={:?}",
+            signer_keys.len(),
+            signer_keys.iter().map(Hash::to_base58).collect::<Vec<_>>()
+        );
+        let legacy_signer_pubkeys = if candidate_version_policy == CandidateVersionPolicy::V0Only {
+            match self.resolve_legacy_signer_pubkeys(&sign_keys).await {
+                Ok(keys) => keys,
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to resolve legacy v0 signer pubkeys from wallet state: {err}"
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        let matcher_signer_keys = signer_keys.clone();
+        let recipient_outputs = match planner_recipient_outputs(&recipients, include_data) {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                return planner_error(format!(
+                    "unable to derive planner recipient lock roots from recipients: {err}"
+                ));
+            }
+        };
+        let refund_default_pkh = match signer_pkh_for_planner
+            .as_ref()
+            .or(parsed_refund_pkh.as_ref())
+        {
+            Some(pkh) => pkh,
+            None => {
+                return planner_error(
+                    "create-tx planner has no signer or refund pubkey hash for refund output"
+                        .to_string(),
+                );
+            }
+        };
+        let refund_output_template = if let (Some(ctx), None) =
+            (multisig_lock.as_ref(), parsed_refund_pkh.as_ref())
+        {
+            // Default multisig refund: change returns to the multisig lock itself,
+            // matching the tx-builder's `refund-lock` fallback when no explicit
+            // refund pubkey hash is supplied.
+            multisig_refund_output_template(ctx)
+        } else {
+            match planner_refund_output_template(
+                parsed_refund_pkh.as_ref(),
+                refund_default_pkh,
+                include_data,
+            ) {
+                Ok(output) => output,
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to derive planner refund output template from signer/refund context: {err}"
+                    ));
+                }
+            }
+        };
+        let planner_constants = match self.peek_planner_blockchain_constants().await {
+            Ok(constants) => constants,
+            Err(err) => {
+                return planner_error(format!(
+                    "unable to read blockchain constants from wallet state: {err}"
+                ));
+            }
+        };
+        let coinbase_relative_min = match planner_constants.coinbase_timelock_min() {
+            Ok(min) => min,
+            Err(err) => {
+                return planner_error(format!(
+                    "unable to resolve coinbase timelock min from blockchain constants: {err}"
+                ));
+            }
+        };
+        info!(
+            "create-tx planner constants bythos_phase={} base_fee={} input_fee_divisor={} min_fee={} coinbase_relative_min={}",
+            planner_constants.bythos_phase,
+            planner_constants.base_fee,
+            planner_constants.input_fee_divisor,
+            planner_constants.data.min_fee,
+            coinbase_relative_min
+        );
+        let order_direction = Self::planner_order_direction(note_selection);
+
+        let request = PlanRequest {
+            planning_mode: CreateTxPlanningMode::Standard,
+            selection_mode: selection_mode.clone(),
+            order_direction,
+            include_data,
+            chain_context: ChainContext {
+                height: snapshot.metadata.height.clone(),
+                bythos_phase: nockchain_types::tx_engine::common::BlockHeight(
+                    nockchain_math::belt::Belt(planner_constants.bythos_phase),
+                ),
+                base_fee: planner_constants.base_fee,
+                input_fee_divisor: planner_constants.input_fee_divisor,
+                min_fee: planner_constants.data.min_fee,
+            },
+            signer_pkh: signer_pkh_for_planner,
+            candidate_version_policy,
+            candidates: snapshot.candidates,
+            recipient_outputs,
+            refund_output: refund_output_template,
+            coinbase_relative_min: Some(coinbase_relative_min),
+            v0_migration_signer_pubkeys: legacy_signer_pubkeys,
+        };
+
+        let plan_result = if let Some(ctx) = multisig_lock.as_ref() {
+            // Multisig spend: resolve inputs by the multisig lock-root's first-name
+            // and carry the reconstructed spend-condition for fee/witness planning.
+            // Also accept protocol-fund coinbase notes, whose committed lock wraps
+            // the multisig lock-root in `[%pkh m=1 {lock_root}]` plus the coinbase
+            // relative timelock before the first-name is taken (the on-chain notes
+            // share `+fund-note-firstname`, not `from_lock_root(lock_root)`). This
+            // mirrors the `+check:check-context` routing to `+check-multisig-lock`.
+            let matcher = match LockRootLockMatcher::from_lock_root(&ctx.lock_root) {
+                Ok(matcher) => matcher.with_spend_condition(ctx.spend_condition.clone()),
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to build multisig lock matcher from lock root {}: {err}",
+                        ctx.lock_root.to_base58()
+                    ));
+                }
+            };
+            let matcher = match matcher.with_coinbase_fund_notes(coinbase_relative_min) {
+                Ok(matcher) => matcher,
+                Err(err) => {
+                    return planner_error(format!(
+                        "unable to derive coinbase fund first-name for multisig lock root {}: {err}",
+                        ctx.lock_root.to_base58()
+                    ));
+                }
+            };
+            info!(
+                "create-multisig-tx planner using multisig lock-root={} threshold={} participants={}",
+                ctx.lock_root.to_base58(),
+                ctx.threshold,
+                ctx.participants.len()
+            );
+            plan_create_tx(&request, &matcher)
+        } else {
+            let matcher = SigningKeyLockMatcher::from_signer_keys(&matcher_signer_keys);
+            info!(
+                "create-tx planner using {} tracked signer keys for lock spendability checks",
+                matcher_signer_keys.len()
+            );
+            plan_create_tx(&request, &matcher)
+        };
+        let plan = match plan_result {
+            Ok(found_plan) => found_plan,
+            Err(err @ PlanError::CandidateVersionDisabled { .. }) => {
+                return Err(CrownError::Unknown(format!(
+                    "create-tx planner rejected the manual note set because it does not match the selected note version policy ({})",
+                    err
+                ))
+                .into());
+            }
+            Err(err) => {
+                return planner_error(format!("planner returned an error: {err}"));
+            }
+        };
+
+        // Fail-fast guard: refuse a plan that cannot fit in a block before the
+        // kernel spends minutes building and signing it. The on-chain
+        // block-inclusion check (`candidate-block-below-max-size` in miner.hoon)
+        // rejects blocks over `max-block-size` (8,000,000 bits ~= 1 MB on
+        // mainnet), so a larger transaction can never be mined. Multisig inputs
+        // are large (each carries the full m-of-n witness), so a high-value spend
+        // over a fund of tiny notes selects thousands of inputs and yields a
+        // multi-MB, unmineable transaction that takes many minutes to build.
+        if let Some(reason) = oversized_plan_reason(&plan) {
+            return planner_error(reason);
+        }
+
+        for trace in &plan.debug_trace {
+            info!("create-tx planner trace: {}", trace);
+        }
+
+        let planned_names = plan
+            .selected
+            .iter()
+            .map(|selected| selected.name.clone())
+            .collect::<Vec<_>>();
+        if let SelectionMode::Manual { note_names } = &selection_mode {
+            if let Err(reason) = ensure_manual_planner_parity(note_names, &planned_names) {
+                return planner_error(reason);
+            }
+        }
+        // Record which notes were selected so the caller can drop the spent
+        // notes from the CSV after the transaction is successfully created.
+        if let Some(csv_path) = notes_csv {
+            *reservation_out = Some(CsvNoteReservation {
+                path: csv_path,
+                selected: planned_names.clone(),
+            });
+        }
+        let planned_names_arg = Self::format_note_names_for_create_tx(&planned_names);
+        let planned_fee = plan.final_fee;
+        let final_fee = if let Some(requested_fee) = fee {
+            if requested_fee < planned_fee && !allow_low_fee {
+                return Err(CrownError::Unknown(format!(
+                    "requested --fee {} is below planner minimum {} (pass --allow-low-fee to override)",
+                    requested_fee, planned_fee
+                ))
+                .into());
+            }
+            if requested_fee != planned_fee {
+                info!(
+                    "create-tx planner fee override requested_fee={} planned_fee={}",
+                    requested_fee, planned_fee
+                );
+            }
+            requested_fee
+        } else {
+            planned_fee
+        };
+
+        let multisig = multisig_lock.as_ref().map(|ctx| MultisigCausePayload {
+            threshold: ctx.threshold,
+            participants_b58: ctx.participants.iter().map(Hash::to_base58).collect(),
+        });
+
+        Self::create_tx(CreateTxRequest {
+            names: planned_names_arg,
+            recipients,
+            fee: final_fee,
+            allow_low_fee,
+            refund_pkh,
+            sign_keys,
+            include_data,
+            save_raw_tx,
+            note_selection,
+            multisig,
+        })
+    }
+
+    pub(crate) fn format_migrate_v0_notes_summary(summary: &MigrateV0NotesSummary) -> String {
+        let mut lines = vec![
+            "## V0 Migration Sweep".to_string(),
+            format!("- destination: `{}`", summary.destination),
+            format!("- block id: `{}`", summary.block_id),
+            format!("- height: `{}`", summary.height),
+            format!(
+                "- active signing keys examined: `{}`",
+                summary.examined_signers
+            ),
+            format!("- migration txs created: `{}`", summary.created_count),
+            format!("- signing keys skipped: `{}`", summary.skipped_count),
+        ];
+
+        if summary.created_count == 0 {
+            lines.push(
+                "- batch create poke: not emitted because every signer bucket was skipped"
+                    .to_string(),
+            );
+        }
+
+        for signer_summary in &summary.signers {
+            lines.push(String::new());
+            lines.push(format!("### {}", signer_summary.signer.label()));
+            lines.push(format!(
+                "- signer address: `{}`",
+                signer_summary.signer.address_b58
+            ));
+            lines.push(format!(
+                "- signer version: `{}`",
+                signer_summary.signer.version
+            ));
+            lines.push(format!("- selected notes: `{}`", signer_summary.note_count));
+            lines.push(format!(
+                "- selected total: `{}`",
+                signer_summary.selected_total
+            ));
+            match (&signer_summary.migrated_amount, &signer_summary.tx_path) {
+                (Some(migrated_amount), Some(tx_path)) => {
+                    lines.push("- result: `created`".to_string());
+                    lines.push(format!(
+                        "- fee: `{}`",
+                        signer_summary.fee.unwrap_or_default()
+                    ));
+                    lines.push(format!("- migrated amount: `{}`", migrated_amount));
+                    lines.push(format!("- tx path: `{}`", tx_path));
+                    lines.push(format!(
+                        "- submit with: `nockchain-wallet send-tx \"{}\"`",
+                        tx_path
+                    ));
+                }
+                _ => {
+                    lines.push("- result: `skipped`".to_string());
+                    if let Some(fee) = signer_summary.fee {
+                        lines.push(format!("- fee estimate: `{}`", fee));
+                    }
+                    if let Some(reason) = &signer_summary.skip_reason {
+                        lines.push(format!("- skip reason: `{}`", reason));
+                    }
+                }
+            }
+        }
+
+        lines.join("\n")
+    }
+
+    /// Plans one v0 migration transaction per active local v0 signer.
+    ///
+    /// Arguments:
+    /// - `synced_snapshot`: optional pre-normalized balance snapshot from the caller. When
+    ///   `None`, the helper reads the current synced balance from wallet state and normalizes it.
+    /// - `destination`: base58-encoded v1 destination address that receives each migrated output.
+    pub(crate) async fn prepare_migrate_v0_notes_per_signer(
+        &mut self,
+        synced_snapshot: Option<NormalizedSnapshot>,
+        destination: String,
+    ) -> Result<PreparedMigrateV0Notes, NockAppError> {
+        let destination_hash = Hash::from_base58(&destination).map_err(|err| {
+            CrownError::Unknown(format!(
+                "migrate-v0-notes planner failed: invalid migration destination '{}' : {}",
+                destination, err
+            ))
+        })?;
+        let snapshot = if let Some(snapshot) = synced_snapshot {
+            snapshot
+        } else {
+            let balance = self.peek_balance_state().await.map_err(|err| {
+                CrownError::Unknown(format!(
+                    "migrate-v0-notes planner failed: unable to read synced balance from wallet state: {err}"
+                ))
+            })?;
+            normalize_balance_pages(&[balance]).map_err(|err| {
+                CrownError::Unknown(format!(
+                    "migrate-v0-notes planner failed: candidate normalization failed for wallet balance snapshot: {err}"
+                ))
+            })?
+        };
+        let active_signers = self.peek_active_signers().await.map_err(|err| {
+            CrownError::Unknown(format!(
+                "migrate-v0-notes planner failed: unable to read active signer entries from wallet state: {err}"
+            ))
+        })?;
+        let active_signers = active_signers
+            .into_iter()
+            .filter(|signer| signer.version == 0)
+            .collect::<Vec<_>>();
+        if active_signers.is_empty() {
+            return Err(CrownError::Unknown(
+                "migrate-v0-notes planner failed: wallet has no active local v0 signing keys under the active master".to_string(),
+            )
+            .into());
+        }
+
+        let planner_constants = self.peek_planner_blockchain_constants().await.map_err(|err| {
+            CrownError::Unknown(format!(
+                "migrate-v0-notes planner failed: unable to read blockchain constants from wallet state: {err}"
+            ))
+        })?;
+        let coinbase_relative_min = planner_constants.coinbase_timelock_min().map_err(|err| {
+            CrownError::Unknown(format!(
+                "migrate-v0-notes planner failed: unable to resolve coinbase timelock min from blockchain constants: {err}"
+            ))
+        })?;
+        let mut destination_outputs = planner_recipient_outputs(
+            &[RecipientSpec::P2pkh {
+                address: destination_hash.clone(),
+                amount: 0,
+            }],
+            true,
+        )
+        .map_err(|err| {
+            CrownError::Unknown(format!(
+                "migrate-v0-notes planner failed: unable to derive migration destination output from recipient: {err}"
+            ))
+        })?;
+        let destination_output = destination_outputs
+            .pop()
+            .expect("single migration recipient should yield one planner output");
+        let refund_output =
+            planner_refund_output_template(Some(&destination_hash), &destination_hash, true)
+                .expect("p2pkh migration refund template should build");
+        let chain_context = ChainContext {
+            height: snapshot.metadata.height.clone(),
+            bythos_phase: nockchain_types::tx_engine::common::BlockHeight(
+                nockchain_math::belt::Belt(planner_constants.bythos_phase),
+            ),
+            base_fee: planner_constants.base_fee,
+            input_fee_divisor: planner_constants.input_fee_divisor,
+            min_fee: planner_constants.data.min_fee,
+        };
+
+        let mut signer_summaries = Vec::with_capacity(active_signers.len());
+        let mut pending_txs = Vec::<PendingMigrationTx>::new();
+        let mut skipped_count = 0usize;
+
+        for signer in active_signers {
+            let request = PlanRequest {
+                planning_mode: CreateTxPlanningMode::V0MigrationSweep {
+                    destination_output: destination_output.clone(),
+                },
+                selection_mode: SelectionMode::Auto,
+                order_direction: SelectionOrder::Ascending,
+                include_data: true,
+                chain_context: chain_context.clone(),
+                signer_pkh: None,
+                candidate_version_policy: CandidateVersionPolicy::V0Only,
+                candidates: snapshot.candidates.clone(),
+                recipient_outputs: Vec::new(),
+                refund_output: refund_output.clone(),
+                coinbase_relative_min: Some(coinbase_relative_min),
+                v0_migration_signer_pubkeys: vec![signer.pubkey.clone()],
+            };
+
+            match plan_create_tx(&request, &SigningKeyLockMatcher::default()) {
+                Ok(plan) => {
+                    for trace in &plan.debug_trace {
+                        info!(
+                            "migrate-v0-notes planner trace signer={} {}",
+                            signer.label(),
+                            trace
+                        );
+                    }
+
+                    let note_count = plan.selected.len();
+                    let selected_total = plan.selected_total;
+                    let fee = Some(plan.final_fee);
+                    let migrated_amount = plan.outputs.first().map(|output| output.amount);
+                    let planned_names = plan
+                        .selected
+                        .iter()
+                        .map(|selected| selected.name.clone())
+                        .collect::<Vec<_>>();
+                    let Some(migrated_amount) = migrated_amount else {
+                        skipped_count = skipped_count.saturating_add(1);
+                        signer_summaries.push(MigrateV0SignerSummary {
+                            signer,
+                            note_count,
+                            selected_total,
+                            fee,
+                            migrated_amount: None,
+                            tx_path: None,
+                            skip_reason: Some("planner_returned_no_destination_output".to_string()),
+                        });
+                        continue;
+                    };
+
+                    let summary_index = signer_summaries.len();
+                    signer_summaries.push(MigrateV0SignerSummary {
+                        signer: signer.clone(),
+                        note_count,
+                        selected_total,
+                        fee,
+                        migrated_amount: Some(migrated_amount),
+                        tx_path: None,
+                        skip_reason: None,
+                    });
+                    pending_txs.push(PendingMigrationTx {
+                        summary_index,
+                        planned_names: planned_names.clone(),
+                        request: CreateTxRequest {
+                            names: Self::format_note_names_for_create_tx(&planned_names),
+                            recipients: vec![RecipientSpec::P2pkh {
+                                address: destination_hash.clone(),
+                                amount: migrated_amount,
+                            }],
+                            fee: plan.final_fee,
+                            allow_low_fee: false,
+                            refund_pkh: Some(destination_hash.to_base58()),
+                            sign_keys: signer.sign_keys(),
+                            include_data: true,
+                            save_raw_tx: false,
+                            note_selection: NoteSelectionStrategyCli::Ascending,
+                            multisig: None,
+                        },
+                    });
+                }
+                Err(PlanError::V0MigrationProducesZeroValue {
+                    selected_total,
+                    fee,
+                }) => {
+                    skipped_count = skipped_count.saturating_add(1);
+                    let skip_reason = if selected_total == 0 {
+                        "no_eligible_v0_notes"
+                    } else {
+                        "zero_value_after_fees"
+                    };
+                    signer_summaries.push(MigrateV0SignerSummary {
+                        signer,
+                        note_count: 0,
+                        selected_total,
+                        fee: Some(fee),
+                        migrated_amount: None,
+                        tx_path: None,
+                        skip_reason: Some(skip_reason.to_string()),
+                    });
+                }
+                Err(err) => {
+                    skipped_count = skipped_count.saturating_add(1);
+                    signer_summaries.push(MigrateV0SignerSummary {
+                        signer,
+                        note_count: 0,
+                        selected_total: 0,
+                        fee: None,
+                        migrated_amount: None,
+                        tx_path: None,
+                        skip_reason: Some(format!("planner_error:{err}")),
+                    });
+                }
+            }
+        }
+
+        let poke = if pending_txs.is_empty() {
+            None
+        } else {
+            Some(Self::create_tx_batch(
+                &pending_txs
+                    .iter()
+                    .map(|pending| pending.request.clone())
+                    .collect::<Vec<_>>(),
+            )?)
+        };
+
+        let created_count = pending_txs.len();
+
+        Ok(PreparedMigrateV0Notes {
+            summary: MigrateV0NotesSummary {
+                destination,
+                block_id: snapshot.metadata.block_id.to_base58(),
+                height: (snapshot.metadata.height.0).0,
+                examined_signers: signer_summaries.len(),
+                created_count,
+                skipped_count,
+                signers: signer_summaries,
+            },
+            poke,
+            pending_txs,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn migrate_v0_notes_per_signer_for_tests(
+        &mut self,
+        synced_snapshot: Option<NormalizedSnapshot>,
+        destination: String,
+        output_path: &Path,
+    ) -> Result<MigrateV0NotesSummary, NockAppError> {
+        let mut prepared = self
+            .prepare_migrate_v0_notes_per_signer(synced_snapshot, destination)
+            .await?;
+        let tx_paths = if let Some((poke, _operation)) = prepared.take_poke() {
+            let effects = self.app.poke(OnePunchWire::Poke.to_wire(), poke).await?;
+            Self::apply_wallet_effects_locally(effects, Some(output_path))
+                .await?
+                .tx_paths
+        } else {
+            Vec::new()
+        };
+        prepared.finalize(tx_paths)
+    }
+
+    /// Creates a transaction. Use `--refund-pkh` when spending legacy v0 notes so the kernel
+    /// knows where to return change. When spending v1 notes the refund automatically
+    /// defaults back to the note owner, so `--refund-pkh` can be omitted.
+    fn encode_create_tx_request(
+        slab: &mut NounSlab,
+        request: &CreateTxRequest,
+    ) -> Result<Noun, NockAppError> {
+        let names_vec = Self::parse_note_names(&request.names)?;
+        let names_noun = names_vec
+            .into_iter()
+            .rev()
+            .fold(D(0), |acc, (first, last)| {
+                let first_noun = make_tas(slab, &first).as_noun();
+                let last_noun = make_tas(slab, &last).as_noun();
+                let name_pair = T(slab, &[first_noun, last_noun]);
+                Cell::new(slab, name_pair, acc).as_noun()
+            });
+
+        let fee_noun = D(request.fee);
+        let order_noun = request.recipients.to_noun(slab);
+        let sign_key_noun = Wallet::encode_sign_keys(slab, request.sign_keys.clone());
+
+        let refund_noun = if let Some(refund) = request.refund_pkh.as_ref() {
+            let refund_hash = Hash::from_base58(refund).map_err(|err| {
+                NockAppError::from(CrownError::Unknown(format!(
+                    "Invalid refund pubkey hash '{}': {}",
+                    refund, err
+                )))
+            })?;
+            let refund_atom = refund_hash.to_noun(slab);
+            T(slab, &[SIG, refund_atom])
+        } else {
+            SIG
+        };
+        let include_data_noun = request.include_data.to_noun(slab);
+        let allow_low_fee_noun = request.allow_low_fee.to_noun(slab);
+        let save_raw_tx_noun = request.save_raw_tx.to_noun(slab);
+        let note_selection_noun = make_tas(slab, request.note_selection.tas_label()).as_noun();
+
+        // `multisig=(unit [m=@ participants=(list @t)])`
+        let multisig_noun = if let Some(multisig) = request.multisig.as_ref() {
+            let participants_noun =
+                multisig
+                    .participants_b58
+                    .iter()
+                    .rev()
+                    .fold(D(0), |acc, participant| {
+                        let participant_noun = make_tas(slab, participant).as_noun();
+                        Cell::new(slab, participant_noun, acc).as_noun()
+                    });
+            let m_noun = D(multisig.threshold);
+            let payload = T(slab, &[m_noun, participants_noun]);
+            T(slab, &[SIG, payload])
+        } else {
+            SIG
+        };
+
+        Ok(T(
+            slab,
+            &[
+                names_noun, order_noun, fee_noun, allow_low_fee_noun, sign_key_noun, refund_noun,
+                include_data_noun, save_raw_tx_noun, note_selection_noun, multisig_noun,
+            ],
+        ))
+    }
+
+    fn create_tx(request: CreateTxRequest) -> CommandNoun<NounSlab> {
+        let mut slab = NounSlab::new();
+        let request_noun = Self::encode_create_tx_request(&mut slab, &request)?;
+
+        Self::wallet("create-tx", &[request_noun], Operation::Poke, &mut slab)
+    }
+
+    fn create_tx_batch(requests: &[CreateTxRequest]) -> CommandNoun<NounSlab> {
+        let mut slab = NounSlab::new();
+        let mut request_nouns = Vec::with_capacity(requests.len());
+        for request in requests {
+            request_nouns.push(Self::encode_create_tx_request(&mut slab, request)?);
+        }
+        let requests_noun = request_nouns
+            .into_iter()
+            .rev()
+            .fold(D(0), |acc, request_noun| {
+                Cell::new(&mut slab, request_noun, acc).as_noun()
+            });
+
+        Self::wallet(
+            "create-tx-batch",
+            &[requests_noun],
+            Operation::Poke,
+            &mut slab,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create_tx_command_for_tests(
+        names: String,
+        recipients: Vec<RecipientSpec>,
+        fee: u64,
+        allow_low_fee: bool,
+        refund_pkh: Option<String>,
+        sign_keys: Vec<(u64, bool)>,
+        include_data: bool,
+        save_raw_tx: bool,
+        note_selection: NoteSelectionStrategyCli,
+    ) -> CommandNoun<NounSlab> {
+        Self::create_tx(CreateTxRequest {
+            names,
+            recipients,
+            fee,
+            allow_low_fee,
+            refund_pkh,
+            sign_keys,
+            include_data,
+            save_raw_tx,
+            note_selection,
+            multisig: None,
+        })
+    }
+
+    /// Encodes optional sign-key tuples for wallet kernel create-tx commands.
+    fn encode_sign_keys(slab: &mut NounSlab, keys: Vec<(u64, bool)>) -> Noun {
+        if keys.is_empty() {
+            SIG
+        } else {
+            Some(keys).to_noun(slab)
+        }
+    }
+
+    /// Builds one `update-balance-grpc` poke from a fully assembled balance snapshot.
+    fn update_balance_grpc_poke(balance_update: v1::BalanceUpdate) -> NounSlab {
+        let mut slab = NounSlab::new();
+        let wrapped_balance = Some(Some(balance_update));
+        let balance_noun = wrapped_balance.to_noun(&mut slab);
+        let head = make_tas(&mut slab, "update-balance-grpc").as_noun();
+        let full = T(&mut slab, &[head, balance_noun]);
+        slab.set_root(full);
+        slab
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_balance_grpc_poke_for_tests(
+        balance_update: v1::BalanceUpdate,
+    ) -> NounSlab {
+        Self::update_balance_grpc_poke(balance_update)
+    }
+
+    /// Merges fetched balance pages into one consistent deduplicated snapshot.
+    pub(crate) fn union_balance_pages(
+        pages: Vec<v1::BalanceUpdate>,
+    ) -> Result<Option<(v1::BalanceUpdate, NormalizedSnapshot)>, NormalizeSnapshotError> {
+        if pages.is_empty() {
+            return Ok(None);
+        }
+
+        let normalized = normalize_balance_pages(&pages)?;
+
+        let mut deduped_notes = BTreeMap::<([u64; 5], [u64; 5]), (Name, v1::Note)>::new();
+        for page in pages {
+            for (name, note) in page.notes.0 {
+                let key = (name.first.to_array(), name.last.to_array());
+                deduped_notes.entry(key).or_insert((name, note));
+            }
+        }
+
+        let merged = v1::BalanceUpdate {
+            height: normalized.metadata.height.clone(),
+            block_id: normalized.metadata.block_id.clone(),
+            notes: v1::Balance(deduped_notes.into_values().collect()),
+        };
+        Ok(Some((merged, normalized)))
+    }
+
+    #[cfg(test)]
+    /// Removes v1 notes that do not match tracked first-name filters.
+    ///
+    /// Some balance endpoints can return broader result sets than requested.
+    /// This keeps wallet state aligned with tracked keys/watch lists by
+    /// admitting only v1 notes whose first-name matches a tracked query.
+    fn filter_untracked_v1_notes_from_balance_update(
+        mut balance_update: v1::BalanceUpdate,
+        tracked_first_names: &std::collections::BTreeSet<[u64; 5]>,
+    ) -> v1::BalanceUpdate {
+        if tracked_first_names.is_empty() {
+            return balance_update;
+        }
+
+        let before = balance_update.notes.0.len();
+        balance_update.notes.0.retain(|(name, note)| match note {
+            v1::Note::V1(_) => tracked_first_names.contains(&name.first.to_array()),
+            v1::Note::V0(_) => true,
+        });
+        let removed = before.saturating_sub(balance_update.notes.0.len());
+        if removed > 0 {
+            info!(
+                "wallet balance sync dropped {} untracked v1 notes from one page",
+                removed
+            );
+        }
+        balance_update
+    }
+
+    #[cfg(test)]
+    /// Test helper for filtering one balance update against tracked first names.
+    pub(crate) fn filter_untracked_v1_notes_for_tests(
+        balance_update: v1::BalanceUpdate,
+        tracked_first_names: Vec<Hash>,
+    ) -> v1::BalanceUpdate {
+        let tracked = tracked_first_names
+            .into_iter()
+            .map(|hash| hash.to_array())
+            .collect::<std::collections::BTreeSet<_>>();
+        Self::filter_untracked_v1_notes_from_balance_update(balance_update, &tracked)
+    }
+
+    /// Collects one page set from the public API balance endpoints.
+    async fn fetch_balance_pages_grpc_public(
+        client: &mut public_nockchain::PublicNockchainGrpcClient,
+        pubkeys: &[String],
+        first_names: &[String],
+    ) -> Result<Vec<v1::BalanceUpdate>, NockAppError> {
+        let mut jobs = tokio::task::JoinSet::new();
+
+        for first_name in first_names {
+            let first_name = first_name.clone();
+            let mut client = client.clone();
+            jobs.spawn(async move {
+                let response = client
+                    .wallet_get_balance(&BalanceRequest::FirstName(first_name.clone()))
+                    .await
+                    .map_err(|e| {
+                        NockAppError::OtherError(format!(
+                            "Failed to request current balance for first name {}: {}",
+                            first_name, e
+                        ))
+                    })?;
+                v1::BalanceUpdate::try_from(response).map_err(|e| {
+                    NockAppError::OtherError(format!(
+                        "Failed to parse balance update for first name {}: {}",
+                        first_name, e
+                    ))
+                })
+            });
+        }
+
+        for key in pubkeys {
+            let key = key.clone();
+            let mut client = client.clone();
+            jobs.spawn(async move {
+                let response = client
+                    .wallet_get_balance(&BalanceRequest::Address(key.clone()))
+                    .await
+                    .map_err(|e| {
+                        NockAppError::OtherError(format!(
+                            "Failed to request current balance for pubkey {}: {}",
+                            key, e
+                        ))
+                    })?;
+                v1::BalanceUpdate::try_from(response).map_err(|e| {
+                    NockAppError::OtherError(format!(
+                        "Failed to parse balance update for pubkey {}: {}",
+                        key, e
+                    ))
+                })
+            });
+        }
+
+        let mut pages = Vec::<v1::BalanceUpdate>::with_capacity(first_names.len() + pubkeys.len());
+        while let Some(job) = jobs.join_next().await {
+            pages.push(job.map_err(NockAppError::JoinError)??);
+        }
+
+        Ok(pages)
+    }
+
+    /// Fetches balances via public gRPC and emits one merged wallet update snapshot.
+    pub(crate) async fn update_balance_grpc_public(
+        client: &mut public_nockchain::PublicNockchainGrpcClient,
+        mut pubkeys: Vec<String>,
+        mut first_names: Vec<String>,
+    ) -> Result<connection::BalanceSyncResult, NockAppError> {
+        first_names.sort();
+        first_names.dedup();
+        pubkeys.sort();
+        pubkeys.dedup();
+
+        const SNAPSHOT_DRIFT_MAX_RETRIES: usize = 8;
+        let mut attempt = 0usize;
+        let (merged_balance, normalized_snapshot) = loop {
+            attempt = attempt.saturating_add(1);
+            let pages =
+                Self::fetch_balance_pages_grpc_public(client, &pubkeys, &first_names).await?;
+
+            match Self::union_balance_pages(pages) {
+                Ok(Some((merged_balance, normalized_snapshot))) => {
+                    break (merged_balance, normalized_snapshot);
+                }
+                Ok(None) => {
+                    return Ok(connection::BalanceSyncResult {
+                        pokes: Vec::new(),
+                        normalized_snapshot: None,
+                    });
+                }
+                Err(
+                    NormalizeSnapshotError::Snapshot(SnapshotConsistencyError::HeightDrift)
+                    | NormalizeSnapshotError::Snapshot(SnapshotConsistencyError::BlockIdDrift),
+                ) if attempt <= SNAPSHOT_DRIFT_MAX_RETRIES => {
+                    continue;
+                }
+                Err(err) => {
+                    return Err(NockAppError::OtherError(format!(
+                        "Failed to normalize fetched wallet balance pages into one snapshot: {}",
+                        err
+                    )));
+                }
+            }
+        };
+
+        Ok(connection::BalanceSyncResult {
+            pokes: vec![Self::update_balance_grpc_poke(merged_balance)],
+            normalized_snapshot: Some(normalized_snapshot),
+        })
+    }
+
+    /// Fetches individual balance pages via private gRPC peek paths.
+    async fn fetch_balance_pages_grpc_private(
+        client: &mut private_nockapp::PrivateNockAppGrpcClient,
+        pubkeys: &[String],
+        first_names: &[String],
+    ) -> Result<Vec<v1::BalanceUpdate>, NockAppError> {
+        let mut jobs = tokio::task::JoinSet::new();
+
+        for (request_index, first_name) in first_names.iter().cloned().enumerate() {
+            let mut client = client.clone();
+            jobs.spawn(async move {
+                let mut slab: NounSlab<NockJammer> = NounSlab::new();
+                let mut path_slab = NounSlab::<NockJammer>::new();
+                let path_noun = vec!["balance-by-first-name".to_string(), first_name.clone()]
+                    .to_noun(&mut path_slab);
+                path_slab.set_root(path_noun);
+                let path_bytes = path_slab.jam().to_vec();
+
+                let response = client
+                    .peek(request_index as i32, path_bytes)
+                    .await
+                    .map_err(|e| {
+                        NockAppError::OtherError(format!(
+                            "Failed to peek balance for first name {first_name}: {e}"
+                        ))
+                    })?;
+
+                let balance = slab.cue_into(response.as_bytes()?)?;
+                let space = slab.noun_space();
+                let payload: Option<Option<v1::BalanceUpdate>> =
+                    <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance, &space)?;
+                Ok::<Option<v1::BalanceUpdate>, NockAppError>(payload.flatten())
+            });
+        }
+
+        for (offset, key) in pubkeys.iter().cloned().enumerate() {
+            let mut client = client.clone();
+            let request_index = first_names.len().saturating_add(offset) as i32;
+            jobs.spawn(async move {
+                let mut slab: NounSlab<NockJammer> = NounSlab::new();
+                let mut path_slab = NounSlab::<NockJammer>::new();
+                let path_noun =
+                    vec!["balance-by-pubkey".to_string(), key.clone()].to_noun(&mut path_slab);
+                path_slab.set_root(path_noun);
+                let path_bytes = path_slab.jam().to_vec();
+
+                let response = client.peek(request_index, path_bytes).await.map_err(|e| {
+                    NockAppError::OtherError(format!(
+                        "Failed to peek balance for pubkey {key}: {e}"
+                    ))
+                })?;
+
+                let balance = slab.cue_into(response.as_bytes()?)?;
+                let space = slab.noun_space();
+                let payload: Option<Option<v1::BalanceUpdate>> =
+                    <Option<Option<v1::BalanceUpdate>>>::from_noun(&balance, &space)?;
+                Ok::<Option<v1::BalanceUpdate>, NockAppError>(payload.flatten())
+            });
+        }
+
+        let mut pages = Vec::<v1::BalanceUpdate>::with_capacity(first_names.len() + pubkeys.len());
+        while let Some(job) = jobs.join_next().await {
+            if let Some(balance_update) = job.map_err(NockAppError::JoinError)?? {
+                pages.push(balance_update);
+            }
+        }
+
+        Ok(pages)
+    }
+
+    /// Fetches balances via private gRPC peek paths and emits one merged wallet update snapshot.
+    pub(crate) async fn update_balance_grpc_private(
+        client: &mut private_nockapp::PrivateNockAppGrpcClient,
+        mut pubkeys: Vec<String>,
+        mut first_names: Vec<String>,
+    ) -> Result<connection::BalanceSyncResult, NockAppError> {
+        first_names.sort();
+        first_names.dedup();
+        pubkeys.sort();
+        pubkeys.dedup();
+
+        const SNAPSHOT_DRIFT_MAX_RETRIES: usize = 8;
+        let mut attempt = 0usize;
+        let (merged_balance, normalized_snapshot) = loop {
+            attempt = attempt.saturating_add(1);
+            let pages =
+                Self::fetch_balance_pages_grpc_private(client, &pubkeys, &first_names).await?;
+
+            match Self::union_balance_pages(pages) {
+                Ok(Some((merged_balance, normalized_snapshot))) => {
+                    break (merged_balance, normalized_snapshot);
+                }
+                Ok(None) => {
+                    return Ok(connection::BalanceSyncResult {
+                        pokes: Vec::new(),
+                        normalized_snapshot: None,
+                    });
+                }
+                Err(
+                    NormalizeSnapshotError::Snapshot(SnapshotConsistencyError::HeightDrift)
+                    | NormalizeSnapshotError::Snapshot(SnapshotConsistencyError::BlockIdDrift),
+                ) if attempt <= SNAPSHOT_DRIFT_MAX_RETRIES => {
+                    continue;
+                }
+                Err(err) => {
+                    return Err(NockAppError::OtherError(format!(
+                        "Failed to normalize fetched wallet balance pages into one snapshot: {}",
+                        err
+                    )));
+                }
+            }
+        };
+
+        Ok(connection::BalanceSyncResult {
+            pokes: vec![Self::update_balance_grpc_poke(merged_balance)],
+            normalized_snapshot: Some(normalized_snapshot),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nockchain_math::belt::Belt;
+    use nockchain_math::crypto::cheetah::A_GEN;
+    use nockchain_types::tx_engine::common::{BlockHeight, Nicks, SchnorrPubkey};
+    use nockchain_types::tx_engine::v0::Lock as V0Lock;
+    use wallet_tx_builder::note_data::DecodedNoteData;
+    use wallet_tx_builder::types::{
+        CandidateIdentity, CandidateV0Note, CandidateV1Note, CandidateVersionPolicy,
+    };
+
+    use super::*;
+
+    fn hash(v: u64) -> Hash {
+        Hash::from_limbs(&[v, 0, 0, 0, 0])
+    }
+
+    fn name(first: u64, last: u64) -> Name {
+        Name::new(hash(first), hash(last))
+    }
+
+    fn candidate_v0(first: u64, last: u64) -> CandidateNote {
+        CandidateNote::V0(CandidateV0Note {
+            identity: CandidateIdentity {
+                name: name(first, last),
+                origin_page: BlockHeight(Belt(1)),
+            },
+            assets: Nicks(1),
+            lock: V0Lock {
+                keys_required: 1,
+                pubkeys: vec![SchnorrPubkey(A_GEN)],
+            },
+            timelock: None,
+        })
+    }
+
+    fn tx_snapshot(entries: &[(&str, u64, u64)]) -> WrittenTxSnapshot {
+        let mut map = std::collections::BTreeMap::new();
+        for (path, secs, len) in entries {
+            map.insert(
+                std::path::PathBuf::from(path),
+                TxFileSnapshot {
+                    modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(*secs)),
+                    len: *len,
+                },
+            );
+        }
+        WrittenTxSnapshot(map)
+    }
+
+    fn plan_result_with(input_count: u64, seed_words: u64, witness_words: u64) -> PlanResult {
+        let selected = (0..input_count)
+            .map(|i| CandidateIdentity {
+                name: name(i, i),
+                origin_page: BlockHeight(Belt(1)),
+            })
+            .collect();
+        PlanResult {
+            selected,
+            selected_total: 0,
+            outputs: Vec::new(),
+            final_fee: 0,
+            word_counts: wallet_tx_builder::types::WordCountBreakdown {
+                seed_words,
+                witness_words,
+            },
+            debug_trace: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn oversized_plan_reason_flags_block_busting_multisig_plans() {
+        // The real failing case: ~2,500 three-of-four multisig inputs at ~144
+        // witness words each -> multi-MB, unmineable.
+        let huge = plan_result_with(2_500, 44, 2_500 * 144);
+        let reason = oversized_plan_reason(&huge).expect("oversized plan must be rejected");
+        assert!(reason.contains("2500 inputs"), "reason: {reason}");
+        assert!(reason.contains("too large to mine"), "reason: {reason}");
+
+        // A modest multisig batch (~200 inputs) is within budget.
+        assert!(oversized_plan_reason(&plan_result_with(200, 44, 200 * 144)).is_none());
+
+        // A normal single-sig spend with a handful of inputs is unaffected.
+        assert!(oversized_plan_reason(&plan_result_with(50, 13, 50 * 35)).is_none());
+    }
+
+    #[test]
+    fn tx_files_changed_detects_new_modified_and_no_change() {
+        let before = tx_snapshot(&[("txs/a.tx", 100, 10)]);
+
+        // No change at all -> a create-tx that wrote nothing (kernel rejected the
+        // poke). Reservation must NOT be committed.
+        assert!(!Wallet::tx_files_changed(&before, &before));
+
+        // A brand-new tx file appeared.
+        let with_new = tx_snapshot(&[("txs/a.tx", 100, 10), ("txs/b.tx", 200, 20)]);
+        assert!(Wallet::tx_files_changed(&before, &with_new));
+
+        // Same path rewritten (mtime/len changed) -> a tx was produced.
+        let rewritten = tx_snapshot(&[("txs/a.tx", 101, 12)]);
+        assert!(Wallet::tx_files_changed(&before, &rewritten));
+
+        // Writing from an empty starting dir.
+        let empty = tx_snapshot(&[]);
+        assert!(Wallet::tx_files_changed(&empty, &before));
+        assert!(!Wallet::tx_files_changed(&empty, &empty));
+    }
+
+    fn candidate_v1(first: u64, last: u64) -> CandidateNote {
+        CandidateNote::V1(CandidateV1Note {
+            identity: CandidateIdentity {
+                name: name(first, last),
+                origin_page: BlockHeight(Belt(1)),
+            },
+            assets: Nicks(1),
+            raw_note_data: Vec::new(),
+            decoded_note_data: DecodedNoteData(Vec::new()),
+        })
+    }
+
+    const CSV_HEADER: &str = "version,name_first,name_last,assets,block_height,source_hash";
+
+    fn csv_row(n: &Name, assets: u64, version: u64) -> String {
+        format!(
+            "{},{},{},{},1,N/A",
+            version,
+            n.first.to_base58(),
+            n.last.to_base58(),
+            assets
+        )
+    }
+
+    fn write_csv(dir: &std::path::Path, lines: &[String]) -> PathBuf {
+        let path = dir.join("notes.csv");
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).expect("write csv");
+        path
+    }
+
+    fn key_set(names: &[Name]) -> std::collections::BTreeSet<NoteNameKey> {
+        names.iter().map(note_name_key).collect()
+    }
+
+    #[test]
+    fn parse_notes_csv_names_round_trips_listed_names() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = name(1, 10);
+        let b = name(2, 20);
+        let path = write_csv(
+            dir.path(),
+            &[CSV_HEADER.to_string(), csv_row(&a, 100, 1), csv_row(&b, 200, 0)],
+        );
+
+        let parsed = parse_notes_csv_names(&path).expect("parse");
+        assert_eq!(key_set(&parsed), key_set(&[a, b]));
+    }
+
+    #[test]
+    fn parse_notes_csv_names_skips_header_blank_and_trims_whitespace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = name(3, 30);
+        // Leading blank line, header, blank line, then a row padded with spaces.
+        let body = format!("\n{}\n\n   {}   \n", CSV_HEADER, csv_row(&a, 5, 1));
+        let path = dir.path().join("notes.csv");
+        std::fs::write(&path, body).expect("write");
+
+        let parsed = parse_notes_csv_names(&path).expect("parse");
+        assert_eq!(key_set(&parsed), key_set(&[a]));
+    }
+
+    #[test]
+    fn parse_notes_csv_names_errors_on_invalid_base58() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_csv(
+            dir.path(),
+            &[CSV_HEADER.to_string(), "1,not-base58!!,also-bad,5,1,N/A".to_string()],
+        );
+
+        let err = parse_notes_csv_names(&path).expect_err("invalid base58 must error");
+        assert!(
+            format!("{err}").contains("invalid name_first"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn notes_csv_tolerates_trailing_blank_line() {
+        // The wallet often leaves a trailing blank line in the CSV. Both parsing
+        // and removal must treat it as a no-op rather than a malformed row.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = name(1, 10);
+        let b = name(2, 20);
+        let path = dir.path().join("notes.csv");
+        // Note the doubled trailing newline -> an empty final line.
+        let body = format!(
+            "{}\n{}\n{}\n\n",
+            CSV_HEADER,
+            csv_row(&a, 100, 1),
+            csv_row(&b, 200, 1)
+        );
+        std::fs::write(&path, body).expect("write");
+
+        let parsed = parse_notes_csv_names(&path).expect("parse with trailing blank");
+        assert_eq!(key_set(&parsed), key_set(&[a.clone(), b.clone()]));
+
+        let removed = remove_notes_from_csv(&path, std::slice::from_ref(&a)).expect("remove");
+        assert_eq!(removed, 1);
+        let remaining = parse_notes_csv_names(&path).expect("reparse");
+        assert_eq!(key_set(&remaining), key_set(std::slice::from_ref(&b)));
+        // Header survives and the file is not left with a dangling blank row.
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(contents.lines().next(), Some(CSV_HEADER));
+        assert!(
+            !contents.ends_with("\n\n"),
+            "should not keep a blank line: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn notes_csv_tolerates_trailing_nul_padding() {
+        // Reproduces a real failure: the wallet's file writer left a line of NUL
+        // bytes as padding, which must be ignored like a blank line rather than
+        // rejected as a malformed row.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = name(1, 10);
+        let b = name(2, 20);
+        let path = dir.path().join("notes.csv");
+        // Real rows, then a NUL-only line, then more NUL padding at EOF.
+        let body = format!(
+            "{}\n{}\n{}\n\0\0\0\0\0\0\0\n\0\0\0\0",
+            CSV_HEADER,
+            csv_row(&a, 100, 1),
+            csv_row(&b, 200, 1)
+        );
+        std::fs::write(&path, body).expect("write");
+
+        let parsed = parse_notes_csv_names(&path).expect("parse past NUL padding");
+        assert_eq!(key_set(&parsed), key_set(&[a.clone(), b.clone()]));
+
+        let removed = remove_notes_from_csv(&path, std::slice::from_ref(&a)).expect("remove");
+        assert_eq!(removed, 1);
+        let remaining = parse_notes_csv_names(&path).expect("reparse");
+        assert_eq!(key_set(&remaining), key_set(std::slice::from_ref(&b)));
+        // The rewrite must not carry the NUL padding back into the file.
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            !contents.contains('\0'),
+            "rewritten CSV must not contain NUL bytes: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn parse_notes_csv_names_errors_on_short_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_csv(
+            dir.path(),
+            &[CSV_HEADER.to_string(), "1,onlytwo".to_string()],
+        );
+
+        let err = parse_notes_csv_names(&path).expect_err("short row must error");
+        assert!(
+            format!("{err}").contains("fewer than 3 columns"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn csv_eligible_filtering_keeps_only_listed_candidates() {
+        // Mirrors the retain predicate used in create_tx_with_planner.
+        let listed = name(1, 10);
+        let unlisted = name(2, 20);
+        let eligible = key_set(std::slice::from_ref(&listed));
+
+        let mut candidates = vec![candidate_v1(1, 10), candidate_v1(2, 20)];
+        candidates.retain(|c| eligible.contains(&note_name_key(&c.identity().name)));
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].identity().name, listed);
+        assert_ne!(candidates[0].identity().name, unlisted);
+    }
+
+    #[test]
+    fn remove_notes_from_csv_removes_only_selected_and_preserves_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spent = name(1, 10);
+        let kept = name(2, 20);
+        let path = write_csv(
+            dir.path(),
+            &[CSV_HEADER.to_string(), csv_row(&spent, 100, 1), csv_row(&kept, 200, 1)],
+        );
+
+        let removed = remove_notes_from_csv(&path, std::slice::from_ref(&spent)).expect("remove");
+        assert_eq!(removed, 1);
+
+        let remaining = parse_notes_csv_names(&path).expect("reparse");
+        assert_eq!(key_set(&remaining), key_set(std::slice::from_ref(&kept)));
+
+        // Header is preserved verbatim.
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(contents.lines().next() == Some(CSV_HEADER));
+    }
+
+    #[test]
+    fn remove_notes_from_csv_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spent = name(1, 10);
+        let kept = name(2, 20);
+        let path = write_csv(
+            dir.path(),
+            &[CSV_HEADER.to_string(), csv_row(&spent, 100, 1), csv_row(&kept, 200, 1)],
+        );
+
+        assert_eq!(
+            remove_notes_from_csv(&path, std::slice::from_ref(&spent)).expect("first"),
+            1
+        );
+        // Removing the same note again removes nothing and leaves the kept row.
+        assert_eq!(remove_notes_from_csv(&path, &[spent]).expect("second"), 0);
+        let remaining = parse_notes_csv_names(&path).expect("reparse");
+        assert_eq!(key_set(&remaining), key_set(std::slice::from_ref(&kept)));
+    }
+
+    #[test]
+    fn remove_notes_from_csv_keeps_unparseable_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let spent = name(1, 10);
+        let path = write_csv(
+            dir.path(),
+            &[
+                CSV_HEADER.to_string(),
+                csv_row(&spent, 100, 1),
+                "1,garbage,garbage,5,1,N/A".to_string(),
+            ],
+        );
+
+        let removed = remove_notes_from_csv(&path, &[spent]).expect("remove");
+        assert_eq!(removed, 1);
+        let contents = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            contents.contains("1,garbage,garbage,5,1,N/A"),
+            "unparseable row must be preserved: {contents}"
+        );
+    }
+
+    #[test]
+    fn manual_candidate_version_policy_returns_v0_only_for_all_v0_manual_sets() {
+        let note_names = vec![name(1, 10), name(2, 20)];
+        let candidates = vec![candidate_v0(1, 10), candidate_v0(2, 20), candidate_v1(3, 30)];
+
+        let policy =
+            Wallet::manual_candidate_version_policy(&note_names, &candidates).expect("policy");
+
+        assert_eq!(policy, CandidateVersionPolicy::V0Only);
+    }
+
+    #[test]
+    fn manual_candidate_version_policy_returns_v1_only_for_all_v1_manual_sets() {
+        let note_names = vec![name(3, 30)];
+        let candidates = vec![candidate_v0(1, 10), candidate_v1(3, 30)];
+
+        let policy =
+            Wallet::manual_candidate_version_policy(&note_names, &candidates).expect("policy");
+
+        assert_eq!(policy, CandidateVersionPolicy::V1Only);
+    }
+
+    #[test]
+    fn manual_candidate_version_policy_rejects_mixed_manual_sets() {
+        let note_names = vec![name(1, 10), name(3, 30)];
+        let candidates = vec![candidate_v0(1, 10), candidate_v1(3, 30)];
+
+        let err = Wallet::manual_candidate_version_policy(&note_names, &candidates)
+            .expect_err("mixed version note set should error");
+
+        assert_eq!(
+            err,
+            "manual create-tx cannot mix v0 and v1 notes; select notes from only one version"
+        );
+    }
+
+    #[test]
+    fn manual_candidate_version_policy_rejects_missing_manual_notes() {
+        let missing = name(9, 90);
+        let note_names = vec![missing.clone()];
+        let candidates = vec![candidate_v0(1, 10), candidate_v1(3, 30)];
+
+        let err = Wallet::manual_candidate_version_policy(&note_names, &candidates)
+            .expect_err("missing note should error");
+
+        assert_eq!(
+            err,
+            format!(
+                "manual mode references unknown note {}/{}",
+                missing.first.to_base58(),
+                missing.last.to_base58()
+            )
+        );
+    }
+}

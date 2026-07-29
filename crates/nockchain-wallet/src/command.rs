@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use clap::builder::BoolishValueParser;
@@ -95,11 +96,11 @@ impl TimelockIntentCli {
     pub fn has_upper_bound(&self) -> bool {
         self.absolute
             .as_ref()
-            .map_or(false, TimelockRangeCli::has_upper_bound)
+            .is_some_and(TimelockRangeCli::has_upper_bound)
             || self
                 .relative
                 .as_ref()
-                .map_or(false, TimelockRangeCli::has_upper_bound)
+                .is_some_and(TimelockRangeCli::has_upper_bound)
     }
 }
 
@@ -171,6 +172,7 @@ impl FromStr for TimelockRangeCli {
     }
 }
 
+/// CLI-facing note selection strategy for create-tx ordering.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub enum NoteSelectionStrategyCli {
     Ascending,
@@ -186,11 +188,21 @@ impl NoteSelectionStrategyCli {
     }
 }
 
+/// Top-level wallet CLI definition.
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct WalletCli {
     #[command(flatten)]
     pub boot: BootCli,
+
+    #[arg(long, default_value = "false")]
+    pub fakenet: bool,
+
+    #[arg(long, requires = "fakenet")]
+    pub fakenet_v1_phase: Option<u64>,
+
+    #[arg(long, requires = "fakenet")]
+    pub fakenet_bythos_phase: Option<u64>,
 
     #[command(flatten)]
     pub connection: ConnectionCli,
@@ -199,6 +211,7 @@ pub struct WalletCli {
     pub command: Commands,
 }
 
+/// Supported watch subcommands for addresses and lock forms.
 #[derive(Subcommand, Debug, Clone)]
 pub enum WatchSubcommand {
     /// Add a watch-only address (base58 pkh or schnorr pubkey)
@@ -228,8 +241,18 @@ pub enum WatchSubcommand {
         #[arg(long)]
         participants: String,
     },
+    /// Import many watch-only multisig locks from a manifest file
+    MultisigBatch {
+        /// Threshold (m) value for every manifest entry
+        #[arg(short = 't', long = "threshold")]
+        threshold: u64,
+        /// Path to a newline-delimited manifest of comma-separated participant hashes
+        #[arg(long, value_name = "FILE")]
+        manifest: String,
+    },
 }
 
+/// gRPC client mode used for wallet network operations.
 #[derive(clap::ValueEnum, Debug, Clone, PartialEq, Eq)]
 pub enum ClientType {
     Public,
@@ -238,6 +261,12 @@ pub enum ClientType {
 
 #[derive(Debug)]
 #[allow(dead_code)]
+// The `Command` variant carries the full CLI `Commands` enum, which is large by
+// nature (every subcommand's args). A `WalletWire` is constructed once per
+// command invocation and immediately lowered via `to_wire()`, never stored in
+// bulk or on a hot path, so boxing it would only add indirection without value.
+#[allow(clippy::large_enum_variant)]
+/// Internal wallet event wires used for nockapp routing.
 pub enum WalletWire {
     ListNotes,
     UpdateBalance,
@@ -267,6 +296,7 @@ impl Wire for WalletWire {
 /// Represents a Noun that the wallet kernel can handle
 pub type CommandNoun<T> = Result<(T, Operation), NockAppError>;
 
+/// Validates label strings accepted by key-derivation CLI paths.
 fn validate_label(s: &str) -> Result<String, String> {
     if s.chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
@@ -278,6 +308,7 @@ fn validate_label(s: &str) -> Result<String, String> {
 }
 
 #[derive(Subcommand, Debug, Clone)]
+/// Wallet command surface for key, note, and transaction operations.
 pub enum Commands {
     /// Generates a new version 1 key pair
     Keygen,
@@ -295,6 +326,29 @@ pub enum Commands {
         /// Label for the child key
         #[arg(short, long, value_parser = validate_label, default_value = None)]
         label: Option<String>,
+    },
+
+    /// Derive a contiguous batch of child keys from the current master key
+    DeriveChildBatch {
+        /// Starting child index, should be in range [0, 2^31)
+        #[arg(long = "start-index", value_parser = clap::value_parser!(u64).range(0..(1u64 << 31)))]
+        start_index: u64,
+
+        /// Number of child keys to derive
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..(1u64 << 31)))]
+        count: u64,
+
+        /// Hardened or unhardened child keys
+        #[arg(long, default_value = "false")]
+        hardened: bool,
+
+        /// Optional label prefix. Derived labels become `<prefix>-<index>`.
+        #[arg(long = "label-prefix", value_parser = validate_label, default_value = None)]
+        label_prefix: Option<String>,
+
+        /// Optional output CSV path. Writes `index,address` rows when provided.
+        #[arg(long = "out", value_name = "FILE")]
+        out: Option<String>,
     },
 
     /// Import keys from a file, extended key, seed phrase, or master private key
@@ -343,6 +397,20 @@ pub enum Commands {
         address: String,
     },
 
+    /// List notes in an already-watched multisig in CSV format
+    ListNotesByMultisigCsv {
+        /// Base58 first-name of the watched multisig (printed by `watch multisig`)
+        #[arg(value_name = "first-name")]
+        first_name: String,
+    },
+
+    /// Show the aggregate balance of an already-watched multisig
+    ShowBalanceMultisig {
+        /// Base58 first-name of the watched multisig (printed by `watch multisig`)
+        #[arg(value_name = "first-name")]
+        first_name: String,
+    },
+
     /// Create a transaction from a transaction file
     SendTx {
         /// Transaction file to create transaction from
@@ -365,16 +433,36 @@ pub enum Commands {
         tx_id: String,
     },
 
+    /// Show a transaction's lifecycle status: confirmed (with block height +
+    /// confirmations), pending in the mempool, or unknown to the node.
+    TxStatus {
+        /// Base58-encoded transaction ID
+        #[arg(value_name = "TX_ID")]
+        tx_id: String,
+
+        /// Poll until the tx is confirmed (or the timeout elapses) instead of
+        /// reporting once and exiting.
+        #[arg(long)]
+        wait: bool,
+
+        /// With --wait, give up after this many seconds (default 600).
+        #[arg(long, value_name = "SECS", default_value_t = 600)]
+        timeout_secs: u64,
+    },
+
     /// Create a transaction (use --refund-pkh when spending legacy v0 notes)
     #[command(
         name = "create-tx",
-        override_usage = "nockchain-wallet create-tx --names <NAMES> --recipient <RECIPIENT>... --fee <FEE> [--refund-pkh <REFUND_PKH>] [--include-data <BOOL>]\n\n# NOTE: --refund-pkh is required when spending from v0 notes. For v1 notes, the refund defaults to the note owner. --include-data defaults to true (pass 'false' to exclude note data).\n# RECIPIENT accepts either legacy '<p2pkh>:<amount>' strings or JSON objects like '{\"kind\":\"multisig\",\"threshold\":2,\"addresses\":[\"pkh-a\",\"pkh-b\"],\"amount\":9000}'.\n\nExamples:\n  # Pay a simple recipient\n  nockchain-wallet create-tx \\\n    --names \"[first1 last1],[first2 last2]\" \\\n    --recipient '{\"kind\":\"p2pkh\",\"address\":\"<p2pkh-b58>\",\"amount\":10000}' \\\n    --fee 10 \\\n    --refund-pkh <p2pkh-b58>\n\n  # Create a multisig recipient\n  nockchain-wallet create-tx \\\n    --names \"[first1 last1],[first2 last2]\" \\\n    --recipient '{\"kind\":\"multisig\",\"threshold\":2,\"addresses\":[\"<pkh-a>\",\"<pkh-b>\",\"<pkh-c>\"],\"amount\":9000}' \\\n    --fee 10"
+        override_usage = "nockchain-wallet create-tx [--names <NAMES>] (--recipient <RECIPIENT>... | --to <P2PKH_B58> (--amount <NOCKS> | --amount-nicks <NICKS>))... [--fee <NOCKS> | --fee-nicks <NICKS>] [--refund-pkh <REFUND_PKH>] [--include-data <BOOL>]\n\n# ERGONOMIC: instead of --recipient JSON you can pass --to <p2pkh-b58> --amount <NOCKS> (paired, repeatable, whole nocks only) to send NOCKS to a p2pkh recipient, so `--to A --amount 100` equals `--recipient '{\"kind\":\"p2pkh\",\"address\":\"A\",\"amount\":6553600}'` (100 x 65536 nicks). Use --amount-nicks <NICKS> to give the paired amount in raw nicks instead (mutually exclusive with --amount). --to and --recipient may be combined. To deposit onto the Base bridge instead, pass --bridge-deposit <NOCKS> --to-evm-address <0x...> (only one per transaction; minimum 100,000 nocks; the bridge charges a 0.3% fee). Fees: --fee is in whole nocks, --fee-nicks is in nicks (mutually exclusive).\n# NOTE: --refund-pkh is required when spending from legacy v0 notes. For v1 notes, the refund defaults to the note owner. --include-data defaults to true (pass 'false' to exclude note data).\n# NOTE: if --names is omitted, the planner auto-selects spendable v1 notes. If provided, names are treated as a manual selection set.\n# NOTE: manual selection may spend either an all-v1 set or an all-v0 set; mixed-version manual sets are rejected.\n# NOTE: --fee is optional. If omitted, the planner computes a fee. If provided, it overrides the planner fee (subject to --allow-low-fee).\n# NOTE: --notes-csv reads candidate notes from a notes CSV (as written by 'list-notes-by-address-csv') instead of downloading the balance, and removes the spent notes from that CSV after the tx is created. Requires a prior sync so the wallet still holds the note data.\n# RECIPIENT accepts a legacy '<p2pkh>:<amount>' string or a JSON object. Supported JSON kinds:\n#   p2pkh:          {\"kind\":\"p2pkh\",\"address\":\"<pkh-b58>\",\"amount\":<nicks>}\n#   multisig:       {\"kind\":\"multisig\",\"threshold\":2,\"addresses\":[\"<pkh-a>\",\"<pkh-b>\"],\"amount\":<nicks>}\n#   bridge-deposit: {\"kind\":\"bridge-deposit\",\"evm-address\":\"0x<40-hex-chars>\",\"amount\":<nicks>}  (optional \"root\":\"<lock-root-b58>\")\n# BRIDGE DEPOSIT: to move NOCK onto the Base bridge, add a 'bridge-deposit' recipient whose 'evm-address' is the 0x-prefixed 20-byte (40 hex char) destination on the Base side; 'amount' is in nicks. The bridge requires a minimum deposit of 100,000 nocks (6,553,600,000 nicks) and charges a 0.3% fee on the deposited amount. The output is locked to the canonical bridge lock root by default, so only pass 'root' if directed to a non-default bridge lock. It is built like any other create-tx output, so broadcast it afterward with 'send-tx'.\n\nExamples:\n  # Auto-select spendable v1 notes and compute fee\n  nockchain-wallet create-tx \\\n    --recipient '{\"kind\":\"p2pkh\",\"address\":\"<p2pkh-b58>\",\"amount\":10000}'\n\n  # Manually pin notes and optionally override fee\n  nockchain-wallet create-tx \\\n    --names \"[first1 last1],[first2 last2]\" \\\n    --recipient '{\"kind\":\"p2pkh\",\"address\":\"<p2pkh-b58>\",\"amount\":10000}' \\\n    --fee 10\n\n  # Deposit 100,000 nocks (the minimum) onto the Base bridge (evm-address receives the bridged funds)\n  nockchain-wallet create-tx \\\n    --recipient '{\"kind\":\"bridge-deposit\",\"evm-address\":\"0xabcdef0123456789abcdef0123456789abcdef01\",\"amount\":6553600000}'\n\n  # Reuse a downloaded notes CSV instead of re-syncing; spent notes are pruned from it\n  nockchain-wallet create-tx \\\n    --notes-csv notes-<p2pkh-b58>.csv \\\n    --recipient '{\"kind\":\"p2pkh\",\"address\":\"<p2pkh-b58>\",\"amount\":10000}'"
     )]
     CreateTx {
-        /// Names of notes to spend (comma-separated)
+        /// Optional names of notes to spend (comma-separated) for manual selection.
         #[arg(long)]
-        names: String,
-        /// Recipient specifications (repeat --recipient for each output)
+        names: Option<String>,
+        /// Output(s); repeat --recipient per output. Accepts '<p2pkh>:<amount>'
+        /// or a JSON object whose "kind" is "p2pkh", "multisig", or
+        /// "bridge-deposit" (use bridge-deposit to move funds onto the Base
+        /// bridge; see this command's help for formats and examples).
         #[arg(
             long = "recipient",
             value_name = "RECIPIENT",
@@ -382,9 +470,51 @@ pub enum Commands {
             action = ArgAction::Append
         )]
         recipients: Vec<RecipientSpecToken>,
-        /// Transaction fee
-        #[arg(long)]
-        fee: u64,
+        /// Ergonomic p2pkh recipient (base58). Pair each --to with one --amount
+        /// (in nocks); builds a p2pkh output identical to the nicks-based
+        /// --recipient JSON form. Repeat for multiple outputs.
+        #[arg(long = "to", value_name = "P2PKH_B58", action = ArgAction::Append)]
+        to: Vec<String>,
+        /// Amount in whole nocks (1 nock = 65536 nicks) for the paired --to
+        /// recipient. Repeat --to/--amount for multiple outputs.
+        #[arg(long = "amount", value_name = "NOCKS", action = ArgAction::Append)]
+        amounts: Vec<u64>,
+        /// Amount in nicks (raw protocol unit) for the paired --to recipient.
+        /// Mutually exclusive with --amount; use a single amount unit per command.
+        #[arg(
+            long = "amount-nicks",
+            value_name = "NICKS",
+            action = ArgAction::Append,
+            conflicts_with = "amounts"
+        )]
+        amounts_nicks: Vec<u64>,
+        /// Ergonomic Base bridge deposit amount in whole nocks (1 nock = 65536
+        /// nicks). Pair with --to-evm-address to move funds onto the Base bridge.
+        /// Only one bridge deposit is allowed per transaction.
+        #[arg(
+            long = "bridge-deposit",
+            value_name = "NOCKS",
+            requires = "to_evm_address"
+        )]
+        bridge_deposit: Option<u64>,
+        /// Base (EVM) destination address for the paired --bridge-deposit
+        /// (0x-prefixed 20-byte hex, 40 hex chars; the 0x prefix is optional).
+        #[arg(
+            long = "to-evm-address",
+            value_name = "EVM_ADDR",
+            requires = "bridge_deposit"
+        )]
+        to_evm_address: Option<String>,
+        /// Optional transaction fee override, in whole nocks (1 nock = 65536 nicks).
+        #[arg(long, value_name = "NOCKS")]
+        fee: Option<u64>,
+        /// Optional transaction fee override, in nicks.
+        /// Mutually exclusive with --fee, which is denominated in nocks.
+        #[arg(long = "fee-nicks", value_name = "NICKS", conflicts_with = "fee")]
+        fee_nicks: Option<u64>,
+        /// Allow fees below the estimated minimum (unsafe, testing only)
+        #[arg(long, default_value = "false")]
+        allow_low_fee: bool,
         /// Optional refund recipient pubkey hash (base58). Required for legacy v0 notes; v1 notes default to the note owner.
         #[arg(long = "refund-pkh", value_name = "REFUND_PKH")]
         refund_pkh: Option<String>,
@@ -412,6 +542,127 @@ pub enum Commands {
         /// Note selection strategy (ascending selects smallest notes first)
         #[arg(long = "note-selection", value_enum, default_value = "ascending")]
         note_selection_strategy: NoteSelectionStrategyCli,
+        /// Select candidate notes from a notes CSV (as written by
+        /// `list-notes-by-address-csv`) instead of downloading the balance. The
+        /// wallet must already hold the listed notes from a prior sync, since
+        /// the note data needed to build the spend comes from local state. The
+        /// notes actually spent are removed from the CSV once the tx is created.
+        #[arg(long = "notes-csv", value_name = "PATH")]
+        notes_csv: Option<PathBuf>,
+    },
+
+    #[command(
+        name = "create-multisig-tx",
+        override_usage = "nockchain-wallet create-multisig-tx --threshold <M> --participants <PKH,...> [--names <NAMES>] (--recipient <RECIPIENT>... | --to <P2PKH_B58> (--amount <NOCKS> | --amount-nicks <NICKS>))... [--fee <NOCKS> | --fee-nicks <NICKS>] [--refund-pkh <REFUND_PKH>] [--include-data <BOOL>]\n\n# ERGONOMIC: instead of --recipient JSON you can pass --to <p2pkh-b58> --amount <NOCKS> (paired, repeatable, whole nocks only) to send NOCKS to a p2pkh recipient; use --amount-nicks <NICKS> for the paired amount in raw nicks instead (mutually exclusive with --amount). Deposit onto the Base bridge with --bridge-deposit <NOCKS> --to-evm-address <0x...> (one per transaction; minimum 100,000 nocks; the bridge charges a 0.3% fee). Fees: --fee is in whole nocks, --fee-nicks is in nicks (mutually exclusive).\n# Spends v1 m-of-n multisig notes. --threshold and --participants describe the SAME multisig lock used with `watch multisig`; they are used to reconstruct the input lock so the planner can select and spend the multisig notes.\n# NOTE: if --names is omitted, the planner auto-selects spendable notes that belong to this multisig lock. If provided, names are treated as a manual selection set (and must all belong to the multisig).\n# NOTE: change returns to the multisig lock by default; pass --refund-pkh to send change to a single-signer address instead.\n# NOTE: this command produces an unsigned-or-partially-signed transaction file under ./txs; collect the remaining signatures with `sign-multisig-tx` before `send-tx`.\n# NOTE: --notes-csv reads candidate notes from a notes CSV (as written by 'list-notes-by-multisig-csv') instead of downloading the balance, and removes the spent notes from that CSV after the tx is created. Requires a prior sync so the wallet still holds the note data.\n# RECIPIENT accepts the same forms as create-tx: a legacy '<p2pkh>:<amount>' string or a JSON object with \"kind\" of \"p2pkh\", \"multisig\", or \"bridge-deposit\" (e.g. '{\"kind\":\"bridge-deposit\",\"evm-address\":\"0x<40-hex-chars>\",\"amount\":<nicks>}' to deposit onto the Base bridge; minimum 100,000 nocks and a 0.3% bridge fee apply)."
+    )]
+    CreateMultisigTx {
+        /// Threshold (m) value for the m-of-n multisig being spent.
+        #[arg(short = 't', long = "threshold")]
+        threshold: u64,
+        /// Comma-separated list of base58 pubkey hashes that define the multisig lock.
+        #[arg(long)]
+        participants: String,
+        /// Optional names of notes to spend (comma-separated) for manual selection.
+        #[arg(long)]
+        names: Option<String>,
+        /// Output(s); repeat --recipient per output. Accepts '<p2pkh>:<amount>'
+        /// or a JSON object whose "kind" is "p2pkh", "multisig", or
+        /// "bridge-deposit" (use bridge-deposit to move funds onto the Base
+        /// bridge; see this command's help for formats and examples).
+        #[arg(
+            long = "recipient",
+            value_name = "RECIPIENT",
+            value_parser = parse_recipient_arg,
+            action = ArgAction::Append
+        )]
+        recipients: Vec<RecipientSpecToken>,
+        /// Ergonomic p2pkh recipient (base58). Pair each --to with one --amount
+        /// (in nocks); builds a p2pkh output identical to the nicks-based
+        /// --recipient JSON form. Repeat for multiple outputs.
+        #[arg(long = "to", value_name = "P2PKH_B58", action = ArgAction::Append)]
+        to: Vec<String>,
+        /// Amount in whole nocks (1 nock = 65536 nicks) for the paired --to
+        /// recipient. Repeat --to/--amount for multiple outputs.
+        #[arg(long = "amount", value_name = "NOCKS", action = ArgAction::Append)]
+        amounts: Vec<u64>,
+        /// Amount in nicks (raw protocol unit) for the paired --to recipient.
+        /// Mutually exclusive with --amount; use a single amount unit per command.
+        #[arg(
+            long = "amount-nicks",
+            value_name = "NICKS",
+            action = ArgAction::Append,
+            conflicts_with = "amounts"
+        )]
+        amounts_nicks: Vec<u64>,
+        /// Ergonomic Base bridge deposit amount in whole nocks (1 nock = 65536
+        /// nicks). Pair with --to-evm-address to move funds onto the Base bridge.
+        /// Only one bridge deposit is allowed per transaction.
+        #[arg(
+            long = "bridge-deposit",
+            value_name = "NOCKS",
+            requires = "to_evm_address"
+        )]
+        bridge_deposit: Option<u64>,
+        /// Base (EVM) destination address for the paired --bridge-deposit
+        /// (0x-prefixed 20-byte hex, 40 hex chars; the 0x prefix is optional).
+        #[arg(
+            long = "to-evm-address",
+            value_name = "EVM_ADDR",
+            requires = "bridge_deposit"
+        )]
+        to_evm_address: Option<String>,
+        /// Optional transaction fee override, in whole nocks (1 nock = 65536 nicks).
+        #[arg(long, value_name = "NOCKS")]
+        fee: Option<u64>,
+        /// Optional transaction fee override, in nicks.
+        /// Mutually exclusive with --fee, which is denominated in nocks.
+        #[arg(long = "fee-nicks", value_name = "NICKS", conflicts_with = "fee")]
+        fee_nicks: Option<u64>,
+        /// Allow fees below the estimated minimum (unsafe, testing only)
+        #[arg(long, default_value = "false")]
+        allow_low_fee: bool,
+        /// Optional refund recipient pubkey hash (base58). When omitted, change returns to the multisig lock.
+        #[arg(long = "refund-pkh", value_name = "REFUND_PKH")]
+        refund_pkh: Option<String>,
+        /// Optional key index to use for the initial signature [0, 2^31), if not provided, we use the master key
+        #[arg(short, long, value_parser = clap::value_parser!(u64).range(0..2 << 31))]
+        index: Option<u64>,
+        /// Hardened or unhardened child key
+        #[arg(long, default_value = "false")]
+        hardened: bool,
+        /// Include note data in output note
+        #[arg(
+            long,
+            action = ArgAction::Set,
+            value_parser = BoolishValueParser::new(),
+            default_value_t = true
+        )]
+        include_data: bool,
+        /// Additional signing keys. Accepts `index` or `index:hardened`.
+        #[arg(long = "sign-key", value_name = "INDEX[:HARDENED]", action = ArgAction::Append)]
+        sign_keys: Vec<String>,
+        /// For debugging purposes. If true, the raw-tx jam will be saved in the
+        /// txs-debug folder in the current working directory.
+        #[arg(long, default_value = "false")]
+        save_raw_tx: bool,
+        /// Note selection strategy (ascending selects smallest notes first)
+        #[arg(long = "note-selection", value_enum, default_value = "ascending")]
+        note_selection_strategy: NoteSelectionStrategyCli,
+        /// Select candidate notes from a notes CSV (as written by
+        /// `list-notes-by-multisig-csv`) instead of downloading the balance. The
+        /// wallet must already hold the listed notes from a prior sync, since
+        /// the note data needed to build the spend comes from local state. The
+        /// notes actually spent are removed from the CSV once the tx is created.
+        #[arg(long = "notes-csv", value_name = "PATH")]
+        notes_csv: Option<PathBuf>,
+    },
+
+    /// Sweep all spendable legacy v0 notes into one v1 destination address.
+    #[command(name = "migrate-v0-notes")]
+    MigrateV0Notes {
+        /// Base58-encoded v1 pay-to-pubkey-hash address that receives the migrated funds.
+        #[arg(long = "destination", value_name = "DESTINATION")]
+        destination: String,
     },
 
     /// Sign a multisig transaction
@@ -455,6 +706,10 @@ pub enum Commands {
     /// Show the master zprv extended private key
     #[command(name = "show-master-zprv")]
     ShowMasterZPrv,
+
+    /// Show the raw master private key as base58
+    #[command(name = "show-master-prv")]
+    ShowMasterPrv,
 
     /// Show the key tree structure
     #[command(name = "show-key-tree")]
@@ -566,13 +821,18 @@ impl Commands {
         match self {
             Commands::Keygen => "keygen",
             Commands::DeriveChild { .. } => "derive-child",
+            Commands::DeriveChildBatch { .. } => "derive-child-batch",
             Commands::ImportKeys { .. } => "import-keys",
             Commands::ExportKeys => "export-keys",
             Commands::ListNotes => "list-notes",
             Commands::ListNotesByAddress { .. } => "list-notes-by-address",
             Commands::ListNotesByAddressCsv { .. } => "list-notes-by-address-csv",
+            Commands::ListNotesByMultisigCsv { .. } => "list-notes-by-multisig-csv",
+            Commands::ShowBalanceMultisig { .. } => "show-balance-multisig",
             Commands::SetActiveMasterAddress { .. } => "set-active-master-address",
             Commands::CreateTx { .. } => "create-tx",
+            Commands::CreateMultisigTx { .. } => "create-tx",
+            Commands::MigrateV0Notes { .. } => "migrate-v0-notes",
             Commands::SignMultisigTx { .. } => "sign-multisig-tx",
             Commands::SendTx { .. } => "send-tx",
             Commands::ShowTx { .. } => "show-tx",
@@ -584,18 +844,253 @@ impl Commands {
             Commands::ShowSeedphrase => "show-seed-phrase",
             Commands::ShowMasterZPub => "show-master-zpub",
             Commands::ShowMasterZPrv => "show-master-zprv",
+            Commands::ShowMasterPrv => "show-master-prv",
             Commands::ShowKeyTree { .. } => "show-key-tree",
             Commands::SignMessage { .. } => "sign-message",
             Commands::VerifyMessage { .. } => "verify-message",
             Commands::SignHash { .. } => "sign-hash",
             Commands::VerifyHash { .. } => "verify-hash",
             Commands::TxAccepted { .. } => "tx-accepted",
+            Commands::TxStatus { .. } => "tx-status",
             Commands::Watch { subcommand } => match subcommand {
                 WatchSubcommand::Address { .. } => "watch-address",
                 WatchSubcommand::Pubkey { .. } => "watch-address",
                 //WatchSubcommand::FirstName { .. } => "watch-first-name",
                 WatchSubcommand::Multisig { .. } => "watch-address-multisig",
+                WatchSubcommand::MultisigBatch { .. } => "watch-address-multisig",
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SAMPLE_P2PKH: &str = "9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV";
+
+    #[test]
+    fn create_tx_defaults_to_ascending_note_selection() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet",
+            "create-tx",
+            "--recipient",
+            &format!("{SAMPLE_P2PKH}:100"),
+        ])
+        .expect("create-tx CLI should parse");
+
+        let Commands::CreateTx {
+            note_selection_strategy,
+            ..
+        } = cli.command
+        else {
+            panic!("expected create-tx command");
+        };
+
+        assert!(matches!(
+            note_selection_strategy,
+            NoteSelectionStrategyCli::Ascending
+        ));
+    }
+
+    #[test]
+    fn create_tx_accepts_descending_note_selection_override() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet",
+            "create-tx",
+            "--recipient",
+            &format!("{SAMPLE_P2PKH}:100"),
+            "--note-selection",
+            "descending",
+        ])
+        .expect("create-tx CLI should parse");
+
+        let Commands::CreateTx {
+            note_selection_strategy,
+            ..
+        } = cli.command
+        else {
+            panic!("expected create-tx command");
+        };
+
+        assert!(matches!(
+            note_selection_strategy,
+            NoteSelectionStrategyCli::Descending
+        ));
+    }
+
+    #[test]
+    fn create_tx_accepts_paired_to_amount_flags() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "100", "--to",
+            SAMPLE_P2PKH, "--amount", "5",
+        ])
+        .expect("create-tx with --to/--amount should parse");
+
+        let Commands::CreateTx {
+            to,
+            amounts,
+            amounts_nicks,
+            recipients,
+            ..
+        } = cli.command
+        else {
+            panic!("expected create-tx command");
+        };
+        assert_eq!(to, vec![SAMPLE_P2PKH.to_string(), SAMPLE_P2PKH.to_string()]);
+        assert_eq!(amounts, vec![100u64, 5u64]);
+        assert!(amounts_nicks.is_empty());
+        assert!(recipients.is_empty());
+    }
+
+    #[test]
+    fn create_tx_rejects_decimal_amount() {
+        let result = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "5.5",
+        ]);
+        assert!(result.is_err(), "decimal --amount must be rejected");
+    }
+
+    #[test]
+    fn create_tx_accepts_amount_nicks() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount-nicks", "6553600",
+        ])
+        .expect("create-tx with --amount-nicks should parse");
+        let Commands::CreateTx {
+            amounts,
+            amounts_nicks,
+            ..
+        } = cli.command
+        else {
+            panic!("expected create-tx command");
+        };
+        assert!(amounts.is_empty());
+        assert_eq!(amounts_nicks, vec![6_553_600u64]);
+    }
+
+    #[test]
+    fn create_tx_amount_and_amount_nicks_are_mutually_exclusive() {
+        let result = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "1",
+            "--amount-nicks", "65536",
+        ]);
+        assert!(
+            result.is_err(),
+            "--amount and --amount-nicks must not be accepted together"
+        );
+    }
+
+    #[test]
+    fn create_multisig_tx_accepts_to_amount_flags() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet",
+            "create-multisig-tx",
+            "--threshold",
+            "2",
+            "--participants",
+            &format!("{SAMPLE_P2PKH},{SAMPLE_P2PKH}"),
+            "--to",
+            SAMPLE_P2PKH,
+            "--amount",
+            "100",
+        ])
+        .expect("create-multisig-tx with --to/--amount should parse");
+
+        let Commands::CreateMultisigTx { to, amounts, .. } = cli.command else {
+            panic!("expected create-multisig-tx command");
+        };
+        assert_eq!(to, vec![SAMPLE_P2PKH.to_string()]);
+        assert_eq!(amounts, vec![100u64]);
+    }
+
+    #[test]
+    fn create_tx_fee_and_fee_nicks_are_mutually_exclusive() {
+        let result = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "1", "--fee", "10",
+            "--fee-nicks", "1",
+        ]);
+        assert!(
+            result.is_err(),
+            "--fee and --fee-nicks must not be accepted together"
+        );
+    }
+
+    #[test]
+    fn create_tx_fee_is_nocks_and_fee_nicks_is_nicks() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "1", "--fee", "2",
+        ])
+        .expect("create-tx with --fee (nocks) should parse");
+        let Commands::CreateTx { fee, fee_nicks, .. } = cli.command else {
+            panic!("expected create-tx command");
+        };
+        assert_eq!(fee, Some(2u64));
+        assert_eq!(fee_nicks, None);
+
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--to", SAMPLE_P2PKH, "--amount", "1", "--fee-nicks",
+            "3",
+        ])
+        .expect("create-tx with --fee-nicks should parse");
+        let Commands::CreateTx { fee, fee_nicks, .. } = cli.command else {
+            panic!("expected create-tx command");
+        };
+        assert_eq!(fee, None);
+        assert_eq!(fee_nicks, Some(3u64));
+    }
+
+    #[test]
+    fn create_tx_accepts_bridge_deposit_pair() {
+        let evm = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "create-tx", "--bridge-deposit", "100000", "--to-evm-address", evm,
+        ])
+        .expect("create-tx with bridge-deposit pair should parse");
+        let Commands::CreateTx {
+            bridge_deposit,
+            to_evm_address,
+            ..
+        } = cli.command
+        else {
+            panic!("expected create-tx command");
+        };
+        assert_eq!(bridge_deposit, Some(100_000u64));
+        assert_eq!(to_evm_address, Some(evm.to_string()));
+    }
+
+    #[test]
+    fn create_tx_bridge_deposit_flags_require_each_other() {
+        // --bridge-deposit without --to-evm-address (and vice versa) is rejected
+        // by clap's `requires` relationship.
+        assert!(
+            WalletCli::try_parse_from([
+                "nockchain-wallet", "create-tx", "--bridge-deposit", "100000",
+            ])
+            .is_err(),
+            "--bridge-deposit alone must be rejected"
+        );
+        assert!(
+            WalletCli::try_parse_from([
+                "nockchain-wallet", "create-tx", "--to-evm-address",
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ])
+            .is_err(),
+            "--to-evm-address alone must be rejected"
+        );
+    }
+
+    #[test]
+    fn migrate_v0_notes_requires_destination() {
+        let cli = WalletCli::try_parse_from([
+            "nockchain-wallet", "migrate-v0-notes", "--destination", SAMPLE_P2PKH,
+        ])
+        .expect("migrate-v0-notes CLI should parse");
+
+        let Commands::MigrateV0Notes { destination } = cli.command else {
+            panic!("expected migrate-v0-notes command");
+        };
+
+        assert_eq!(destination, SAMPLE_P2PKH);
     }
 }

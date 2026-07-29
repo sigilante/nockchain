@@ -8,7 +8,7 @@ use nockapp::driver::{NockAppHandle, PokeResult};
 use nockapp::noun::slab::NounSlab;
 use nockapp::wire::WireRepr;
 use nockchain_types::tx_engine::v0;
-use nockvm::noun::SIG;
+use nockvm::noun::{NounAllocator, SIG};
 use noun_serde::{NounDecode, NounEncode};
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
@@ -161,7 +161,9 @@ impl PublicNockchainGrpcServer {
         let result = match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                match <Option<Option<(v0::BlockHeight, v0::Hash)>>>::from_noun(&result_noun) {
+                let space = result_slab.noun_space();
+                match <Option<Option<(v0::BlockHeight, v0::Hash)>>>::from_noun(&result_noun, &space)
+                {
                     Ok(opt) => Ok(opt.flatten()),
                     // Peek either returned [~ ~] or ~
                     Err(_) => Err(NockAppGrpcError::PeekReturnedNoData),
@@ -194,26 +196,26 @@ impl PublicNockchainGrpcServer {
                 tracing::debug!("refreshed heaviest chain");
                 let mut guard = self.heaviest_chain.write().await;
                 let new_height_value = height.0 .0;
-                let should_update = guard
-                    .as_ref()
-                    .map(|current| new_height_value >= current.height.0 .0)
-                    .unwrap_or(true);
-
-                if should_update {
-                    let snapshot = HeaviestChainSnapshot {
-                        height,
-                        block_id,
-                        fetched_at: Instant::now(),
-                    };
-                    *guard = Some(snapshot);
-                    self.metrics.heaviest_chain_age_seconds.swap(0.0);
-                } else if let Some(current) = guard.as_ref() {
-                    warn!(
-                        new_height = new_height_value,
-                        cached_height = current.height.0 .0,
-                        "Heaviest chain peek returned lower height than cache"
-                    );
+                // The peek reports the tip, and a reorg onto a chain with more
+                // accumulated work in fewer blocks lowers it. The snapshot must
+                // follow it down: it keys the balance cache, so pinning it to a
+                // height the chain no longer holds misses on every lookup.
+                if let Some(current) = guard.as_ref() {
+                    if new_height_value < current.height.0 .0 {
+                        warn!(
+                            new_height = new_height_value,
+                            cached_height = current.height.0 .0,
+                            "Heaviest chain tip moved down: reorg onto a shorter heavier chain"
+                        );
+                    }
                 }
+                let snapshot = HeaviestChainSnapshot {
+                    height,
+                    block_id,
+                    fetched_at: Instant::now(),
+                };
+                *guard = Some(snapshot);
+                self.metrics.heaviest_chain_age_seconds.swap(0.0);
             }
             None => {}
         }
@@ -413,7 +415,8 @@ impl NockchainService for PublicNockchainGrpcServer {
         match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                let result = <Option<Option<v0::BalanceUpdate>>>::from_noun(&result_noun);
+                let space = result_slab.noun_space();
+                let result = <Option<Option<v0::BalanceUpdate>>>::from_noun(&result_noun, &space);
 
                 match result {
                     Ok(update) => {
@@ -723,7 +726,8 @@ impl NockchainService for PublicNockchainGrpcServer {
         match peek_result {
             Ok(Some(result_slab)) => {
                 let result_noun = unsafe { result_slab.root() };
-                match <Option<Option<bool>>>::from_noun(&result_noun) {
+                let space = result_slab.noun_space();
+                match <Option<Option<bool>>>::from_noun(&result_noun, &space) {
                     Ok(opt) => {
                         let accepted = opt.flatten().unwrap_or(false);
                         timed_return(
@@ -812,8 +816,9 @@ mod tests {
             &self,
             path: NounSlab,
         ) -> std::result::Result<Option<NounSlab>, nockapp::nockapp::error::NockAppError> {
+            let space = path.noun_space();
             let root = unsafe { path.root() };
-            if let Ok(segments) = <Vec<String>>::from_noun(&root) {
+            if let Ok(segments) = <Vec<String>>::from_noun(&root, &space) {
                 if segments.first().map(String::as_str) == Some("heaviest-chain") {
                     let mut slab = NounSlab::new();
                     let noun = Some(Some((
@@ -842,7 +847,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn wallet_get_balance_uses_cache_for_subsequent_pages() {
         let (update, expected_names) = fixtures::make_balance_update(4);
         let handle = Arc::new(MockHandle::new(update));

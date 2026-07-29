@@ -6,9 +6,25 @@ use nockvm::mem::{AllocationError, NewStackError};
 
 #[tokio::main]
 async fn main() -> Result<(), Error> {
-    let mut cli = HoonCli::parse();
-    cli.boot.save_interval = None;
+    let cli = HoonCli::parse();
     boot::init_default_tracing(&cli.boot.clone());
+    if cli.parse_only_ast_jam {
+        let out_path = cli.output.clone().ok_or_else(|| {
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--parse-only-ast-jam requires --output",
+            )) as Error
+        })?;
+        let exported = export_parse_cache_ast_jam_if_missing(
+            cli.entry.clone(),
+            cli.directory.clone(),
+            out_path,
+            true,
+        )
+        .await?;
+        println!("parse-cache AST jam saved to {}", exported.display());
+        return Ok(());
+    }
     let result = std::panic::AssertUnwindSafe(async {
         let (mut nockapp, _) = initialize_hoonc(cli).await?;
         nockapp.run().await?;

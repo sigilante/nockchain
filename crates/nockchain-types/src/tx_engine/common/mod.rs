@@ -1,12 +1,14 @@
+pub mod page;
+
 use anyhow::Result;
-use ibig::{ubig, UBig};
 use nockchain_math::belt::{Belt, PRIME};
-use nockchain_math::crypto::cheetah::{CheetahError, CheetahPoint, P_BIG};
-use nockchain_math::noun_ext::NounMathExt;
-use nockchain_math::zoon::common::DefaultTipHasher;
-use nockchain_math::zoon::zmap;
-use nockvm::noun::{Noun, NounAllocator, D};
+use nockchain_math::crypto::cheetah::{ch_scal_big, CheetahError, CheetahPoint, A_GEN};
+use nockchain_math::noun_ext::NounMathExtHandle;
+use nockchain_math::zoon::zmap::ZMap;
+use nockvm::noun::{Noun, NounAllocator, NounSpace, D};
 use noun_serde::{NounDecode, NounDecodeError, NounEncode};
+use num_bigint::BigUint;
+pub use page::{BigNum, BlockId, CoinbaseSplit, Page, PageMsg};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, NounDecode, NounEncode)]
@@ -16,11 +18,16 @@ impl SchnorrPubkey {
     pub const BYTES_BASE58: usize = 132;
 
     pub fn to_base58(&self) -> Result<String, CheetahError> {
-        Ok(CheetahPoint::into_base58(&self.0)?)
+        CheetahPoint::into_base58(&self.0)
     }
 
     pub fn from_base58(b58: &str) -> Result<Self, CheetahError> {
         Ok(SchnorrPubkey(CheetahPoint::from_base58(b58)?))
+    }
+
+    pub fn from_secret_scalar_biguint(scalar: &BigUint) -> anyhow::Result<Self> {
+        let scalar = ibig::UBig::from_be_bytes(&scalar.to_bytes_be());
+        Ok(SchnorrPubkey(ch_scal_big(&scalar, &A_GEN)?))
     }
 }
 
@@ -35,32 +42,30 @@ pub struct Signature(pub Vec<(SchnorrPubkey, SchnorrSignature)>);
 
 impl NounEncode for Signature {
     fn to_noun<A: NounAllocator>(&self, stack: &mut A) -> Noun {
-        self.0.iter().fold(D(0), |map, (pubkey, sig)| {
-            let mut key = pubkey.to_noun(stack);
-            let mut value = sig.to_noun(stack);
-            zmap::z_map_put(stack, &map, &mut key, &mut value, &DefaultTipHasher)
-                .expect("z-map put for signature should not fail")
-        })
+        ZMap::try_from_entries(self.0.clone())
+            .expect("signature z-map should encode")
+            .to_noun(stack)
     }
 }
 
 impl NounDecode for Signature {
-    fn from_noun(noun: &Noun) -> Result<Self, NounDecodeError> {
-        if let Ok(atom) = noun.as_atom() {
+    fn from_noun(noun: &Noun, space: &NounSpace) -> Result<Self, NounDecodeError> {
+        if let Ok(atom) = noun.in_space(space).as_atom() {
             if atom.as_u64()? == 0 {
                 return Ok(Signature(Vec::new()));
             }
             return Err(NounDecodeError::Custom("signature node not a cell".into()));
         }
 
-        let entries = nockchain_math::structs::HoonMapIter::from(*noun)
-            .filter(|entry| entry.is_cell())
+        let entries = nockchain_math::structs::collect_zmap_entries_strict(&noun.in_space(space))
+            .map_err(|_| NounDecodeError::Custom("malformed signature z-map node".into()))?
+            .into_iter()
             .map(|entry| {
                 let [key, value] = entry
                     .uncell()
                     .map_err(|_| NounDecodeError::Custom("signature entry not a pair".into()))?;
-                let pubkey = SchnorrPubkey::from_noun(&key)?;
-                let signature = SchnorrSignature::from_noun(&value)?;
+                let pubkey = SchnorrPubkey::from_noun_handle(&key)?;
+                let signature = SchnorrSignature::from_noun_handle(&value)?;
                 Ok((pubkey, signature))
             })
             .collect::<Result<Vec<_>, NounDecodeError>>()?;
@@ -117,7 +122,7 @@ impl NounEncode for Version {
 }
 
 impl NounDecode for Version {
-    fn from_noun(noun: &Noun) -> Result<Self, NounDecodeError> {
+    fn from_noun(noun: &Noun, _space: &NounSpace) -> Result<Self, NounDecodeError> {
         match noun.as_atom()?.as_direct() {
             Ok(ver) if ver.data() == 0 => Ok(Version::V0),
             Ok(ver) if ver.data() == 1 => Ok(Version::V1),
@@ -139,6 +144,10 @@ pub enum HashDecodeError {
     ProvidedValueTooLarge,
     #[error("base58 decode error: {0}")]
     Base58(#[from] bs58::decode::Error),
+    #[error("expected {expected} bytes for tip5 hash, got {actual}")]
+    InvalidByteLength { expected: usize, actual: usize },
+    #[error("base58 string is not the canonical encoding of this tip5 hash")]
+    NonCanonical,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, NounDecode, NounEncode, Serialize, Deserialize)]
@@ -146,37 +155,162 @@ pub struct Hash(pub [Belt; 5]);
 
 impl Hash {
     pub fn to_base58(&self) -> String {
-        fn base_p_to_decimal<const N: usize>(belts: [Belt; N]) -> String {
-            let prime_ubig = UBig::from(PRIME);
-            let mut result = ubig!(0);
-
-            for (i, value) in belts.iter().enumerate() {
-                result += UBig::from(value.0) * prime_ubig.pow(i);
-            }
-
-            let bytes = result.to_be_bytes();
-            bs58::encode(bytes).into_string()
-        }
-
-        base_p_to_decimal(self.0)
+        bs58::encode(self.to_be_bytes()).into_string()
     }
 
     pub fn from_base58(s: &str) -> Result<Self, HashDecodeError> {
         let bytes = bs58::decode(s).into_vec()?;
-        let mut value = UBig::from_be_bytes(&bytes);
+        let mut value = BigUint::from_bytes_be(&bytes);
+        let prime = BigUint::from(PRIME);
         let mut belts = [Belt(0); 5];
-        for i in 0..5 {
-            belts[i] = Belt((value.clone() % PRIME) as u64);
-            value /= PRIME;
+        for belt in &mut belts {
+            let rem = &value % &prime;
+            let rem_u64: u64 = rem
+                .try_into()
+                .map_err(|_| HashDecodeError::ProvidedValueTooLarge)?;
+            *belt = Belt(rem_u64);
+            value /= &prime;
         }
-        if value > *P_BIG {
+        // A canonical tip5 hash occupies exactly five base-p limbs. Any nonzero
+        // remaining quotient means the value is out of the tip5 domain (e.g. a
+        // v0 pubkey) and must be rejected rather than silently truncated --
+        // truncation would let many distinct base58 strings alias one digest.
+        if value != BigUint::from(0u8) {
             return Err(HashDecodeError::ProvidedValueTooLarge);
         }
-        Ok(Hash(belts))
+        let hash = Hash(belts);
+        // Reject non-canonical spellings (e.g. leading-`1`/zero-byte padding)
+        // that decode to the same digest: require the exact canonical encoding.
+        if hash.to_base58() != s {
+            return Err(HashDecodeError::NonCanonical);
+        }
+        Ok(hash)
+    }
+
+    /// Decode a tip5 hash from a big-endian 32-byte value using base-p decomposition.
+    pub fn from_be_bytes(bytes: &[u8; 32]) -> Self {
+        let mut value = BigUint::from_bytes_be(bytes);
+        let prime = BigUint::from(PRIME);
+        let mut belts = [Belt(0); 5];
+        for belt in &mut belts {
+            let rem: u64 = (&value % &prime)
+                .try_into()
+                .expect("remainder must fit in u64");
+            *belt = Belt(rem);
+            value /= &prime;
+        }
+        Hash(belts)
+    }
+
+    /// Convert this tip5 hash to its atom representation (big integer).
+    /// This is the inverse of `from_be_bytes` for values that fit in 32 bytes.
+    /// Encodes limbs as a base-p number: a + b*p + c*p^2 + d*p^3 + e*p^4.
+    // TODO: Unify this implementation with the digest_to_atom jet.
+    pub fn to_atom(&self) -> BigUint {
+        let prime = BigUint::from(PRIME);
+        let mut result = BigUint::from(0u8);
+        let mut power = BigUint::from(1u8);
+        for belt in &self.0 {
+            result += BigUint::from(belt.0) * &power;
+            power *= &prime;
+        }
+        result
+    }
+
+    /// Convert this tip5 hash to big-endian bytes of its atom representation.
+    pub fn to_be_bytes(&self) -> Vec<u8> {
+        self.to_atom().to_bytes_be()
+    }
+
+    pub fn from_limbs(limbs: &[u64; 5]) -> Self {
+        Hash([Belt(limbs[0]), Belt(limbs[1]), Belt(limbs[2]), Belt(limbs[3]), Belt(limbs[4])])
+    }
+
+    pub fn to_be_limb_bytes(&self) -> [u8; 40] {
+        let limbs = self.to_array();
+        let mut out = [0u8; 40];
+        for (i, limb) in limbs.iter().enumerate() {
+            out[i * 8..(i + 1) * 8].copy_from_slice(&limb.to_be_bytes());
+        }
+        out
+    }
+
+    pub fn from_be_limb_bytes(bytes: &[u8]) -> Result<Self, HashDecodeError> {
+        if bytes.len() != 40 {
+            return Err(HashDecodeError::InvalidByteLength {
+                expected: 40,
+                actual: bytes.len(),
+            });
+        }
+        let mut limbs = [0u64; 5];
+        for (i, limb) in limbs.iter_mut().enumerate() {
+            let start = i * 8;
+            let chunk: [u8; 8] = bytes[start..start + 8].try_into().map_err(|_| {
+                HashDecodeError::InvalidByteLength {
+                    expected: 40,
+                    actual: bytes.len(),
+                }
+            })?;
+            *limb = u64::from_be_bytes(chunk);
+        }
+        Ok(Self::from_limbs(&limbs))
     }
 
     pub fn to_array(&self) -> [u64; 5] {
         [self.0[0].0, self.0[1].0, self.0[2].0, self.0[3].0, self.0[4].0]
+    }
+}
+
+/// Canonical wrapper for a v1 note first-name digest.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, NounDecode, NounEncode, Serialize, Deserialize)]
+pub struct FirstName(pub Hash);
+
+impl FirstName {
+    pub fn as_hash(&self) -> &Hash {
+        &self.0
+    }
+
+    pub fn into_hash(self) -> Hash {
+        self.0
+    }
+
+    pub fn to_base58(&self) -> String {
+        self.0.to_base58()
+    }
+
+    pub fn from_base58(s: &str) -> Result<Self, HashDecodeError> {
+        Ok(Self(Hash::from_base58(s)?))
+    }
+
+    pub fn to_array(&self) -> [u64; 5] {
+        self.0.to_array()
+    }
+}
+
+impl From<Hash> for FirstName {
+    fn from(value: Hash) -> Self {
+        Self(value)
+    }
+}
+
+impl From<FirstName> for Hash {
+    fn from(value: FirstName) -> Self {
+        value.0
+    }
+}
+
+/// Peek response for the heaviest block ID.
+/// Wraps `(unit (unit Hash))` - the Hoon peek response encoding.
+#[derive(Debug, Clone, PartialEq, Eq, NounDecode, NounEncode)]
+pub struct Heavy(pub Option<Option<Option<Hash>>>);
+
+impl Heavy {
+    /// Convert to Base58 string if the heavy block ID exists.
+    pub fn to_base58(&self) -> Option<String> {
+        match &self.0 {
+            Some(Some(Some(hash))) => Some(hash.to_base58()),
+            _ => None,
+        }
     }
 }
 
@@ -214,6 +348,161 @@ impl TimelockRangeAbsolute {
         Self {
             min: None,
             max: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nockchain_math::belt::{Belt, PRIME};
+    use num_bigint::BigUint;
+
+    use super::{Hash, HashDecodeError};
+
+    fn biguint_to_be_32(value: &BigUint) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        let bytes = value.to_bytes_be();
+        assert!(
+            bytes.len() <= 32,
+            "expected value that fits in 32 bytes, got {} bytes",
+            bytes.len()
+        );
+        out[32 - bytes.len()..].copy_from_slice(&bytes);
+        out
+    }
+
+    #[test]
+    fn tip5_be_limb_bytes_roundtrip() {
+        let hash = Hash([Belt(1), Belt(2), Belt(3), Belt(4), Belt(5)]);
+        let bytes = hash.to_be_limb_bytes();
+        let roundtrip = Hash::from_be_limb_bytes(&bytes).expect("valid be limb bytes");
+        assert_eq!(hash, roundtrip);
+    }
+
+    #[test]
+    fn tip5_be_limb_bytes_rejects_wrong_length() {
+        let bytes = vec![0u8; 39];
+        let err = Hash::from_be_limb_bytes(&bytes).expect_err("invalid length");
+        assert!(matches!(
+            err,
+            HashDecodeError::InvalidByteLength {
+                expected: 40,
+                actual: 39
+            }
+        ));
+    }
+
+    // Base58 tip5-hash decoding must be canonical, so distinct
+    // strings cannot alias the same five-limb digest.
+    #[test]
+    fn from_base58_rejects_non_canonical_leading_one() {
+        // A known-canonical hash, then the same string with an extra leading
+        // '1' (a leading zero byte): it decodes to the same digest but is not
+        // the canonical spelling, so it must be rejected rather than aliased.
+        let canonical = "3giXkwW4zbFhoyJu27RbP6VNiYgR6yaTfk2AYnEHvxtVaGbmcVD6jb9";
+        Hash::from_base58(canonical).expect("canonical hash decodes");
+        let padded = format!("1{canonical}");
+        assert!(
+            matches!(
+                Hash::from_base58(&padded),
+                Err(HashDecodeError::NonCanonical)
+            ),
+            "leading-'1'-padded base58 must be rejected as non-canonical"
+        );
+    }
+
+    #[test]
+    fn from_base58_rejects_out_of_domain_high_quotient() {
+        // p^5 needs a sixth base-p limb (out of the five-limb tip5 domain). The
+        // old `value > prime` check accepted it and truncated it to the all-zero
+        // digest -- an alias of the empty string. It must now be rejected.
+        let p5 = BigUint::from(PRIME).pow(5);
+        let s = bs58::encode(p5.to_bytes_be()).into_string();
+        assert!(
+            matches!(
+                Hash::from_base58(&s),
+                Err(HashDecodeError::ProvidedValueTooLarge)
+            ),
+            "a value with a nonzero high quotient must be rejected, not truncated"
+        );
+    }
+
+    #[test]
+    fn tip5_limbs_roundtrip() {
+        let test_cases = vec![
+            Hash([Belt(0), Belt(0), Belt(0), Belt(0), Belt(0)]),
+            Hash([Belt(1), Belt(0), Belt(0), Belt(0), Belt(0)]),
+            Hash([Belt(1), Belt(2), Belt(3), Belt(4), Belt(5)]),
+            Hash([Belt(100), Belt(200), Belt(300), Belt(400), Belt(500)]),
+            Hash([
+                Belt(PRIME - 1),
+                Belt(PRIME - 1),
+                Belt(PRIME - 1),
+                Belt(PRIME - 1),
+                Belt(PRIME - 1),
+            ]),
+        ];
+
+        for original in test_cases {
+            let limbs = original.to_array();
+            let reconstructed = Hash::from_limbs(&limbs);
+            assert_eq!(original, reconstructed, "hash should roundtrip exactly");
+        }
+    }
+
+    #[test]
+    fn tip5_from_be_bytes_known_vectors() {
+        let one = {
+            let mut bytes = [0u8; 32];
+            bytes[31] = 1;
+            bytes
+        };
+
+        // Bridge vector with explicit bytes and limbs.
+        //
+        // Calculation:
+        // n = 1 + 2*p + 3*p^2 + 4*p^3 + 1*p^4, where p = PRIME
+        // n (32-byte big-endian) =
+        // 0xfffffffc0000000dffffffe40000002dffffffce0000002cffffffe80000000b
+        let bridge_limbs = [1, 2, 3, 4, 1];
+        let bridge_bytes = [
+            0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x0d, 0xff, 0xff, 0xff, 0xe4, 0x00, 0x00,
+            0x00, 0x2d, 0xff, 0xff, 0xff, 0xce, 0x00, 0x00, 0x00, 0x2c, 0xff, 0xff, 0xff, 0xe8,
+            0x00, 0x00, 0x00, 0x0b,
+        ];
+
+        let prime = BigUint::from(PRIME);
+        let p2 = &prime * &prime;
+        let p3 = &p2 * &prime;
+        let p4 = &p3 * &prime;
+        let bridge_value = BigUint::from(1u64)
+            + BigUint::from(2u64) * &prime
+            + BigUint::from(3u64) * &p2
+            + BigUint::from(4u64) * &p3
+            + BigUint::from(1u64) * &p4;
+        assert_eq!(
+            biguint_to_be_32(&bridge_value),
+            bridge_bytes,
+            "bridge vector bytes should match documented base-p expansion",
+        );
+
+        let test_vectors: [([u8; 32], [u64; 5]); 2] =
+            [(one, [1, 0, 0, 0, 0]), (bridge_bytes, bridge_limbs)];
+
+        for (input, expected_limbs) in test_vectors {
+            let digest = Hash::from_be_bytes(&input);
+            assert_eq!(
+                digest.to_array(),
+                expected_limbs,
+                "unexpected base-p limbs for input bytes"
+            );
+
+            let atom = digest.to_atom();
+            assert_eq!(
+                biguint_to_be_32(&atom),
+                input,
+                "bytes -> tip5 -> atom should roundtrip back to the original 32 bytes"
+            );
         }
     }
 }

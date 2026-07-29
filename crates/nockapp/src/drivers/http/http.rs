@@ -11,7 +11,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::{serve, Router};
 use axum_server::tls_rustls::RustlsConfig;
-use nockvm::noun::{Atom, D, T};
+use nockvm::noun::{Atom, NounAllocator, D, T};
 use nockvm_macros::tas;
 use tokio::select;
 use tokio::sync::{oneshot, RwLock};
@@ -57,6 +57,8 @@ pub enum HttpError {
     AcmeError(#[from] anyhow::Error),
     #[error("Environment variable error: {0}")]
     EnvError(#[from] env::VarError),
+    #[error("Invalid HTTP_PORT value: {0}")]
+    InvalidPort(String),
     #[error("Noun processing error: {0}")]
     NounError(#[from] nockvm::noun::Error),
 }
@@ -133,6 +135,7 @@ impl CachedResponse {
         self.timestamp.elapsed() > max_age
     }
 
+    #[allow(clippy::result_large_err)]
     fn to_response(&self) -> Result<Response<Body>, HttpError> {
         let mut res = Response::builder().status(self.status);
         for (k, v) in &self.headers {
@@ -178,6 +181,11 @@ pub fn http() -> IODriverFn {
         let domain = env::var("HTTPS_DOMAIN").unwrap_or_else(|_| "localhost".to_string());
         // Directory to serve static files from
         let web_dir = env::var("WEB_DIR").ok();
+        // Port to bind to in local mode (production uses the standard 80/443).
+        let local_port = match env::var("HTTP_PORT") {
+            Ok(s) => s.parse::<u16>().map_err(|_| HttpError::InvalidPort(s))?,
+            Err(_) => 8080,
+        };
 
         // Check if we're running locally
         let is_local = domain == "localhost"
@@ -265,8 +273,8 @@ pub fn http() -> IODriverFn {
         };
 
         if is_local {
-            // Local development: just run HTTP on port 8080
-            let http_listener = tokio::net::TcpListener::bind("127.0.0.1:8080")
+            // Local development: run HTTP on 127.0.0.1, port from HTTP_PORT (default 8080)
+            let http_listener = tokio::net::TcpListener::bind(("127.0.0.1", local_port))
                 .await
                 .map_err(HttpError::BindError)?;
             let http_addr = http_listener
@@ -300,7 +308,8 @@ pub fn http() -> IODriverFn {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
             // Start certificate generation in background - don't block main loop
-            let acme_manager = acme_manager_opt.unwrap();
+            let acme_manager =
+                acme_manager_opt.expect("acme_manager should be set when https is enabled");
             let app_for_https = app.clone();
             tokio::spawn(async move {
                 match tokio::time::timeout(
@@ -315,15 +324,24 @@ pub fn http() -> IODriverFn {
 
                         match tokio::net::TcpListener::bind("0.0.0.0:443").await {
                             Ok(https_listener) => {
-                                let https_addr = https_listener.local_addr().unwrap();
+                                let https_addr = https_listener
+                                    .local_addr()
+                                    .expect("listener should have local addr");
                                 info!("HTTPS server listening on {}", https_addr);
-                                let std_listener = https_listener.into_std().unwrap();
-                                if let Err(e) =
-                                    axum_server::from_tcp_rustls(std_listener, rustls_config)
-                                        .serve(app_for_https.into_make_service())
-                                        .await
-                                {
-                                    error!("HTTPS server error: {}", e);
+                                let std_listener = https_listener
+                                    .into_std()
+                                    .expect("listener should convert to std");
+                                match axum_server::from_tcp_rustls(std_listener, rustls_config) {
+                                    Ok(server) => {
+                                        if let Err(e) =
+                                            server.serve(app_for_https.into_make_service()).await
+                                        {
+                                            error!("HTTPS server error: {}", e);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to create HTTPS server: {}", e);
+                                    }
                                 }
                             }
                             Err(e) => {
@@ -514,69 +532,105 @@ pub fn http() -> IODriverFn {
                                 return Ok(());
                             }
                         };
-                        let effect = unsafe { slab.root() };
-                        let res_list = effect.as_cell()?;
-
-                        let head_tag = res_list.head().as_atom()?;
-                        let tag_val = head_tag.as_u64().map_err(|e| HttpError::AtomCreationError(e.to_string()))?;
-                        if tag_val != tas!(b"res") && tag_val != tas!(b"cache") && tag_val != tas!(b"htmx") && tag_val != tas!(b"h-cache") {
-                            debug!("http: not an HTTP response effect, skipping. Got tag: {:?}", head_tag);
-                            return Ok(());
+                        struct ParsedEffect {
+                            tag_val: u64,
+                            id: u64,
+                            status_code: u64,
+                            headers: Vec<(String, String)>,
+                            body: Option<Bytes>,
                         }
 
-                        debug!("processing HTTP response effect");
-                        let mut res = res_list.tail().as_cell()?;
-                        let id = res.head().as_atom()?.as_u64()
-                            .map_err(|e| HttpError::AtomCreationError(e.to_string()))?;
-                        debug!("HTTP response for request id: {}", id);
+                        let parsed = (|| -> Result<Option<ParsedEffect>, HttpError> {
+                            let effect = unsafe { slab.root() };
+                            let space = slab.noun_space();
+                            let res_list = effect.in_space(&space).as_cell()?;
 
-                        res = res.tail().as_cell()?;
-                        let status_code = res
-                            .head()
-                            .as_atom()?
-                            .direct()
-                            .expect("not a valid status code!")
-                            .data();
-                        debug!("HTTP response status code: {}", status_code);
+                            let head_tag = res_list.head().as_atom()?;
+                            let tag_val = head_tag
+                                .as_u64()
+                                .map_err(|e| HttpError::AtomCreationError(e.to_string()))?;
+                            if tag_val != tas!(b"res")
+                                && tag_val != tas!(b"cache")
+                                && tag_val != tas!(b"htmx")
+                                && tag_val != tas!(b"h-cache")
+                            {
+                                debug!(
+                                    "http: not an HTTP response effect, skipping. Got tag: {:?}",
+                                    head_tag.atom()
+                                );
+                                return Ok(None);
+                            }
 
-                        let mut header_list = res.tail().as_cell()?.head();
-                        let mut header_vec: Vec<(String, String)> = Vec::new();
-                        loop {
-                            if header_list.is_atom() {
-                                break;
-                            } else {
-                                let header = header_list.as_cell()?.head().as_cell()?;
-                                let key_vec = header.head().as_atom()?;
-                                let val_vec = header.tail().as_atom()?;
+                            debug!("processing HTTP response effect");
+                            let mut res = res_list.tail().as_cell()?;
+                            let id = res
+                                .head()
+                                .as_atom()?
+                                .as_u64()
+                                .map_err(|e| HttpError::AtomCreationError(e.to_string()))?;
+                            debug!("HTTP response for request id: {}", id);
 
-                                if let Ok(key) = key_vec.to_bytes_until_nul() {
-                                    if let Ok(val) = val_vec.to_bytes_until_nul() {
-                                        let key_str = String::from_utf8(key)?;
-                                        let val_str = String::from_utf8(val)?;
-                                        debug!("HTTP response header: {}: {}", key_str, val_str);
-                                        header_vec.push((key_str, val_str));
-                                        header_list = header_list.as_cell()?.tail();
+                            res = res.tail().as_cell()?;
+                            let status_code = res
+                                .head()
+                                .as_atom()?
+                                .atom()
+                                .as_direct()
+                                .expect("not a valid status code!")
+                                .data();
+                            debug!("HTTP response status code: {}", status_code);
+
+                            let mut header_list = res.tail().as_cell()?.head().noun();
+                            let mut headers: Vec<(String, String)> = Vec::new();
+                            loop {
+                                if header_list.is_atom() {
+                                    break;
+                                } else {
+                                    let header = header_list
+                                        .in_space(&space)
+                                        .as_cell()?
+                                        .head()
+                                        .as_cell()?;
+                                    let key_vec = header.head().as_atom()?;
+                                    let val_vec = header.tail().as_atom()?;
+
+                                    if let Ok(key) = key_vec.to_bytes_until_nul() {
+                                        if let Ok(val) = val_vec.to_bytes_until_nul() {
+                                            let key_str = String::from_utf8(key)?;
+                                            let val_str = String::from_utf8(val)?;
+                                            debug!(
+                                                "HTTP response header: {}: {}",
+                                                key_str, val_str
+                                            );
+                                            headers.push((key_str, val_str));
+                                            header_list =
+                                                header_list.in_space(&space).as_cell()?.tail().noun();
+                                        } else {
+                                            break;
+                                        }
                                     } else {
                                         break;
                                     }
-                                } else {
-                                    break;
                                 }
                             }
-                        }
 
-                        let maybe_body = res.tail().as_cell()?.tail();
+                            let maybe_body = res.tail().as_cell()?.tail().noun();
 
-                        let body: Option<Bytes> = {
-                            if maybe_body.is_cell() {
-                                let body_octs = maybe_body.as_cell()?.tail().as_cell()?;
+                            let body: Option<Bytes> = if maybe_body.is_cell() {
+                                let body_octs = maybe_body
+                                    .in_space(&space)
+                                    .as_cell()?
+                                    .tail()
+                                    .as_cell()?;
                                 let body_len = body_octs
                                     .head()
                                     .as_atom()?
-                                    .direct()
+                                    .atom()
+                                    .as_direct()
                                     .expect("body len")
                                     .data();
-                                let len: usize = body_len.try_into().map_err(|_| HttpError::BodyLengthConversion)?;
+                                let len: usize =
+                                    body_len.try_into().map_err(|_| HttpError::BodyLengthConversion)?;
                                 let mut body_vec: Vec<u8> = vec![0; len];
                                 let body_atom = body_octs.tail().as_atom()?;
 
@@ -592,7 +646,9 @@ pub fn http() -> IODriverFn {
                                     }
                                 };
 
-                                body_vec.copy_from_slice(&body_bytes[..std::cmp::min(body_bytes.len(), len)]);
+                                body_vec.copy_from_slice(
+                                    &body_bytes[..std::cmp::min(body_bytes.len(), len)],
+                                );
                                 let bytes = Bytes::from(body_vec);
 
                                 // Log the response body as string if possible, using lossy conversion
@@ -606,8 +662,28 @@ pub fn http() -> IODriverFn {
                             } else {
                                 debug!("HTTP response has no body");
                                 None
-                            }
+                            };
+
+                            Ok(Some(ParsedEffect {
+                                tag_val,
+                                id,
+                                status_code,
+                                headers,
+                                body,
+                            }))
+                        })();
+
+                        let Some(parsed) = parsed? else {
+                            return Ok(());
                         };
+
+                        let ParsedEffect {
+                            tag_val,
+                            id,
+                            status_code,
+                            headers: header_vec,
+                            body,
+                        } = parsed;
 
                         let resp = if let Ok(status) = StatusCode::from_u16(status_code as u16) {
                             debug!("Building HTTP response with status: {}", status);
@@ -646,7 +722,6 @@ pub fn http() -> IODriverFn {
                             Ok(response)
                         } else {
                             error!("http: not a valid status code: {}", status_code);
-                            error!("http: res: {:?}", res);
                             Err(StatusCode::INTERNAL_SERVER_ERROR)
                         };
 
@@ -778,5 +853,5 @@ async fn favicon_handler() -> Response {
         .header("content-type", "image/svg+xml")
         .header("cache-control", "public, max-age=86400")
         .body(Body::from(svg))
-        .unwrap()
+        .expect("static response should build successfully")
 }

@@ -1,6 +1,19 @@
+// Allow architectural patterns
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::needless_borrow)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::redundant_closure)]
+#![allow(clippy::or_fun_call)]
+#![allow(clippy::explicit_counter_loop)]
+#![allow(clippy::vec_init_then_push)]
+#![allow(clippy::unwrap_or_default)]
+
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, io};
 
 use anyhow::{anyhow, Result};
@@ -16,10 +29,15 @@ use crossterm::terminal::{
 };
 use nockapp_grpc_proto::pb::common::v1::{self as pb_common, Base58Hash, PageRequest};
 use nockapp_grpc_proto::pb::public::v2::nockchain_block_service_client::NockchainBlockServiceClient;
+use nockapp_grpc_proto::pb::public::v2::nockchain_metrics_service_client::NockchainMetricsServiceClient;
 use nockapp_grpc_proto::pb::public::v2::{
-    get_blocks_response, get_transaction_block_response, get_transaction_details_response,
-    BlockEntry, GetBlocksRequest, GetTransactionBlockRequest, GetTransactionDetailsRequest,
-    TransactionBlockData, TransactionDetails as RpcTransactionDetails,
+    get_block_details_request, get_block_details_response, get_blocks_response,
+    get_explorer_metrics_response, get_peer_stats_response, get_transaction_block_response,
+    get_transaction_details_response, transaction_details, transaction_output, BlockDetails,
+    BlockEntry, ExplorerMetrics, GetBlockDetailsRequest, GetBlocksRequest,
+    GetExplorerMetricsRequest, GetPeerStatsRequest, GetTransactionBlockRequest,
+    GetTransactionDetailsRequest, PeerReqResGeneration as RpcPeerReqResGeneration, PeerStat,
+    PeerStatsData, TransactionBlockData, TransactionDetails as RpcTransactionDetails,
 };
 use nockchain_math::belt::Belt;
 use nockchain_types::tx_engine::common::Hash as Tip5Hash;
@@ -27,12 +45,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::{Frame, Terminal};
+use rustls::crypto::aws_lc_rs;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tonic::Request;
-use tracing::{info, warn};
+use tracing::{info, trace, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing_tracy::TracyLayer;
@@ -55,6 +74,8 @@ enum View {
     BlocksList,
     TransactionsList,
     WalletsList,
+    Nous,
+    Metrics,
     BlockDetails(usize), // index in blocks list
     TransactionDetails { block_idx: usize, tx_idx: usize },
     TransactionSearch,
@@ -70,11 +91,20 @@ enum ConnectionStatus {
 }
 
 const PAGE_JUMP: usize = 20;
-const AUTO_REFRESH_IDLE_GRACE: Duration = Duration::from_secs(3);
 const EMPTY_CACHE_BACKOFF: Duration = Duration::from_secs(30);
 const ERROR_REFRESH_BACKOFF: Duration = Duration::from_secs(5);
 const WALLET_INDEX_CHUNK: usize = 64;
 const NICKS_PER_NOCK: u64 = 65_536;
+const NOUS_BAR_WIDTH: usize = 16;
+const SPINNER_FRAMES: [&str; 4] = ["◴", "◷", "◶", "◵"];
+const SPINNER_COLORS: [Color; 6] = [
+    Color::Red,
+    Color::Yellow,
+    Color::Green,
+    Color::Cyan,
+    Color::Blue,
+    Color::Magenta,
+];
 
 struct App {
     client: Option<NockchainBlockServiceClient<tonic::transport::Channel>>,
@@ -91,7 +121,6 @@ struct App {
     clear_status_on_input: bool,
     last_refresh: Instant,
     next_allowed_refresh: Instant,
-    auto_refresh_enabled: bool,
     tx_search_input: String,
     tx_search_result: Option<TxSearchResult>,
     server_uri: String,
@@ -115,17 +144,41 @@ struct App {
     wallet_index_highest_synced: u64,
     clipboard: Option<Clipboard>,
     block_focus: BlockDetailsFocus,
+    full_block_details: HashMap<u64, BlockDetails>,
+    loading_block_details: Option<u64>,
+    metrics_client: Option<NockchainMetricsServiceClient<tonic::transport::Channel>>,
+    metrics_data: Option<ExplorerMetrics>,
+    metrics_error: Option<String>,
+    peer_stats_data: Option<PeerStatsData>,
+    peer_stats_error: Option<String>,
+    peer_list_state: ListState,
+    compare_peer_anchor: Option<String>,
     last_user_action: Instant,
     help_scroll: u16,
     help_max_scroll: u16,
     active_tab: usize,
+    busy: bool,
+    spinner_index: usize,
+    shutdown_flag: Arc<AtomicBool>,
 
     // Connection state
     connection_status: ConnectionStatus,
     last_successful_connection: Option<Instant>,
     last_connection_attempt: Instant,
     last_connection_error: Option<String>,
+    #[allow(dead_code)]
     fail_fast: bool,
+
+    // Prefetch state - background loading of block details to avoid loading screens
+    prefetch_queue: VecDeque<u64>,
+    prefetch_in_progress: bool,
+
+    // Priority prefetch queue - for blocks user navigates to (processed first)
+    priority_prefetch_queue: VecDeque<u64>,
+    // Deferred page load request (non-blocking)
+    request_next_page: bool,
+    // Whether scroll-triggered preloading is enabled (env var EXPLORER_SCROLL_PRELOAD)
+    scroll_preload_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +313,8 @@ impl App {
                     (None, ConnectionStatus::NeverConnected, Some(e.to_string()))
                 }
             };
+        let metrics_client =
+            (NockchainMetricsServiceClient::connect(server_uri.clone()).await).ok();
 
         let (wallet_cmd_tx, wallet_cmd_rx) = mpsc::unbounded_channel();
         let (wallet_res_tx, wallet_res_rx) = mpsc::unbounded_channel();
@@ -283,7 +338,6 @@ impl App {
             clear_status_on_input: false,
             last_refresh: Instant::now(),
             next_allowed_refresh: Instant::now(),
-            auto_refresh_enabled: true,
             tx_search_input: String::new(),
             tx_search_result: None,
             server_uri,
@@ -307,10 +361,22 @@ impl App {
             wallet_index_highest_synced: 0,
             clipboard: Clipboard::new().ok(),
             block_focus: BlockDetailsFocus::Block,
+            full_block_details: HashMap::new(),
+            loading_block_details: None,
+            metrics_client,
+            metrics_data: None,
+            metrics_error: None,
+            peer_stats_data: None,
+            peer_stats_error: None,
+            peer_list_state: ListState::default(),
+            compare_peer_anchor: None,
             last_user_action: Instant::now(),
             help_scroll: 0,
             help_max_scroll: 0,
             active_tab: 0,
+            busy: false,
+            spinner_index: 0,
+            shutdown_flag: Arc::new(AtomicBool::new(false)),
 
             // Connection state
             connection_status,
@@ -322,11 +388,22 @@ impl App {
             last_connection_attempt: Instant::now(),
             last_connection_error: connection_error,
             fail_fast,
+
+            // Prefetch state
+            prefetch_queue: VecDeque::new(),
+            prefetch_in_progress: false,
+
+            // Priority prefetch queue
+            priority_prefetch_queue: VecDeque::new(),
+            request_next_page: false,
+            // Scroll-triggered preloading is opt-in via env var
+            scroll_preload_enabled: env::var("EXPLORER_SCROLL_PRELOAD").is_ok(),
         };
 
         // Only try to load blocks if connected
         if app.connection_status == ConnectionStatus::Connected {
             let _ = app.load_blocks(None).await; // Don't fail if this errors
+            let _ = app.load_peer_stats().await;
         }
 
         Ok(app)
@@ -337,6 +414,8 @@ impl App {
             View::BlocksList | View::BlockDetails(_) => 0,
             View::TransactionsList | View::TransactionDetails { .. } | View::TransactionSearch => 1,
             View::WalletsList => 2,
+            View::Nous => 3,
+            View::Metrics => 4,
             View::Help => self.active_tab,
         };
         self.active_tab = tab;
@@ -344,7 +423,7 @@ impl App {
     }
 
     fn activate_tab(&mut self, tab: usize) {
-        match tab % 3 {
+        match tab % 5 {
             0 => self.set_view(View::BlocksList),
             1 => {
                 self.set_view(View::TransactionsList);
@@ -361,12 +440,18 @@ impl App {
                     self.clear_status_on_input = true;
                 }
             }
+            3 => {
+                self.set_view(View::Nous);
+            }
+            4 => {
+                self.set_view(View::Metrics);
+            }
             _ => {}
         }
     }
 
     fn cycle_tabs(&mut self, delta: i32) {
-        let total_tabs = 3;
+        let total_tabs = 5;
         let idx = (self.active_tab as i32 + delta).rem_euclid(total_tabs as i32) as usize;
         self.activate_tab(idx);
     }
@@ -458,6 +543,97 @@ impl App {
         Ok(())
     }
 
+    #[tracing::instrument(name = "tui.block_explorer.load_metrics", skip(self))]
+    async fn load_metrics(&mut self) -> Result<()> {
+        // Ensure we have a metrics client
+        if self.metrics_client.is_none() {
+            match NockchainMetricsServiceClient::connect(self.server_uri.clone()).await {
+                Ok(client) => self.metrics_client = Some(client),
+                Err(e) => {
+                    self.metrics_error = Some(format!("Metrics connect error: {}", e));
+                    return Ok(());
+                }
+            }
+        }
+
+        let Some(ref mut client) = self.metrics_client else {
+            return Ok(());
+        };
+
+        match client
+            .get_explorer_metrics(Request::new(GetExplorerMetricsRequest {}))
+            .await
+        {
+            Ok(response) => {
+                let resp = response.into_inner();
+                match resp.result {
+                    Some(get_explorer_metrics_response::Result::Metrics(metrics)) => {
+                        self.metrics_data = Some(metrics);
+                        self.metrics_error = None;
+                    }
+                    Some(get_explorer_metrics_response::Result::Error(e)) => {
+                        self.metrics_error = Some(format!("Metrics error: {}", e.message));
+                    }
+                    None => {
+                        self.metrics_error = Some("Empty metrics response".into());
+                    }
+                }
+            }
+            Err(e) => {
+                self.metrics_error = Some(format!("Metrics gRPC error: {}", e));
+                self.metrics_client = None;
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(name = "tui.block_explorer.load_peer_stats", skip(self))]
+    async fn load_peer_stats(&mut self) -> Result<()> {
+        if self.metrics_client.is_none() {
+            match NockchainMetricsServiceClient::connect(self.server_uri.clone()).await {
+                Ok(client) => self.metrics_client = Some(client),
+                Err(e) => {
+                    self.peer_stats_error = Some(format!("Peer stats connect error: {}", e));
+                    return Ok(());
+                }
+            }
+        }
+
+        let Some(ref mut client) = self.metrics_client else {
+            return Ok(());
+        };
+
+        match client
+            .get_peer_stats(Request::new(GetPeerStatsRequest {}))
+            .await
+        {
+            Ok(response) => {
+                let resp = response.into_inner();
+                match resp.result {
+                    Some(get_peer_stats_response::Result::Stats(stats)) => {
+                        self.peer_stats_data = Some(stats);
+                        self.peer_stats_error = None;
+                        self.sync_peer_selection();
+                        self.clear_missing_peer_compare_anchor();
+                    }
+                    Some(get_peer_stats_response::Result::Error(e)) => {
+                        self.peer_stats_error = Some(format!("Peer stats error: {}", e.message));
+                    }
+                    None => {
+                        self.peer_stats_error = Some("Empty peer stats response".into());
+                    }
+                }
+            }
+            Err(e) => {
+                self.peer_stats_error = Some(format!("Peer stats gRPC error: {}", e));
+                self.metrics_client = None;
+            }
+        }
+
+        Ok(())
+    }
+
     #[tracing::instrument(name = "tui.block_explorer.load_next_page", skip(self))]
     async fn load_next_page(&mut self) -> Result<()> {
         if let Some(token) = self.next_page_token.clone() {
@@ -471,6 +647,60 @@ impl App {
         self.load_blocks(None).await
     }
 
+    #[tracing::instrument(
+        name = "tui.block_explorer.load_full_block_details",
+        skip(self),
+        fields(height = tracing::field::Empty)
+    )]
+    async fn load_full_block_details(&mut self, height: u64) -> Result<()> {
+        tracing::Span::current().record("height", &tracing::field::display(height));
+
+        if self.full_block_details.contains_key(&height) {
+            return Ok(());
+        }
+
+        let Some(ref mut client) = self.client else {
+            return Err(anyhow!("Not connected to server"));
+        };
+
+        self.loading_block_details = Some(height);
+
+        let request = GetBlockDetailsRequest {
+            selector: Some(get_block_details_request::Selector::Height(height)),
+        };
+
+        match client.get_block_details(Request::new(request)).await {
+            Ok(response) => {
+                if self.connection_status != ConnectionStatus::Connected {
+                    self.connection_status = ConnectionStatus::Connected;
+                    self.last_successful_connection = Some(Instant::now());
+                }
+
+                let resp = response.into_inner();
+                match resp.result {
+                    Some(get_block_details_response::Result::Details(details)) => {
+                        self.full_block_details.insert(height, details);
+                    }
+                    Some(get_block_details_response::Result::Error(e)) => {
+                        self.error_message = Some(format!("Error: {}", e.message));
+                    }
+                    None => {
+                        self.error_message = Some("No response from server".into());
+                    }
+                }
+            }
+            Err(e) => {
+                crash_happy_check(&format!("load_full_block_details(height={})", height), &e);
+                self.connection_status = ConnectionStatus::Disconnected;
+                self.last_connection_error = Some(e.to_string());
+                self.error_message = Some(format!("gRPC Error: {}", e));
+            }
+        }
+
+        self.loading_block_details = None;
+        Ok(())
+    }
+
     #[tracing::instrument(name = "tui.block_explorer.attempt_reconnect", skip(self))]
     async fn attempt_reconnect(&mut self) -> Result<()> {
         self.last_connection_attempt = Instant::now();
@@ -479,14 +709,19 @@ impl App {
         match NockchainBlockServiceClient::connect(self.server_uri.clone()).await {
             Ok(client) => {
                 self.client = Some(client);
+                self.metrics_client =
+                    NockchainMetricsServiceClient::connect(self.server_uri.clone())
+                        .await
+                        .ok();
                 self.connection_status = ConnectionStatus::Connected;
                 self.last_successful_connection = Some(Instant::now());
                 self.last_connection_error = None;
                 self.status_message = Some("Connected to server!".into());
-                info!("Reconnected to server at {}", self.server_uri);
+                trace!("Reconnected to server at {}", self.server_uri);
 
                 // Try to load initial blocks
                 let _ = self.load_blocks(None).await;
+                let _ = self.load_peer_stats().await;
                 Ok(())
             }
             Err(e) => {
@@ -617,6 +852,7 @@ impl App {
                 self.set_transaction_overview_selection(block_idx, tx_idx);
             }
             Err(e) => {
+                crash_happy_check(&format!("open_transaction_detail(tx_id={})", tx_id), &e);
                 // Mark as disconnected on error
                 self.connection_status = ConnectionStatus::Disconnected;
                 self.last_connection_error = Some(e.to_string());
@@ -716,6 +952,49 @@ impl App {
         }
         self.sync_tx_list_selection();
         self.rebuild_transactions_list();
+        self.queue_prefetch_visible_blocks();
+    }
+
+    /// Queue visible blocks for background prefetch of full block details.
+    /// This eliminates loading screens when navigating to block details.
+    /// Only active when EXPLORER_SCROLL_PRELOAD env var is set.
+    fn queue_prefetch_visible_blocks(&mut self) {
+        if !self.scroll_preload_enabled {
+            return;
+        }
+        // Queue first 15 blocks for prefetch (approximately what fits on screen)
+        for block in self.blocks.iter().take(15) {
+            if !self.full_block_details.contains_key(&block.height)
+                && !self.prefetch_queue.contains(&block.height)
+            {
+                self.prefetch_queue.push_back(block.height);
+            }
+        }
+    }
+
+    /// Queue adjacent blocks for predictive prefetching when navigating BlockDetails.
+    /// Only active when EXPLORER_SCROLL_PRELOAD env var is set.
+    fn queue_adjacent_prefetch(&mut self, current_idx: usize) {
+        if !self.scroll_preload_enabled {
+            return;
+        }
+        // Prefetch next 2 and previous 2 blocks for smooth navigation
+        for offset in [1i32, 2, -1, -2] {
+            let adj_idx = if offset < 0 {
+                current_idx.checked_sub(offset.unsigned_abs() as usize)
+            } else {
+                Some(current_idx + offset as usize)
+            };
+            if let Some(idx) = adj_idx {
+                if let Some(block) = self.blocks.get(idx) {
+                    if !self.full_block_details.contains_key(&block.height)
+                        && !self.priority_prefetch_queue.contains(&block.height)
+                    {
+                        self.priority_prefetch_queue.push_back(block.height);
+                    }
+                }
+            }
+        }
     }
 
     fn update_pagination_tokens(&mut self) {
@@ -1217,26 +1496,6 @@ impl App {
         }
     }
 
-    fn viewing_tip(&self) -> bool {
-        if self.blocks.is_empty() {
-            true
-        } else {
-            self.list_state
-                .selected()
-                .map(|idx| idx == 0)
-                .unwrap_or(true)
-        }
-    }
-
-    fn should_auto_refresh_blocks(&self, interval: Duration) -> bool {
-        self.auto_refresh_enabled
-            && Instant::now() >= self.next_allowed_refresh
-            && matches!(self.view, View::BlocksList)
-            && self.viewing_tip()
-            && self.last_refresh.elapsed() >= interval
-            && self.can_auto_refresh(AUTO_REFRESH_IDLE_GRACE)
-    }
-
     fn is_at_bottom(&self) -> bool {
         match self.list_state.selected() {
             Some(idx) if !self.blocks.is_empty() => idx == self.blocks.len() - 1,
@@ -1245,7 +1504,7 @@ impl App {
     }
 
     fn should_auto_fetch_more(&self) -> bool {
-        self.has_more_pages && !self.loading && self.is_at_bottom()
+        self.scroll_preload_enabled && self.has_more_pages && !self.loading && self.is_at_bottom()
     }
 
     fn page_down(&mut self) -> Option<usize> {
@@ -1277,6 +1536,108 @@ impl App {
         self.list_state
             .selected()
             .and_then(|idx| self.blocks.get(idx))
+    }
+
+    fn current_peer_rows(&self) -> Vec<PeerStat> {
+        sorted_peer_stats(
+            self.peer_stats_data
+                .as_ref()
+                .map(|stats| stats.peers.as_slice())
+                .unwrap_or(&[]),
+        )
+    }
+
+    fn sync_peer_selection(&mut self) {
+        let len = self.current_peer_rows().len();
+        if len == 0 {
+            self.peer_list_state.select(None);
+            return;
+        }
+
+        let next = self
+            .peer_list_state
+            .selected()
+            .unwrap_or(0)
+            .min(len.saturating_sub(1));
+        self.peer_list_state.select(Some(next));
+    }
+
+    fn clear_missing_peer_compare_anchor(&mut self) {
+        let Some(anchor) = self.compare_peer_anchor.as_ref() else {
+            return;
+        };
+        if !self
+            .current_peer_rows()
+            .iter()
+            .any(|peer| &peer.peer_id == anchor)
+        {
+            self.compare_peer_anchor = None;
+        }
+    }
+
+    fn selected_peer(&self) -> Option<PeerStat> {
+        let peers = self.current_peer_rows();
+        let idx = self.peer_list_state.selected()?;
+        peers.get(idx).cloned()
+    }
+
+    fn move_peer_selection(&mut self, delta: i32) {
+        let len = self.current_peer_rows().len();
+        if len == 0 {
+            self.peer_list_state.select(None);
+            return;
+        }
+        let current = self.peer_list_state.selected().unwrap_or(0) as i32;
+        let new_idx = (current + delta).clamp(0, (len - 1) as i32) as usize;
+        self.peer_list_state.select(Some(new_idx));
+    }
+
+    fn page_peer_selection(&mut self, delta: i32) {
+        let len = self.current_peer_rows().len();
+        if len == 0 {
+            self.peer_list_state.select(None);
+            return;
+        }
+        let jump = PAGE_JUMP.min(len.saturating_sub(1)) as i32;
+        let current = self.peer_list_state.selected().unwrap_or(0) as i32;
+        let new_idx = (current + delta * jump).clamp(0, (len - 1) as i32) as usize;
+        self.peer_list_state.select(Some(new_idx));
+    }
+
+    fn select_first_peer(&mut self) {
+        if self.current_peer_rows().is_empty() {
+            self.peer_list_state.select(None);
+        } else {
+            self.peer_list_state.select(Some(0));
+        }
+    }
+
+    fn select_last_peer(&mut self) {
+        let len = self.current_peer_rows().len();
+        if len == 0 {
+            self.peer_list_state.select(None);
+        } else {
+            self.peer_list_state.select(Some(len - 1));
+        }
+    }
+
+    fn toggle_peer_compare_anchor(&mut self) {
+        let Some(selected) = self.selected_peer() else {
+            return;
+        };
+
+        if self.compare_peer_anchor.as_deref() == Some(selected.peer_id.as_str()) {
+            self.compare_peer_anchor = None;
+            self.status_message = Some("Cleared pinned comparison peer".into());
+        } else {
+            self.compare_peer_anchor = Some(selected.peer_id.clone());
+            self.status_message = Some(format!(
+                "Pinned {} for side-by-side comparison",
+                short_hash_str(&selected.peer_id)
+            ));
+        }
+        self.clear_status_on_input = true;
+        self.error_message = None;
     }
 
     fn selected_tx_index(&self) -> Option<usize> {
@@ -1316,6 +1677,16 @@ impl App {
 
     fn copy_tx_id(&mut self, tx_id: &str) {
         self.copy_text_to_clipboard(tx_id, "Copied transaction id to clipboard");
+    }
+
+    fn copy_selected_peer_id(&mut self) {
+        let Some(peer) = self.selected_peer() else {
+            self.error_message = Some("No peer selected".into());
+            self.status_message = None;
+            self.clear_status_on_input = false;
+            return;
+        };
+        self.copy_text_to_clipboard(&peer.peer_id, "Copied peer id to clipboard");
     }
 
     fn copy_selected_block_id(&mut self) {
@@ -1416,6 +1787,23 @@ impl App {
         self.last_user_action = Instant::now();
     }
 
+    fn start_busy(&mut self) {
+        self.busy = true;
+        self.spinner_index = 0;
+    }
+
+    fn stop_busy(&mut self) {
+        self.busy = false;
+    }
+
+    fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_flag.store(true, AtomicOrdering::Release);
+    }
+
     fn record_refresh(&mut self) {
         let now = Instant::now();
         self.last_refresh = now;
@@ -1426,9 +1814,6 @@ impl App {
         self.next_allowed_refresh = Instant::now() + delay;
     }
 
-    fn can_auto_refresh(&self, interval: Duration) -> bool {
-        self.last_user_action.elapsed() >= interval
-    }
     fn open_help(&mut self) {
         if !matches!(self.view, View::Help) {
             self.previous_view = Some(self.view.clone());
@@ -1465,6 +1850,8 @@ fn ui(f: &mut Frame, app: &mut App) {
         View::BlocksList => render_blocks_list(f, chunks[2], app),
         View::TransactionsList => render_transactions_list(f, chunks[2], app),
         View::WalletsList => render_wallets_list(f, chunks[2], app),
+        View::Nous => render_nous_view(f, chunks[2], app),
+        View::Metrics => render_metrics_view(f, chunks[2], app),
         View::BlockDetails(idx) => render_block_details(f, chunks[2], app, *idx),
         View::TransactionDetails { block_idx, tx_idx } => {
             render_transaction_details(f, chunks[2], app, *block_idx, *tx_idx)
@@ -1533,7 +1920,7 @@ fn render_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let titles = ["Blocks", "Transactions", "Wallets"]
+    let titles = ["Blocks", "Transactions", "Wallets", "Nous", "Metrics"]
         .iter()
         .map(|title| Line::from(Span::styled(*title, Style::default().fg(Color::Cyan))))
         .collect::<Vec<_>>();
@@ -1715,8 +2102,351 @@ fn render_wallets_list(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_stateful_widget(list, chunks[1], &mut app.wallet_list_state);
 }
 
+fn render_metrics_view(f: &mut Frame, area: Rect, app: &mut App) {
+    let mut lines = Vec::new();
+    if let Some(metrics) = &app.metrics_data {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Cache height: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(metrics.cache_height.to_string()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Cache lowest height: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(metrics.cache_lowest_height.to_string()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Cache span: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(metrics.cache_span.to_string()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Coverage ratio: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{:.3}", metrics.cache_coverage_ratio)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Heaviest height: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(metrics.heaviest_height.to_string()),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Seed ready: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if metrics.seed_ready { "yes" } else { "no" }),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Backfill resume height: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if metrics.backfill_resume_height >= 0 {
+                metrics.backfill_resume_height.to_string()
+            } else {
+                "none".to_string()
+            }),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Cache age (s): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{:.3}", metrics.cache_age_seconds)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Last refresh age (s): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{:.3}", metrics.refresh_age_seconds)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Last backfill age (s): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(if metrics.backfill_age_seconds >= 0.0 {
+                format!("{:.3}", metrics.backfill_age_seconds)
+            } else {
+                "n/a".to_string()
+            }),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Seed time (s): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!("{:.3}", metrics.seed_time_seconds)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Refresh counts (ok/err): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}/{}",
+                metrics.refresh_success_count, metrics.refresh_error_count
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Backfill counts (ok/err): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}/{}",
+                metrics.backfill_success_count, metrics.backfill_error_count
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "GetBlocks latency p50/p90/p99 (ms): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{:.3}/{:.3}/{:.3}",
+                metrics.get_blocks_p50_ms, metrics.get_blocks_p90_ms, metrics.get_blocks_p99_ms
+            )),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled(
+                "BlockDetails latency p50/p90/p99 (ms): ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{:.3}/{:.3}/{:.3}",
+                metrics.get_block_details_p50_ms,
+                metrics.get_block_details_p90_ms,
+                metrics.get_block_details_p99_ms
+            )),
+        ]));
+    } else if let Some(err) = &app.metrics_error {
+        lines.push(Line::from(Span::styled(
+            format!("Metrics unavailable: {}", err),
+            Style::default().fg(Color::Red),
+        )));
+    } else {
+        lines.push(Line::from("Metrics not loaded yet"));
+    }
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Explorer Metrics")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(paragraph, area);
+}
+
+fn render_nous_view(f: &mut Frame, area: Rect, app: &mut App) {
+    app.sync_peer_selection();
+    let peers = app.current_peer_rows();
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(0)])
+        .split(area);
+
+    let summary = Paragraph::new(build_nous_summary_lines(
+        app.peer_stats_data.as_ref(),
+        &peers,
+    ))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Nous Summary")
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .wrap(Wrap { trim: false });
+    f.render_widget(summary, layout[0]);
+
+    if let Some(err) = &app.peer_stats_error {
+        let paragraph = Paragraph::new(vec![Line::from(Span::styled(
+            format!("Peer stats unavailable: {}", err),
+            Style::default().fg(Color::Red),
+        ))])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Nous Peers")
+                .border_style(Style::default().fg(Color::Red)),
+        )
+        .wrap(Wrap { trim: false });
+        f.render_widget(paragraph, layout[1]);
+        return;
+    }
+
+    if app.peer_stats_data.is_none() {
+        let paragraph = Paragraph::new(vec![Line::from(Span::styled(
+            "Loading peer stats…",
+            Style::default().fg(Color::Yellow),
+        ))])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Nous Peers")
+                .border_style(Style::default().fg(Color::Yellow)),
+        );
+        f.render_widget(paragraph, layout[1]);
+        return;
+    }
+
+    if peers.is_empty() {
+        let paragraph = Paragraph::new(vec![
+            Line::from(Span::styled(
+                "No connected peers have been observed yet.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Press `r` to refresh after peers connect."),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Nous Peers")
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .wrap(Wrap { trim: false });
+        f.render_widget(paragraph, layout[1]);
+        return;
+    }
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(layout[1]);
+
+    render_nous_peer_list(f, body[0], app, &peers);
+    render_nous_detail_panel(f, body[1], app, &peers);
+}
+
+fn render_nous_peer_list(f: &mut Frame, area: Rect, app: &mut App, peers: &[PeerStat]) {
+    let items: Vec<ListItem> = peers
+        .iter()
+        .map(|peer| {
+            let generation = peer_generation_label(peer.protocol_generation);
+            let total_bytes = peer_total_bytes(peer);
+            let anchor = if app.compare_peer_anchor.as_deref() == Some(peer.peer_id.as_str()) {
+                "pin"
+            } else {
+                "   "
+            };
+            let header = Line::from(vec![
+                Span::styled(format!("[{}]", anchor), Style::default().fg(Color::Magenta)),
+                Span::raw(" "),
+                Span::styled(
+                    format!("{:<4}", generation),
+                    generation_style(peer.protocol_generation),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    short_hash_str(&peer.peer_id),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::raw("  up "),
+                Span::styled(
+                    format_duration(Duration::from_secs(peer.connection_duration_seconds)),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]);
+            let stats = Line::from(vec![
+                Span::styled(
+                    format!("req {:>4}", peer.request_count),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    format_bytes(total_bytes),
+                    Style::default().fg(Color::LightBlue),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    format!("{:.1} ms", peer.average_round_trip_ms),
+                    Style::default().fg(Color::White),
+                ),
+            ]);
+            ListItem::new(vec![header, stats])
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            "Peers ({}) [Enter pin | c copy | r refresh]",
+            peers.len()
+        )))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+    f.render_stateful_widget(list, area, &mut app.peer_list_state);
+}
+
+fn render_nous_detail_panel(f: &mut Frame, area: Rect, app: &mut App, peers: &[PeerStat]) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(0)])
+        .split(area);
+
+    let selected_idx = app.peer_list_state.selected().unwrap_or(0);
+    let Some(selected) = peers.get(selected_idx) else {
+        return;
+    };
+    let comparison = comparison_peer(peers, selected, app.compare_peer_anchor.as_deref());
+
+    let detail = Paragraph::new(build_selected_peer_lines(selected))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Selected Peer")
+                .border_style(generation_style(selected.protocol_generation)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(detail, layout[0]);
+
+    let comparison_title = if app.compare_peer_anchor.is_some() {
+        "Side-by-Side Comparison (pinned)"
+    } else {
+        "Side-by-Side Comparison"
+    };
+    let comparison_lines = match comparison {
+        Some(other) => build_peer_comparison_lines(selected, other),
+        None => vec![
+            Line::from(Span::styled(
+                "Select or pin another peer to compare side-by-side.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(
+                "When a pinned peer is not set, the TUI auto-picks the busiest peer from the opposite generation.",
+            ),
+        ],
+    };
+    let comparison_paragraph = Paragraph::new(comparison_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(comparison_title)
+                .border_style(Style::default().fg(Color::Yellow)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(comparison_paragraph, layout[1]);
+}
+
 fn render_block_details(f: &mut Frame, area: Rect, app: &mut App, idx: usize) {
-    let block = match app.blocks.get(idx) {
+    let block = match app.blocks.get(idx).cloned() {
         Some(b) => b,
         None => {
             let text = Paragraph::new("Block not found").block(
@@ -1729,71 +2459,335 @@ fn render_block_details(f: &mut Frame, area: Rect, app: &mut App, idx: usize) {
         }
     };
 
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("Height: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(block.height.to_string()),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Block ID: ",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(Span::styled(
-            hash_full_display(&block.block_id),
-            Style::default().fg(Color::Green),
-        )),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "Parent ID: ",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(Span::styled(
-            hash_full_display(&block.parent),
-            Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Timestamp: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format_timestamp(block.timestamp)),
-        ]),
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            format!("Transactions ({}): ", block.tx_ids.len()),
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(""),
-    ];
+    let full_details = app.full_block_details.get(&block.height).cloned();
+    let loading_details = app.loading_block_details == Some(block.height);
+    let block_focus = app.block_focus;
 
-    if block.tx_ids.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no transactions)",
-            Style::default().fg(Color::DarkGray),
-        )));
-        let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title("Block Details (ESC to go back)"),
-            )
-            .wrap(Wrap { trim: false });
-        f.render_widget(paragraph, area);
-        return;
+    // Split into left (block info) and right (transactions) panes
+    // Block details get 75%, transactions get 25%
+    let main_layout = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
+        .split(area);
+
+    // Left pane: Block details
+    render_block_info_pane(
+        f,
+        main_layout[0],
+        &block,
+        full_details.as_ref(),
+        loading_details,
+        block_focus,
+    );
+
+    // Right pane: Transactions list
+    render_block_transactions_pane(f, main_layout[1], &block, app);
+}
+
+fn render_block_info_pane(
+    f: &mut Frame,
+    area: Rect,
+    block: &BlockEntry,
+    full_details: Option<&BlockDetails>,
+    loading: bool,
+    block_focus: BlockDetailsFocus,
+) {
+    let label_style = Style::default()
+        .add_modifier(Modifier::BOLD)
+        .fg(Color::Cyan);
+    let value_style = Style::default().fg(Color::White);
+    let hash_style = Style::default().fg(Color::Green);
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let accent_style = Style::default().fg(Color::Yellow);
+
+    let mut lines = Vec::new();
+
+    // Header section
+    lines.push(Line::from(vec![Span::styled(
+        "═══ IDENTITY ═══",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(""));
+
+    // Height and Version
+    let version_str = if let Some(details) = full_details {
+        format!("v{}", details.version)
+    } else {
+        "".to_string()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("  Height      ", label_style),
+        Span::styled(
+            format!("{}", block.height),
+            accent_style.add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            version_str,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    // Block ID
+    lines.push(Line::from(vec![Span::styled(
+        "  Block ID    ", label_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(hash_full_display(&block.block_id), hash_style),
+    ]));
+
+    // Parent ID
+    lines.push(Line::from(vec![Span::styled(
+        "  Parent      ", label_style,
+    )]));
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(hash_full_display(&block.parent), dim_style),
+    ]));
+
+    lines.push(Line::from(""));
+
+    // Consensus section
+    lines.push(Line::from(vec![Span::styled(
+        "═══ CONSENSUS ═══",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(""));
+
+    // Timestamp
+    lines.push(Line::from(vec![
+        Span::styled("  Timestamp   ", label_style),
+        Span::styled(format_timestamp(block.timestamp), value_style),
+    ]));
+
+    if let Some(details) = full_details {
+        // Epoch Counter
+        lines.push(Line::from(vec![
+            Span::styled("  Epoch       ", label_style),
+            Span::styled(format!("{}", details.epoch_counter), value_style),
+        ]));
+
+        // Proof of Work
+        let pow_display = if details.has_pow {
+            "✓ Present"
+        } else {
+            "✗ Missing"
+        };
+        let pow_color = if details.has_pow {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  PoW         ", label_style),
+            Span::styled(pow_display, Style::default().fg(pow_color)),
+        ]));
+
+        // Target
+        if let Some(ref target) = details.target {
+            lines.push(Line::from(vec![Span::styled(
+                "  Target      ", label_style,
+            )]));
+            let target_display = truncate_bignum_display(&target.display, 40);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(target_display, dim_style),
+            ]));
+        }
+
+        // Accumulated Work
+        if let Some(ref work) = details.accumulated_work {
+            lines.push(Line::from(vec![Span::styled(
+                "  Acc. Work   ", label_style,
+            )]));
+            let work_display = truncate_bignum_display(&work.display, 40);
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(work_display, dim_style),
+            ]));
+        }
+    } else if loading {
+        lines.push(Line::from(vec![
+            Span::styled("  ", dim_style),
+            Span::styled("Loading details...", Style::default().fg(Color::Yellow)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  ", dim_style),
+            Span::styled("(press Enter to load full details)", dim_style),
+        ]));
     }
 
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(lines.len() as u16), Constraint::Min(5)])
-        .split(area);
+    lines.push(Line::from(""));
+
+    // Content section
+    lines.push(Line::from(vec![Span::styled(
+        "═══ CONTENT ═══",
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(""));
+
+    // Transaction count
+    lines.push(Line::from(vec![
+        Span::styled("  Tx Count    ", label_style),
+        Span::styled(format!("{}", block.tx_ids.len()), accent_style),
+    ]));
+
+    // Raw page size (prefer raw_page_bytes, fall back to msg.raw.len())
+    if let Some(details) = full_details {
+        let raw_size = observed_raw_page_bytes(details);
+        lines.push(Line::from(vec![
+            Span::styled("  Raw Size    ", label_style),
+            Span::styled(format_bytes(raw_size), accent_style),
+        ]));
+    }
+
+    // Coinbase section (if we have full details)
+    if let Some(details) = full_details {
+        if let Some(ref coinbase) = details.coinbase {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![Span::styled(
+                "  Coinbase Rewards:", label_style,
+            )]));
+            render_coinbase_lines(&mut lines, coinbase);
+        }
+
+        // Message (if present)
+        if let Some(ref msg) = details.msg {
+            if !msg.decoded.is_empty() || !msg.raw.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![Span::styled(
+                    "  Message     ", label_style,
+                )]));
+                let msg_text = if !msg.decoded.is_empty() {
+                    msg.decoded.clone()
+                } else if !msg.raw.is_empty() {
+                    format!("(raw {} bytes)", msg.raw.len())
+                } else {
+                    "(empty)".to_string()
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(msg_text, dim_style),
+                ]));
+            }
+        }
+    }
+
+    let is_focused = block_focus == BlockDetailsFocus::Block;
+    let border_style = if is_focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Block Details (ESC to go back)"),
+                .border_style(border_style)
+                .title(Span::styled(
+                    " Block Details ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
         )
         .wrap(Wrap { trim: false });
-    f.render_widget(paragraph, layout[0]);
+    f.render_widget(paragraph, area);
+}
+
+fn render_coinbase_lines(
+    lines: &mut Vec<Line>,
+    coinbase: &nockapp_grpc_proto::pb::public::v2::CoinbaseSplit,
+) {
+    use nockapp_grpc_proto::pb::public::v2::coinbase_split::Version;
+    let dim_style = Style::default().fg(Color::DarkGray);
+    let value_style = Style::default().fg(Color::Green);
+
+    match &coinbase.version {
+        Some(Version::V0(v0)) => {
+            if v0.entry_count > 0 {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(format!("{} recipient(s) ", v0.entry_count), value_style),
+                    Span::styled(v0.note.clone(), dim_style),
+                ]));
+            } else if !v0.note.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(v0.note.clone(), dim_style),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("(v0 legacy format)", dim_style),
+                ]));
+            }
+        }
+        Some(Version::V1(v1)) => {
+            if v1.entries.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("(no entries)", dim_style),
+                ]));
+            } else {
+                for entry in &v1.entries {
+                    let lock_hash = entry
+                        .lock_hash
+                        .as_ref()
+                        .map(|h| truncate_str(&h.hash, 16))
+                        .unwrap_or_else(|| "???".to_string());
+                    let amount = entry
+                        .amount
+                        .as_ref()
+                        .map(|a| format_nicks(a.value))
+                        .unwrap_or_else(|| "0".to_string());
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(lock_hash, dim_style),
+                        Span::raw(" → "),
+                        Span::styled(amount, value_style),
+                    ]));
+                }
+            }
+        }
+        None => {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("(unknown format)", dim_style),
+            ]));
+        }
+    }
+}
+
+fn render_block_transactions_pane(f: &mut Frame, area: Rect, block: &BlockEntry, app: &mut App) {
+    if block.tx_ids.is_empty() {
+        let text = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  No transactions in this block",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ])
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Transactions "),
+        );
+        f.render_widget(text, area);
+        return;
+    }
 
     let tx_items: Vec<ListItem> = block
         .tx_ids
@@ -1802,28 +2796,71 @@ fn render_block_details(f: &mut Frame, area: Rect, app: &mut App, idx: usize) {
         .map(|(i, tx)| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("[{:3}] ", i + 1),
+                    format!(" {:3} ", i + 1),
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(&tx.hash, Style::default().fg(Color::Cyan)),
+                Span::styled(truncate_str(&tx.hash, 44), Style::default().fg(Color::Cyan)),
             ]))
         })
         .collect();
 
-    let title = match app.block_focus {
-        BlockDetailsFocus::Transactions => "Transactions (Enter to inspect, c copies tx id)",
-        BlockDetailsFocus::Block => "Transactions (Tab to focus, Enter opens details)",
+    let is_focused = app.block_focus == BlockDetailsFocus::Transactions;
+    let border_style = if is_focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+
+    let title = if is_focused {
+        format!(
+            " Transactions ({}) [Enter: details, c: copy] ",
+            block.tx_ids.len()
+        )
+    } else {
+        format!(" Transactions ({}) [Tab to focus] ", block.tx_ids.len())
     };
 
     let list = List::new(tx_items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(border_style)
+                .title(Span::styled(
+                    title,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )),
+        )
         .highlight_style(
             Style::default()
                 .bg(Color::DarkGray)
+                .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol(">> ");
-    f.render_stateful_widget(list, layout[1], &mut app.tx_list_state);
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, area, &mut app.tx_list_state);
+}
+
+fn truncate_bignum_display(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max_len.saturating_sub(3)])
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max_len.saturating_sub(1)])
+    }
+}
+
+fn format_nicks(nicks: u64) -> String {
+    let nock = nicks as f64 / NICKS_PER_NOCK as f64;
+    format!("{} NOCK", format_nock_value(nock))
 }
 
 fn render_transaction_details(
@@ -1967,14 +3004,39 @@ fn build_tx_header_lines(
         Span::raw("  Size: "),
         Span::raw(format!("{} bytes", format_number(details.size_bytes))),
     ]));
+    // Totals section - multi-line format
+    lines.push(Line::from(Span::styled(
+        "Totals:",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
     lines.push(Line::from(vec![
-        Span::styled("Totals: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(format!(
-            "in {} | out {} | fee {}",
-            format_amount(details.total_input.as_ref()),
-            format_amount(details.total_output.as_ref()),
-            format_amount(details.fee.as_ref())
-        )),
+        Span::raw("  in:        "),
+        Span::raw(format_amount(details.total_input.as_ref())),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  total out: "),
+        Span::raw(format_amount(get_total_output_nicks(
+            &details.total_output_required,
+        ))),
+    ]));
+    // Calculate net sent = total_out - fee
+    let total_out_nicks = get_total_output_nicks(&details.total_output_required)
+        .map(|n| n.value)
+        .unwrap_or(0);
+    let fee_nicks = get_fee_nicks(&details.fee_required)
+        .map(|n| n.value)
+        .unwrap_or(0);
+    let net_sent_nicks = total_out_nicks.saturating_sub(fee_nicks);
+    let net_sent = pb_common::Nicks {
+        value: net_sent_nicks,
+    };
+    lines.push(Line::from(vec![
+        Span::raw("  net sent:  "),
+        Span::raw(format_amount(Some(&net_sent))),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  fee:       "),
+        Span::raw(format_amount(get_fee_nicks(&details.fee_required))),
     ]));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -2089,7 +3151,10 @@ fn build_tx_output_lines(details: &RpcTransactionDetails) -> Vec<Line<'static>> 
                     Style::default().fg(Color::DarkGray),
                 ),
                 Span::styled(
-                    format!("{} ", format_amount(output.amount.as_ref())),
+                    format!(
+                        "{} ",
+                        format_amount(get_output_amount_nicks(&output.amount_required))
+                    ),
                     Style::default().fg(Color::LightGreen),
                 ),
                 Span::styled(
@@ -2168,6 +3233,34 @@ fn format_amount(amount: Option<&pb_common::Nicks>) -> String {
     )
 }
 
+/// Extract Nicks from total_output oneof wrapper
+fn get_total_output_nicks(
+    oneof: &Option<transaction_details::TotalOutputRequired>,
+) -> Option<&pb_common::Nicks> {
+    match oneof {
+        Some(transaction_details::TotalOutputRequired::TotalOutput(nicks)) => Some(nicks),
+        None => None,
+    }
+}
+
+/// Extract Nicks from fee oneof wrapper
+fn get_fee_nicks(oneof: &Option<transaction_details::FeeRequired>) -> Option<&pb_common::Nicks> {
+    match oneof {
+        Some(transaction_details::FeeRequired::Fee(nicks)) => Some(nicks),
+        None => None,
+    }
+}
+
+/// Extract Nicks from output amount oneof wrapper
+fn get_output_amount_nicks(
+    oneof: &Option<transaction_output::AmountRequired>,
+) -> Option<&pb_common::Nicks> {
+    match oneof {
+        Some(transaction_output::AmountRequired::Amount(nicks)) => Some(nicks),
+        None => None,
+    }
+}
+
 fn format_wallet_nocks(value: u64) -> String {
     let nock = value as f64 / NICKS_PER_NOCK as f64;
     format!("{} nock", format_nock_value(nock))
@@ -2190,6 +3283,487 @@ fn short_hash_str(text: &str) -> String {
     } else {
         format!("{}...{}", &text[..8], &text[text.len() - 6..])
     }
+}
+
+fn peer_generation(value: i32) -> RpcPeerReqResGeneration {
+    RpcPeerReqResGeneration::try_from(value).unwrap_or(RpcPeerReqResGeneration::Unspecified)
+}
+
+fn peer_generation_label(value: i32) -> &'static str {
+    match peer_generation(value) {
+        RpcPeerReqResGeneration::Gen1 => "gen1",
+        RpcPeerReqResGeneration::Gen2 => "gen2",
+        RpcPeerReqResGeneration::Unspecified => "unk",
+    }
+}
+
+fn generation_style(value: i32) -> Style {
+    match peer_generation(value) {
+        RpcPeerReqResGeneration::Gen1 => Style::default().fg(Color::LightRed),
+        RpcPeerReqResGeneration::Gen2 => Style::default().fg(Color::LightGreen),
+        RpcPeerReqResGeneration::Unspecified => Style::default().fg(Color::DarkGray),
+    }
+}
+
+fn peer_total_bytes(peer: &PeerStat) -> u64 {
+    peer.bytes_sent.saturating_add(peer.bytes_received)
+}
+
+fn peer_request_rate(peer: &PeerStat) -> f64 {
+    if peer.connection_duration_seconds == 0 {
+        0.0
+    } else {
+        peer.request_count as f64 / peer.connection_duration_seconds as f64
+    }
+}
+
+fn peer_throughput_kib_per_sec(peer: &PeerStat) -> f64 {
+    if peer.connection_duration_seconds == 0 {
+        0.0
+    } else {
+        peer_total_bytes(peer) as f64 / 1024.0 / peer.connection_duration_seconds as f64
+    }
+}
+
+fn peer_block_rate(peer: &PeerStat) -> f64 {
+    if peer.connection_duration_seconds == 0 {
+        0.0
+    } else {
+        peer.blocks_received as f64 / peer.connection_duration_seconds as f64
+    }
+}
+
+fn sorted_peer_stats(peers: &[PeerStat]) -> Vec<PeerStat> {
+    let mut rows = peers.to_vec();
+    rows.sort_by(|left, right| {
+        peer_generation_rank(left.protocol_generation)
+            .cmp(&peer_generation_rank(right.protocol_generation))
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| peer_total_bytes(right).cmp(&peer_total_bytes(left)))
+            .then_with(|| left.peer_id.cmp(&right.peer_id))
+    });
+    rows
+}
+
+fn peer_generation_rank(value: i32) -> u8 {
+    match peer_generation(value) {
+        RpcPeerReqResGeneration::Gen2 => 0,
+        RpcPeerReqResGeneration::Gen1 => 1,
+        RpcPeerReqResGeneration::Unspecified => 2,
+    }
+}
+
+fn build_nous_summary_lines(
+    snapshot: Option<&PeerStatsData>,
+    peers: &[PeerStat],
+) -> Vec<Line<'static>> {
+    let gen2_count = peers
+        .iter()
+        .filter(|peer| peer_generation(peer.protocol_generation) == RpcPeerReqResGeneration::Gen2)
+        .count();
+    let gen1_count = peers
+        .iter()
+        .filter(|peer| peer_generation(peer.protocol_generation) == RpcPeerReqResGeneration::Gen1)
+        .count();
+    let snapshot_age = snapshot
+        .and_then(|stats| snapshot_age_seconds(stats.collected_at_unix_ms))
+        .map(|age| format!("snapshot {}s ago", age))
+        .unwrap_or_else(|| "snapshot pending".to_string());
+
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            format!("Peers: {}", peers.len()),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("gen2 {}", gen2_count),
+            Style::default().fg(Color::LightGreen),
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!("gen1 {}", gen1_count),
+            Style::default().fg(Color::LightRed),
+        ),
+        Span::raw(" | "),
+        Span::styled(snapshot_age, Style::default().fg(Color::Yellow)),
+    ])];
+
+    if let Some(gen2_req_rate) =
+        cohort_average_metric(peers, RpcPeerReqResGeneration::Gen2, peer_request_rate)
+    {
+        if let Some(gen1_req_rate) =
+            cohort_average_metric(peers, RpcPeerReqResGeneration::Gen1, peer_request_rate)
+        {
+            let gen2_rtt = cohort_average_metric(peers, RpcPeerReqResGeneration::Gen2, |peer| {
+                peer.average_round_trip_ms
+            })
+            .unwrap_or(0.0);
+            let gen1_rtt = cohort_average_metric(peers, RpcPeerReqResGeneration::Gen1, |peer| {
+                peer.average_round_trip_ms
+            })
+            .unwrap_or(0.0);
+            let gen2_batch = cohort_average_metric(peers, RpcPeerReqResGeneration::Gen2, |peer| {
+                peer.average_batch_size
+            })
+            .unwrap_or(0.0);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "Speedup: gen2 {:.2}x req/s vs gen1",
+                        speedup_ratio(gen2_req_rate, gen1_req_rate)
+                    ),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    format!("RTT {:.1}ms vs {:.1}ms", gen2_rtt, gen1_rtt),
+                    Style::default().fg(Color::White),
+                ),
+                Span::raw(" | "),
+                Span::styled(
+                    format!("avg batch {:.2}", gen2_batch),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        } else {
+            lines.push(Line::from(
+                "Waiting for at least one gen1 peer to compute mixed-generation speedup.",
+            ));
+        }
+    } else {
+        lines.push(Line::from(
+            "Waiting for at least one gen2 peer to compute mixed-generation speedup.",
+        ));
+    }
+
+    lines
+}
+
+fn build_selected_peer_lines(peer: &PeerStat) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled("Peer: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(peer.peer_id.clone(), Style::default().fg(Color::Green)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Generation: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                peer_generation_label(peer.protocol_generation),
+                generation_style(peer.protocol_generation).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | "),
+            Span::styled("Connected: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format_duration(Duration::from_secs(peer.connection_duration_seconds)),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Requests: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ({:.2}/s)", peer.request_count, peer_request_rate(peer)),
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::raw(" | "),
+            Span::styled(
+                "Throughput: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:.2} KiB/s", peer_throughput_kib_per_sec(peer)),
+                Style::default().fg(Color::LightBlue),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("IO: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format_bytes(peer_total_bytes(peer)),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" | "),
+            Span::styled("RTT: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:.1} ms", peer.average_round_trip_ms),
+                Style::default().fg(Color::White),
+            ),
+            Span::raw(" | "),
+            Span::styled("Batch: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:.2}", peer.average_batch_size),
+                Style::default().fg(Color::Magenta),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Failures: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                peer.failure_count.to_string(),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw(" | "),
+            Span::styled("Timeouts: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                peer.timeout_count.to_string(),
+                Style::default().fg(Color::LightRed),
+            ),
+            Span::raw(" | "),
+            Span::styled("Blocks: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ({:.3}/s)", peer.blocks_received, peer_block_rate(peer)),
+                Style::default().fg(Color::LightGreen),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Propagation: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:.2} ms", peer.average_block_propagation_ms),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ]
+}
+
+fn build_peer_comparison_lines(selected: &PeerStat, other: &PeerStat) -> Vec<Line<'static>> {
+    vec![
+        Line::from(vec![
+            Span::styled(
+                "L ",
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} ({})",
+                    short_hash_str(&selected.peer_id),
+                    peer_generation_label(selected.protocol_generation)
+                ),
+                Style::default().fg(Color::Green),
+            ),
+            Span::raw(" | "),
+            Span::styled(
+                "R ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} ({})",
+                    short_hash_str(&other.peer_id),
+                    peer_generation_label(other.protocol_generation)
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+        Line::from(""),
+        metric_comparison_line(
+            "Req/s",
+            peer_request_rate(selected),
+            peer_request_rate(other),
+            false,
+        ),
+        metric_comparison_line(
+            "KiB/s",
+            peer_throughput_kib_per_sec(selected),
+            peer_throughput_kib_per_sec(other),
+            false,
+        ),
+        metric_comparison_line(
+            "RTT ms", selected.average_round_trip_ms, other.average_round_trip_ms, true,
+        ),
+        metric_comparison_line(
+            "Batch", selected.average_batch_size, other.average_batch_size, false,
+        ),
+        metric_comparison_line(
+            "Blk/s",
+            peer_block_rate(selected),
+            peer_block_rate(other),
+            false,
+        ),
+        metric_comparison_line(
+            "Prop ms", selected.average_block_propagation_ms, other.average_block_propagation_ms,
+            true,
+        ),
+    ]
+}
+
+fn metric_comparison_line(
+    label: &str,
+    left_value: f64,
+    right_value: f64,
+    lower_is_better: bool,
+) -> Line<'static> {
+    let max_value = left_value.max(right_value).max(1.0);
+    let left_better = if lower_is_better {
+        left_value < right_value
+    } else {
+        left_value > right_value
+    };
+    let right_better = if lower_is_better {
+        right_value < left_value
+    } else {
+        right_value > left_value
+    };
+    let left_style = if left_better {
+        Style::default().fg(Color::LightGreen)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    let right_style = if right_better {
+        Style::default().fg(Color::LightGreen)
+    } else {
+        Style::default().fg(Color::White)
+    };
+
+    Line::from(vec![
+        Span::styled(
+            format!("{:<7}", label),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                "{:>7.2} {}",
+                left_value,
+                metric_bar(left_value, max_value, NOUS_BAR_WIDTH)
+            ),
+            left_style,
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            format!(
+                "{:>7.2} {}",
+                right_value,
+                metric_bar(right_value, max_value, NOUS_BAR_WIDTH)
+            ),
+            right_style,
+        ),
+        Span::raw(" | "),
+        Span::styled(
+            comparison_delta_text(left_value, right_value, lower_is_better),
+            Style::default().fg(Color::Magenta),
+        ),
+    ])
+}
+
+fn metric_bar(value: f64, max_value: f64, width: usize) -> String {
+    let ratio = if max_value <= f64::EPSILON {
+        0.0
+    } else {
+        (value / max_value).clamp(0.0, 1.0)
+    };
+    let filled = ((ratio * width as f64).round() as usize).min(width);
+    format!("{}{}", "█".repeat(filled), "·".repeat(width - filled))
+}
+
+fn comparison_delta_text(left_value: f64, right_value: f64, lower_is_better: bool) -> String {
+    if (left_value - right_value).abs() < f64::EPSILON {
+        return "even".to_string();
+    }
+
+    let (winner, winner_value, loser_value) = if lower_is_better {
+        if left_value < right_value {
+            ("L", left_value, right_value)
+        } else {
+            ("R", right_value, left_value)
+        }
+    } else if left_value > right_value {
+        ("L", left_value, right_value)
+    } else {
+        ("R", right_value, left_value)
+    };
+
+    if winner_value <= f64::EPSILON || loser_value <= f64::EPSILON {
+        format!("{} leads", winner)
+    } else if lower_is_better {
+        format!("{} {:.2}x lower", winner, loser_value / winner_value)
+    } else {
+        format!("{} {:.2}x higher", winner, winner_value / loser_value)
+    }
+}
+
+fn comparison_peer<'a>(
+    peers: &'a [PeerStat],
+    selected: &PeerStat,
+    anchor: Option<&str>,
+) -> Option<&'a PeerStat> {
+    if let Some(anchor_id) = anchor {
+        if let Some(peer) = peers
+            .iter()
+            .find(|peer| peer.peer_id == anchor_id && peer.peer_id != selected.peer_id)
+        {
+            return Some(peer);
+        }
+    }
+
+    let selected_generation = peer_generation(selected.protocol_generation);
+    peers
+        .iter()
+        .filter(|peer| peer.peer_id != selected.peer_id)
+        .filter(|peer| peer_generation(peer.protocol_generation) != selected_generation)
+        .max_by(|left, right| {
+            peer_request_rate(left)
+                .partial_cmp(&peer_request_rate(right))
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| peer_total_bytes(left).cmp(&peer_total_bytes(right)))
+        })
+        .or_else(|| {
+            peers
+                .iter()
+                .filter(|peer| peer.peer_id != selected.peer_id)
+                .max_by(|left, right| {
+                    peer_request_rate(left)
+                        .partial_cmp(&peer_request_rate(right))
+                        .unwrap_or(Ordering::Equal)
+                        .then_with(|| peer_total_bytes(left).cmp(&peer_total_bytes(right)))
+                })
+        })
+}
+
+fn cohort_average_metric<F>(
+    peers: &[PeerStat],
+    generation: RpcPeerReqResGeneration,
+    metric: F,
+) -> Option<f64>
+where
+    F: Fn(&PeerStat) -> f64,
+{
+    let cohort = peers
+        .iter()
+        .filter(|peer| peer_generation(peer.protocol_generation) == generation)
+        .map(metric)
+        .collect::<Vec<_>>();
+    if cohort.is_empty() {
+        None
+    } else {
+        Some(cohort.iter().sum::<f64>() / cohort.len() as f64)
+    }
+}
+
+fn speedup_ratio(gen2_value: f64, gen1_value: f64) -> f64 {
+    if gen1_value <= f64::EPSILON {
+        0.0
+    } else {
+        gen2_value / gen1_value
+    }
+}
+
+fn snapshot_age_seconds(collected_at_unix_ms: u64) -> Option<u64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(now.saturating_sub(collected_at_unix_ms) / 1_000)
 }
 
 fn format_number(value: u64) -> String {
@@ -2373,23 +3947,7 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
         ])]
     } else {
         let age = app.last_refresh.elapsed().as_secs();
-        let refresh_status = if app.auto_refresh_enabled {
-            if matches!(app.view, View::BlocksList) && app.viewing_tip() {
-                format!("Auto-refresh: ON (last: {}s ago)", age)
-            } else if matches!(app.view, View::BlocksList) {
-                format!(
-                    "Auto-refresh: PAUSED (scroll to newest block to resume, last: {}s ago)",
-                    age
-                )
-            } else {
-                format!(
-                    "Auto-refresh: PAUSED (viewing other tab, last: {}s ago)",
-                    age
-                )
-            }
-        } else {
-            format!("Auto-refresh: OFF (last: {}s ago)", age)
-        };
+        let refresh_status = format!("Last refresh: {}s ago (manual)", age);
         let mut spans = vec![
             Span::styled("Ready", Style::default().fg(Color::Green)),
             Span::raw(" | "),
@@ -2415,6 +3973,10 @@ fn render_status_bar(f: &mut Frame, area: Rect, app: &App) {
     let status =
         Paragraph::new(status_text).block(Block::default().borders(Borders::ALL).title("Status"));
     f.render_widget(status, area);
+
+    if app.is_busy() {
+        render_busy_overlay(f, app);
+    }
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -2431,7 +3993,7 @@ fn format_duration(duration: Duration) -> String {
 fn render_help(f: &mut Frame, area: Rect, app: &App) {
     let help_text = match &app.view {
         View::BlocksList => {
-            "↑: Up | ↓: Down (auto-loads older blocks) | PgUp/PgDn: Jump | Enter: View block | c: Copy block id | t: Search TX | r: Refresh | a: Auto-refresh | n: Next Page | s: Sync all pages | Tab/Shift+Tab: Switch tabs | ?: Help | q: Quit"
+            "↑: Up | ↓: Down (auto-loads older blocks) | PgUp/PgDn: Jump | Enter: View block | c: Copy block id | t: Search TX | r: Refresh | n: Next Page | s: Sync all pages | Tab/Shift+Tab: Switch tabs | ?: Help | q: Quit"
         }
         View::TransactionsList => {
             "↑: Up | ↓: Down | PgUp/PgDn: Jump | Home/End: First/last | Enter: View tx | Esc: Back to blocks | Tab/Shift+Tab: Switch tabs | n/p: Next/Prev tx | s: Sync all pages | ?: Help | q: Quit"
@@ -2439,12 +4001,18 @@ fn render_help(f: &mut Frame, area: Rect, app: &App) {
         View::WalletsList => {
             "↑: Up | ↓: Down | PgUp/PgDn: Jump | Home/End: First/last | b/r/e/t: Sort balance/recv/sent/tx | o: Toggle order | Tab/Shift+Tab: Switch tabs | s: Sync all pages | ?: Help | q: Quit"
         }
+        View::Nous => {
+            "↑/↓: Select peer | PgUp/PgDn/Home/End: Jump | Enter: Pin/unpin compare peer | c: Copy peer id | r: Refresh peer stats | Tab/Shift+Tab: Switch tabs | ?: Help | q: Quit"
+        }
         View::BlockDetails(_) => {
-            "ESC: Back | PgUp/PgDn: Prev/next block | Tab: Toggle tx focus | ↑/↓ (tx focus): Move selection | Enter: TX details | c: Copy tx id (tx focus) | n/p: Next/Prev tx | ?: Help | q: Quit"
+            "ESC: Back | ↑↓/PgUp/PgDn: Navigate blocks | Tab: Toggle focus | Enter: TX details | c: Copy tx | n/p: Next/Prev tx | ?: Help | q: Quit"
         }
         View::TransactionDetails { .. } => "ESC: Back | Tab: Switch pane | ↑/↓/PgUp/PgDn/Home/End: Scroll pane | n/p: Next/Prev tx | c: Copy tx id | ?: Help | q: Quit",
         View::TransactionSearch => {
             "ESC: Back | Enter: Search (prefix ok) | Ctrl+V/Ctrl+Shift+V: Paste | Ctrl+C: Clear | ?: Help | q: Quit"
+        }
+        View::Metrics => {
+            "ESC: Back | r: Refresh metrics | Tab/Shift+Tab: Switch tabs | ?: Help | q: Quit"
         }
         View::Help => "ESC/q/?: Close help",
     };
@@ -2497,6 +4065,26 @@ fn hash_to_string(hash: &nockapp_grpc_proto::pb::common::v1::Hash) -> String {
         hash.belt_4.as_ref().map(|b| b.value).unwrap_or(0),
         hash.belt_5.as_ref().map(|b| b.value).unwrap_or(0),
     )
+}
+
+fn observed_raw_page_bytes(details: &BlockDetails) -> u64 {
+    details.raw_page_bytes.unwrap_or_else(|| {
+        details
+            .msg
+            .as_ref()
+            .map(|msg| msg.raw.len() as u64)
+            .unwrap_or(0)
+    })
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1_048_576 {
+        format!("{:.1} MiB ({} bytes)", bytes as f64 / 1_048_576.0, bytes)
+    } else if bytes >= 1_024 {
+        format!("{:.1} KiB ({} bytes)", bytes as f64 / 1_024.0, bytes)
+    } else {
+        format!("{} bytes", bytes)
+    }
 }
 
 fn format_timestamp(raw_ts: u64) -> String {
@@ -2590,17 +4178,72 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    let horizontal = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1]);
+    horizontal[1]
+}
+
+fn render_busy_overlay(f: &mut Frame, app: &App) {
+    if !app.is_busy() {
+        return;
+    }
+    let area = f.area();
+    let popup_area = centered_rect(50, 20, area);
+    let frame = SPINNER_FRAMES[app.spinner_index % SPINNER_FRAMES.len()];
+    let color = SPINNER_COLORS[app.spinner_index % SPINNER_COLORS.len()];
+    let lines = vec![
+        Line::from(vec![Span::styled(
+            "Working…",
+            Style::default().add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled(
+                frame,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" Please wait while the request completes…"),
+        ]),
+    ];
+    f.render_widget(Clear, popup_area);
+    f.render_widget(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Loading")
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup_area,
+    );
+}
+
 #[tracing::instrument(name = "tui.run_app", skip(terminal, app))]
 async fn run_app(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     mut app: App,
 ) -> Result<()> {
     let tick_rate = Duration::from_millis(250);
-    let auto_refresh_interval = Duration::from_secs(10);
     let mut last_tick = Instant::now();
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
+        if app.shutdown_flag.load(AtomicOrdering::Acquire) {
+            return Ok(());
+        }
         app.poll_wallet_worker();
 
         let timeout = tick_rate
@@ -2614,11 +4257,14 @@ async fn run_app(
                     app.note_user_action();
                     match &app.view {
                         View::BlocksList => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Down => {
                                 app.move_selection_down();
                                 if app.should_auto_fetch_more() {
-                                    app.load_next_page().await?;
+                                    app.request_next_page = true;
                                 }
                             }
                             KeyCode::Up => {
@@ -2627,7 +4273,7 @@ async fn run_app(
                             KeyCode::PageDown => {
                                 app.page_down();
                                 if app.should_auto_fetch_more() {
-                                    app.load_next_page().await?;
+                                    app.request_next_page = true;
                                 }
                             }
                             KeyCode::PageUp => {
@@ -2657,6 +4303,14 @@ async fn run_app(
                                         BlockDetailsFocus::Transactions
                                     };
                                     app.sync_tx_list_selection();
+                                    // Load full block details
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        app.start_busy();
+                                        terminal.draw(|f| ui(f, &mut app))?;
+                                        let _ = app.load_full_block_details(height).await;
+                                        app.stop_busy();
+                                    }
                                 }
                             }
                             KeyCode::Char('t') => {
@@ -2665,25 +4319,37 @@ async fn run_app(
                                 app.tx_search_result = None;
                             }
                             KeyCode::Char('r') => {
-                                app.refresh().await?;
-                            }
-                            KeyCode::Char('a') => {
-                                app.auto_refresh_enabled = !app.auto_refresh_enabled;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.refresh().await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('n') => {
                                 if app.has_more_pages {
-                                    app.load_next_page().await?;
+                                    app.start_busy();
+                                    terminal.draw(|f| ui(f, &mut app))?;
+                                    let res = app.load_next_page().await;
+                                    app.stop_busy();
+                                    res?;
                                 }
                             }
                             KeyCode::Char('s') => {
-                                app.sync_all_blocks().await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.sync_all_blocks().await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Tab => app.cycle_tabs(1),
                             KeyCode::BackTab => app.cycle_tabs(-1),
                             _ => {}
                         },
                         View::TransactionsList => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Esc => {
                                 app.set_view(View::BlocksList);
                             }
@@ -2709,23 +4375,42 @@ async fn run_app(
                             }
                             KeyCode::Enter => {
                                 if let Some(idx) = app.tx_overview_state.selected() {
-                                    app.open_transaction_from_global_index(idx).await?;
+                                    app.start_busy();
+                                    terminal.draw(|f| ui(f, &mut app))?;
+                                    let res = app.open_transaction_from_global_index(idx).await;
+                                    app.stop_busy();
+                                    res?;
                                 }
                             }
                             KeyCode::Char('n') => {
-                                app.navigate_transaction_delta(1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('p') => {
-                                app.navigate_transaction_delta(-1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(-1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('s') => {
-                                app.sync_all_blocks().await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.sync_all_blocks().await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('?') => app.open_help(),
                             _ => {}
                         },
                         View::WalletsList => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Esc => app.set_view(View::BlocksList),
                             KeyCode::Tab => app.cycle_tabs(1),
                             KeyCode::BackTab => app.cycle_tabs(-1),
@@ -2747,13 +4432,72 @@ async fn run_app(
                             KeyCode::Char('t') => app.set_wallet_sort_key(WalletSortKey::TxCount),
                             KeyCode::Char('o') => app.toggle_wallet_sort_order(),
                             KeyCode::Char('s') => {
-                                app.sync_all_blocks().await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.sync_all_blocks().await;
+                                app.stop_busy();
+                                res?;
+                            }
+                            KeyCode::Char('?') => app.open_help(),
+                            _ => {}
+                        },
+                        View::Nous => match key.code {
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
+                            KeyCode::Esc => app.set_view(View::BlocksList),
+                            KeyCode::Tab => app.cycle_tabs(1),
+                            KeyCode::BackTab => app.cycle_tabs(-1),
+                            KeyCode::Down => app.move_peer_selection(1),
+                            KeyCode::Up => app.move_peer_selection(-1),
+                            KeyCode::PageDown => app.page_peer_selection(1),
+                            KeyCode::PageUp => app.page_peer_selection(-1),
+                            KeyCode::Home => {
+                                app.select_first_peer();
+                            }
+                            KeyCode::End => {
+                                app.select_last_peer();
+                            }
+                            KeyCode::Enter => {
+                                app.toggle_peer_compare_anchor();
+                            }
+                            KeyCode::Char('c') => {
+                                app.copy_selected_peer_id();
+                            }
+                            KeyCode::Char('r') => {
+                                app.peer_stats_error = None;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let _ = app.load_peer_stats().await;
+                                app.stop_busy();
+                            }
+                            KeyCode::Char('?') => app.open_help(),
+                            _ => {}
+                        },
+                        View::Metrics => match key.code {
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
+                            KeyCode::Esc => app.set_view(View::BlocksList),
+                            KeyCode::Tab => app.cycle_tabs(1),
+                            KeyCode::BackTab => app.cycle_tabs(-1),
+                            KeyCode::Char('r') => {
+                                app.metrics_error = None;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let _ = app.load_metrics().await;
+                                app.stop_busy();
                             }
                             KeyCode::Char('?') => app.open_help(),
                             _ => {}
                         },
                         View::BlockDetails(_) => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Esc => {
                                 app.set_view(View::BlocksList);
                                 app.block_focus = BlockDetailsFocus::Block;
@@ -2773,6 +4517,13 @@ async fn run_app(
                                 } else if let Some(idx) = app.select_first_block() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        app.start_busy();
+                                        terminal.draw(|f| ui(f, &mut app))?;
+                                        let _ = app.load_full_block_details(height).await;
+                                        app.stop_busy();
+                                    }
                                 }
                             }
                             KeyCode::End => {
@@ -2781,13 +4532,28 @@ async fn run_app(
                                 } else if let Some(idx) = app.select_last_block() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        app.start_busy();
+                                        terminal.draw(|f| ui(f, &mut app))?;
+                                        let _ = app.load_full_block_details(height).await;
+                                        app.stop_busy();
+                                    }
                                 }
                             }
                             KeyCode::Char('n') => {
-                                app.navigate_transaction_delta(1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('p') => {
-                                app.navigate_transaction_delta(-1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(-1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('c') => {
                                 if let Some(tx_id) = app.selected_tx_id() {
@@ -2800,7 +4566,12 @@ async fn run_app(
                                     if let (Some(block_idx), Some(tx_idx)) =
                                         (app.list_state.selected(), app.selected_tx_index())
                                     {
-                                        app.open_transaction_detail(block_idx, tx_idx).await?;
+                                        app.start_busy();
+                                        terminal.draw(|f| ui(f, &mut app))?;
+                                        let res =
+                                            app.open_transaction_detail(block_idx, tx_idx).await;
+                                        app.stop_busy();
+                                        res?;
                                     }
                                 }
                             }
@@ -2810,8 +4581,17 @@ async fn run_app(
                                 } else if let Some(idx) = app.move_selection_down() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        // Queue fetch if not cached (non-blocking)
+                                        if !app.full_block_details.contains_key(&height) {
+                                            app.priority_prefetch_queue.push_front(height);
+                                        }
+                                        // Queue adjacent blocks for predictive prefetch
+                                        app.queue_adjacent_prefetch(idx);
+                                    }
                                     if app.should_auto_fetch_more() {
-                                        app.load_next_page().await?;
+                                        app.request_next_page = true;
                                     }
                                 }
                             }
@@ -2821,14 +4601,32 @@ async fn run_app(
                                 } else if let Some(idx) = app.move_selection_up() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        // Queue fetch if not cached (non-blocking)
+                                        if !app.full_block_details.contains_key(&height) {
+                                            app.priority_prefetch_queue.push_front(height);
+                                        }
+                                        // Queue adjacent blocks for predictive prefetch
+                                        app.queue_adjacent_prefetch(idx);
+                                    }
                                 }
                             }
                             KeyCode::PageDown => {
                                 if let Some(idx) = app.page_down() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        // Queue fetch if not cached (non-blocking)
+                                        if !app.full_block_details.contains_key(&height) {
+                                            app.priority_prefetch_queue.push_front(height);
+                                        }
+                                        // Queue adjacent blocks for predictive prefetch
+                                        app.queue_adjacent_prefetch(idx);
+                                    }
                                     if app.should_auto_fetch_more() {
-                                        app.load_next_page().await?;
+                                        app.request_next_page = true;
                                     }
                                 }
                             }
@@ -2836,12 +4634,24 @@ async fn run_app(
                                 if let Some(idx) = app.page_up() {
                                     app.set_view(View::BlockDetails(idx));
                                     app.sync_tx_list_selection();
+                                    if let Some(block) = app.blocks.get(idx) {
+                                        let height = block.height;
+                                        // Queue fetch if not cached (non-blocking)
+                                        if !app.full_block_details.contains_key(&height) {
+                                            app.priority_prefetch_queue.push_front(height);
+                                        }
+                                        // Queue adjacent blocks for predictive prefetch
+                                        app.queue_adjacent_prefetch(idx);
+                                    }
                                 }
                             }
                             _ => {}
                         },
                         View::TransactionDetails { block_idx, .. } => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Esc => {
                                 app.set_view(View::BlockDetails(*block_idx));
                                 app.block_focus = BlockDetailsFocus::Transactions;
@@ -2875,15 +4685,26 @@ async fn run_app(
                                 app.end_tx_pane();
                             }
                             KeyCode::Char('n') => {
-                                app.navigate_transaction_delta(1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             KeyCode::Char('p') => {
-                                app.navigate_transaction_delta(-1).await?;
+                                app.start_busy();
+                                terminal.draw(|f| ui(f, &mut app))?;
+                                let res = app.navigate_transaction_delta(-1).await;
+                                app.stop_busy();
+                                res?;
                             }
                             _ => {}
                         },
                         View::TransactionSearch => match key.code {
-                            KeyCode::Char('q') => return Ok(()),
+                            KeyCode::Char('q') => {
+                                app.request_shutdown();
+                                return Ok(());
+                            }
                             KeyCode::Esc => app.set_view(View::BlocksList),
                             KeyCode::Char('?') => app.open_help(),
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -2898,7 +4719,11 @@ async fn run_app(
                             KeyCode::Enter => {
                                 if !app.tx_search_input.is_empty() {
                                     let search_input = app.tx_search_input.clone();
-                                    app.search_transaction(&search_input).await?;
+                                    app.start_busy();
+                                    terminal.draw(|f| ui(f, &mut app))?;
+                                    let res = app.search_transaction(&search_input).await;
+                                    app.stop_busy();
+                                    res?;
                                 }
                             }
                             KeyCode::Backspace => {
@@ -2935,17 +4760,73 @@ async fn run_app(
         }
 
         if last_tick.elapsed() >= tick_rate {
-            // Auto-reconnect if disconnected
-            if app.should_retry_connection() {
+            // Check for pending user input - skip slow operations if user is interacting
+            let has_pending_input = crossterm::event::poll(Duration::ZERO).unwrap_or(false);
+
+            // Auto-reconnect if disconnected (skip if user has pending input)
+            if !has_pending_input && app.should_retry_connection() {
                 let _ = app.attempt_reconnect().await; // Don't fail on reconnect error
             }
 
-            // Auto-refresh blocks if connected
-            if app.should_auto_refresh_blocks(auto_refresh_interval) {
-                let _ = app.refresh().await;
+            // Process priority prefetch first (user-navigated blocks)
+            // Skip if user has pending input - prioritize UI responsiveness
+            if !has_pending_input
+                && !app.prefetch_in_progress
+                && !app.priority_prefetch_queue.is_empty()
+                && app.connection_status == ConnectionStatus::Connected
+            {
+                if let Some(height) = app.priority_prefetch_queue.pop_front() {
+                    if !app.full_block_details.contains_key(&height) {
+                        app.prefetch_in_progress = true;
+                        let _ = app.load_full_block_details(height).await;
+                        app.prefetch_in_progress = false;
+                    }
+                }
             }
+
+            // Process background prefetch of block details (one at a time to avoid blocking UI)
+            // Skip if user has pending input - prioritize UI responsiveness
+            if !has_pending_input
+                && !app.prefetch_in_progress
+                && !app.prefetch_queue.is_empty()
+                && app.connection_status == ConnectionStatus::Connected
+            {
+                if let Some(height) = app.prefetch_queue.pop_front() {
+                    if !app.full_block_details.contains_key(&height) {
+                        app.prefetch_in_progress = true;
+                        let _ = app.load_full_block_details(height).await;
+                        app.prefetch_in_progress = false;
+                    }
+                }
+            }
+
+            // Handle deferred page load request (from non-blocking navigation)
+            // Skip if user has pending input - prioritize UI responsiveness
+            if !has_pending_input
+                && app.request_next_page
+                && !app.prefetch_in_progress
+                && app.connection_status == ConnectionStatus::Connected
+            {
+                app.request_next_page = false;
+                let _ = app.load_next_page().await;
+            }
+
             last_tick = Instant::now();
         }
+    }
+}
+
+/// Check if CRASH_HAPPY env var is set. If so, panic with detailed error info.
+/// This is useful for debugging deserialization errors during development.
+fn crash_happy_check(context: &str, error: &impl std::fmt::Debug) {
+    if env::var("CRASH_HAPPY").is_ok() {
+        panic!(
+            "\n\n=== CRASH_HAPPY TRIGGERED ===\n\
+            Context: {}\n\
+            Error: {:#?}\n\
+            =============================\n",
+            context, error
+        );
     }
 }
 
@@ -2972,6 +4853,9 @@ fn init_tracing() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing()?;
+    aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|e| anyhow!("failed to install rustls provider: {e:?}"))?;
     // Parse CLI args
     let args = Args::parse();
 
@@ -3036,7 +4920,7 @@ async fn wallet_index_worker(
 
             let fetch_result = client
                 .as_mut()
-                .unwrap()
+                .expect("client should be connected")
                 .get_transaction_details(Request::new(request))
                 .await;
 
@@ -3112,9 +4996,11 @@ fn accumulate_wallet_delta(
     for output in &details.outputs {
         if let Some(address) = normalize_wallet_label(&output.note_name_b58) {
             let entry = map.entry(address.clone()).or_default();
-            entry.total_received = entry
-                .total_received
-                .saturating_add(output.amount.as_ref().map(|n| n.value).unwrap_or(0));
+            entry.total_received = entry.total_received.saturating_add(
+                get_output_amount_nicks(&output.amount_required)
+                    .map(|n| n.value)
+                    .unwrap_or(0),
+            );
             touched.insert(address);
         }
     }
@@ -3154,9 +5040,8 @@ fn render_help_menu(f: &mut Frame, area: Rect, app: &mut App) {
                 "PgDn       Jump down by 20 blocks (auto-loads older)",
                 "Enter      View selected block", "c          Copy selected block id",
                 "Tab/Shift+Tab Switch between tabs", "t          Open transaction search",
-                "r          Refresh newest page", "a          Toggle auto-refresh",
-                "n          Fetch next page now", "s          Sync all pages",
-                "?          Show this help", "q          Quit",
+                "r          Refresh newest page", "n          Fetch next page now",
+                "s          Sync all pages", "?          Show this help", "q          Quit",
             ],
         ),
         (
@@ -3176,6 +5061,22 @@ fn render_help_menu(f: &mut Frame, area: Rect, app: &mut App) {
                 "Home/End  Jump to first/last wallet", "b/r/e/t   Sort balance/recv/sent/tx",
                 "o          Toggle sort order", "Tab/Shift+Tab Switch tabs",
                 "s          Sync all pages", "?          Show this help",
+            ],
+        ),
+        (
+            "Nous",
+            vec![
+                "↑/↓        Move peer selection", "PgUp/PgDn Jump by 20 peers",
+                "Home/End  Jump to first/last peer", "Enter      Pin/unpin compare peer",
+                "c          Copy selected peer id", "r          Refresh peer stats",
+                "Tab/Shift+Tab Switch tabs", "?          Show this help",
+            ],
+        ),
+        (
+            "Metrics",
+            vec![
+                "r          Refresh explorer metrics", "Tab/Shift+Tab Switch tabs",
+                "ESC/q/?    Close help",
             ],
         ),
         (
@@ -3272,4 +5173,169 @@ fn render_help_menu(f: &mut Frame, area: Rect, app: &mut App) {
         .scroll((app.help_scroll, 0));
 
     f.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use nockapp_grpc_proto::pb::public::v2::{
+        BlockDetails, PageMsg, PeerReqResGeneration as RpcPeerReqResGeneration, PeerStat,
+    };
+
+    use super::{
+        comparison_peer, format_bytes, observed_raw_page_bytes, snapshot_age_seconds,
+        sorted_peer_stats, speedup_ratio,
+    };
+
+    fn test_peer(
+        peer_id: &str,
+        generation: RpcPeerReqResGeneration,
+        request_count: u64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        connection_duration_seconds: u64,
+    ) -> PeerStat {
+        PeerStat {
+            peer_id: peer_id.to_string(),
+            protocol_generation: generation as i32,
+            request_count,
+            bytes_sent,
+            bytes_received,
+            connection_duration_seconds,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn prefers_raw_page_bytes_when_present() {
+        let details = BlockDetails {
+            raw_page_bytes: Some(4096),
+            msg: Some(PageMsg {
+                raw: vec![1, 2, 3],
+                decoded: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(observed_raw_page_bytes(&details), 4096);
+    }
+
+    #[test]
+    fn falls_back_to_msg_raw_len() {
+        let details = BlockDetails {
+            raw_page_bytes: None,
+            msg: Some(PageMsg {
+                raw: vec![0; 512],
+                decoded: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(observed_raw_page_bytes(&details), 512);
+    }
+
+    #[test]
+    fn returns_zero_when_no_msg_and_no_raw_page_bytes() {
+        let details = BlockDetails {
+            raw_page_bytes: None,
+            msg: None,
+            ..Default::default()
+        };
+        assert_eq!(observed_raw_page_bytes(&details), 0);
+    }
+
+    #[test]
+    fn format_bytes_displays_correctly() {
+        assert_eq!(format_bytes(0), "0 bytes");
+        assert_eq!(format_bytes(512), "512 bytes");
+        assert_eq!(format_bytes(1024), "1.0 KiB (1024 bytes)");
+        assert_eq!(format_bytes(1536), "1.5 KiB (1536 bytes)");
+        assert_eq!(format_bytes(1_048_576), "1.0 MiB (1048576 bytes)");
+        assert_eq!(format_bytes(2_621_440), "2.5 MiB (2621440 bytes)");
+    }
+
+    #[test]
+    fn sorted_peer_stats_orders_gen2_before_gen1_then_activity() {
+        let sorted = sorted_peer_stats(&[
+            test_peer("gen1-busy", RpcPeerReqResGeneration::Gen1, 90, 400, 200, 30),
+            test_peer("gen2-calm", RpcPeerReqResGeneration::Gen2, 10, 100, 50, 30),
+            test_peer("gen2-busy", RpcPeerReqResGeneration::Gen2, 50, 700, 300, 30),
+            test_peer(
+                "unknown",
+                RpcPeerReqResGeneration::Unspecified,
+                200,
+                999,
+                1,
+                30,
+            ),
+        ]);
+
+        let ordered_ids = sorted
+            .iter()
+            .map(|peer| peer.peer_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ordered_ids,
+            vec!["gen2-busy", "gen2-calm", "gen1-busy", "unknown"]
+        );
+    }
+
+    #[test]
+    fn comparison_peer_prefers_explicit_anchor() {
+        let peers = vec![
+            test_peer("selected", RpcPeerReqResGeneration::Gen2, 60, 500, 500, 30),
+            test_peer("anchored", RpcPeerReqResGeneration::Gen2, 5, 100, 100, 30),
+            test_peer(
+                "gen1-other",
+                RpcPeerReqResGeneration::Gen1,
+                40,
+                400,
+                400,
+                30,
+            ),
+        ];
+
+        let selected = &peers[0];
+        let compare = comparison_peer(&peers, selected, Some("anchored"))
+            .expect("anchored peer should be returned");
+
+        assert_eq!(compare.peer_id, "anchored");
+    }
+
+    #[test]
+    fn comparison_peer_prefers_opposite_generation_without_anchor() {
+        let peers = vec![
+            test_peer("selected", RpcPeerReqResGeneration::Gen2, 60, 500, 500, 30),
+            test_peer(
+                "same-gen-busy",
+                RpcPeerReqResGeneration::Gen2,
+                120,
+                700,
+                700,
+                30,
+            ),
+            test_peer("gen1-best", RpcPeerReqResGeneration::Gen1, 40, 400, 400, 30),
+        ];
+
+        let selected = &peers[0];
+        let compare = comparison_peer(&peers, selected, None)
+            .expect("opposite-generation peer should be preferred");
+
+        assert_eq!(compare.peer_id, "gen1-best");
+    }
+
+    #[test]
+    fn speedup_ratio_handles_zero_and_nonzero_baselines() {
+        assert_eq!(speedup_ratio(6.0, 2.0), 3.0);
+        assert_eq!(speedup_ratio(6.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn snapshot_age_seconds_saturates_for_future_timestamps() {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_millis() as u64;
+
+        assert_eq!(snapshot_age_seconds(now_ms + 5_000), Some(0));
+    }
 }

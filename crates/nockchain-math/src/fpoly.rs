@@ -1,10 +1,11 @@
 use std::cmp::max;
 use std::vec;
 
+use nockvm::noun::NounSpace;
 use noun_serde::NounDecode;
 use num_traits::MulAdd;
 
-use crate::belt::Belt;
+use crate::belt::{Belt, FieldError};
 use crate::bpoly::bitreverse;
 use crate::felt::*;
 use crate::poly::*;
@@ -218,7 +219,7 @@ pub fn fp_shift(poly_a: &[Felt], felt_b: &Felt, poly_res: &mut [Felt]) {
 }
 
 pub fn fp_ntt(fp: &[Felt], root: &Felt) -> Vec<Felt> {
-    let n = fp.len() as u32;
+    let n = fp.len();
 
     if n == 1 {
         return vec![fp[0]];
@@ -227,34 +228,29 @@ pub fn fp_ntt(fp: &[Felt], root: &Felt) -> Vec<Felt> {
     debug_assert!(n.is_power_of_two());
 
     let log_2_of_n = n.ilog2();
-
-    const FELT0: Felt = Felt([Belt(0), Belt(0), Belt(0)]);
-    const FELT1: Felt = Felt([Belt(1), Belt(0), Belt(0)]);
-
-    let mut x: Vec<Felt> = vec![FELT0; n as usize];
-    x.copy_from_slice(fp);
+    let mut x: Vec<Felt> = fp.into();
 
     for k in 0..n {
-        let rk = bitreverse(k, log_2_of_n);
-        if k < rk {
-            x.swap(rk as usize, k as usize);
+        let rk = bitreverse(k as u32, log_2_of_n);
+        if k < rk as usize {
+            x.swap(rk as usize, k);
         }
     }
 
     let mut m = 1;
     for _ in 0..log_2_of_n {
-        let mut w_m: Felt = Default::default();
+        let mut w_m = Felt::zero();
         fpow(root, (n / (2 * m)) as u64, &mut w_m);
 
         let mut k = 0;
         while k < n {
-            let mut w = FELT1;
+            let mut w = Felt::one();
 
             for j in 0..m {
-                let u: Felt = x[(k + j) as usize];
-                let v: Felt = x[(k + j + m) as usize] * w;
-                x[(k + j) as usize] = u + v;
-                x[(k + j + m) as usize] = u - v;
+                let u = x[k + j];
+                let v = x[k + j + m] * w;
+                x[k + j] = u + v;
+                x[k + j + m] = u - v;
                 w = w * w_m;
             }
 
@@ -267,6 +263,27 @@ pub fn fp_ntt(fp: &[Felt], root: &Felt) -> Vec<Felt> {
 }
 
 #[inline(always)]
+pub fn fp_fft(fp: &[Felt]) -> Result<Vec<Felt>, FieldError> {
+    let order = fp.len() as u64;
+    let root = &Felt::ordered_root(order)?;
+    Ok(fp_ntt(fp, root))
+}
+
+#[inline(always)]
+pub fn fp_ifft(fp: &[Felt]) -> Result<Vec<Felt>, FieldError> {
+    let order = fp.len() as u64;
+    let ordered_root = Belt(order).ordered_root()?;
+    let root = &Felt::constant(ordered_root.inv().0);
+    let scale_factor = &mut Felt::from([Belt(order).inv(), Belt(0), Belt(0)]);
+
+    let ntt_result = fp_ntt(fp, root);
+    let mut scal_res = vec![Felt::zero(); order as usize];
+
+    fpscal(scale_factor, &ntt_result, &mut scal_res);
+    Ok(scal_res)
+}
+
+#[inline(always)]
 pub fn fp_coseword(fp: &[Felt], offset: &Felt, order: u32, root: &Felt) -> Vec<Felt> {
     // shift
     let len_res: u32 = order;
@@ -274,6 +291,55 @@ pub fn fp_coseword(fp: &[Felt], offset: &Felt, order: u32, root: &Felt) -> Vec<F
     fp_shift(fp, offset, &mut res);
 
     fp_ntt(&res, root)
+}
+
+#[inline(always)]
+pub fn fp_intercosate(offset: &Felt, order: u32, values: &[Felt]) -> Result<Vec<Felt>, FieldError> {
+    let len = values.len();
+    if order == 0 || !order.is_power_of_two() || len != order as usize {
+        return Err(FieldError::OrderedRootError);
+    }
+
+    let mut res = vec![Felt::zero(); len];
+    let ifft_res = fp_ifft(values)?;
+    let mut finv_res = Felt::zero();
+
+    finv(offset, &mut finv_res);
+
+    fp_shift(&ifft_res, &finv_res, &mut res);
+
+    Ok(res)
+}
+
+#[inline(always)]
+pub fn fpmul_fast(a: &[Felt], b: &[Felt], res: &mut [Felt]) {
+    if res.is_empty() {
+        return;
+    }
+
+    let mut new_a = a.to_vec();
+    let mut new_b = b.to_vec();
+
+    let res_len = res.len();
+    let padded_len = res_len.next_power_of_two();
+
+    new_a.resize(padded_len, Felt::zero());
+    new_b.resize(padded_len, Felt::zero());
+
+    let res_fpoly_a = fp_fft(&new_a).expect("fp_fft failed");
+    let res_fpoly_b = fp_fft(&new_b).expect("fp_fft failed");
+
+    let mut res_mul = vec![Felt::zero(); padded_len];
+    res_mul
+        .iter_mut()
+        .zip(res_fpoly_a.iter())
+        .zip(res_fpoly_b.iter())
+        .for_each(|((res_vec, a_vec), b_vec)| {
+            fmul(a_vec, b_vec, res_vec);
+        });
+
+    let ifft_result = fp_ifft(res_mul.as_slice()).expect("fp_ifft failed");
+    res.copy_from_slice(&ifft_result[0..res.len()]);
 }
 
 // MIT License
@@ -302,9 +368,9 @@ pub fn fpeval(a: &[Felt], x: Felt) -> Felt {
 }
 
 #[inline(always)]
-pub fn lift_to_fpoly(belts: HoonList, res: &mut [Felt]) {
+pub fn lift_to_fpoly(belts: HoonList<'_>, res: &mut [Felt], space: &NounSpace) {
     for (i, b) in belts.into_iter().enumerate() {
-        let belt = Belt::from_noun(&b).unwrap_or_else(|err| {
+        let belt = Belt::from_noun(&b, space).unwrap_or_else(|err| {
             panic!(
                 "Panicked with {err:?} at {}:{} (git sha: {:?})",
                 file!(),
@@ -313,5 +379,36 @@ pub fn lift_to_fpoly(belts: HoonList, res: &mut [Felt]) {
             )
         });
         res[i] = Felt::lift(belt);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn felt(i: u64) -> Felt {
+        Felt::from([Belt(i), Belt(i + 1), Belt(i + 2)])
+    }
+
+    #[test]
+    fn fp_intercosate_rejects_order_mismatch_without_panicking() {
+        let values = [felt(1), felt(4)];
+        assert!(matches!(
+            fp_intercosate(&Felt::one(), 4, &values),
+            Err(FieldError::OrderedRootError)
+        ));
+    }
+
+    #[test]
+    fn fpmul_fast_matches_naive_for_large_inputs() {
+        let a = (0..40).map(felt).collect::<Vec<_>>();
+        let b = (40..90).map(felt).collect::<Vec<_>>();
+        let mut naive = vec![Felt::zero(); a.len() + b.len() - 1];
+        let mut fast = vec![Felt::zero(); naive.len()];
+
+        fpmul(&a, &b, &mut naive);
+        fpmul_fast(&a, &b, &mut fast);
+
+        assert_eq!(fast, naive);
     }
 }

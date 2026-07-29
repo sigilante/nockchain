@@ -7,7 +7,7 @@
 /=  mine  /common/pow
 /=  nv  /common/nock-verifier
 /=  zeke  /common/zeke
-/=  *  /common/zoon
+/=  *  /common/h-zoon
 /=  *  /common/wrapper
 ::
 ::  Never use c-transact face, always use the lustar `t`
@@ -17,6 +17,7 @@
 |%
 ++  moat  (keep kernel-state:dk)
 ++  inner
+  ~%  %dumb-inner  ..ut  ~
   |_  k=kernel-state:dk
   +*  min      ~(. dumb-miner m.k constants.k)
       der      ~(. dumb-derived d.k constants.k)
@@ -25,6 +26,7 @@
   ::
   ::  We should be calling the inner kernel load in case of update
   ++  load
+    ~/  %load
     ::  use the below for validation of new state upgrades
     ::  |=  untyped-arg=*
     ::  ~>  %slog.[0 leaf+"typing kernel state"]
@@ -33,17 +35,35 @@
     ::
     ::  use this for production
     |=  arg=load-kernel-state:dk
-    ~&  [%nockchain-state-version -.arg]
     ::  cut
     |^
-    =.  k  ~>  %bout  (update-constants (check-checkpoints (state-n-to-6 arg)))
-    =.  c.k  ~>  %bout  check-and-repair:con
+    ::  each stage is named before it runs so that the %bout durations, which
+    ::  print unlabelled, are attributable
+    ~>  %slog.[0 'load: begin']
+    =/  ks=kernel-state:dk
+      ~>  %slog.[0 'load: [1/5] state-n-to-10: migrating state to version 10']
+      ~>  %bout  (state-n-to-10 arg)
+    =.  ks
+      ~>  %slog.[0 'load: [2/5] check-checkpoints: verifying checkpointed digests']
+      ~>  %bout  (check-checkpoints ks)
+    =.  k
+      ~>  %slog.[0 'load: [3/5] update-constants']
+      ~>  %bout  (update-constants ks)
+    =.  c.k
+      ~>  %slog.[0 'load: [4/5] check-and-repair: validating consensus state']
+      ~>  %bout  check-and-repair:con
+    =.  c.k
+      ~>  %slog.[0 'load: [5/5] repair-orphaned-claims: releasing txs stranded by past reorgs']
+      ~>  %bout  repair-orphaned-claims:con
+    ~|  %v1-phase-must-be-lte-asert-phase
+    ?>  (lte v1-phase.constants.k asert-phase.constants.k)
+    ~>  %slog.[0 'load: complete']
     k
     ::  this arm should be renamed each state upgrade to state-n-to-[latest] and extended to loop through all upgrades
-    ++  state-n-to-6
+    ++  state-n-to-10
       |=  arg=load-kernel-state:dk
       ^-  kernel-state:dk
-      ?.  ?=(%6 -.arg)
+      ?.  ?=(%10 -.arg)
         ~>  %slog.[0 'load: State upgrade required']
         ?-  -.arg
             ::
@@ -53,8 +73,140 @@
           %3  $(arg (state-3-to-4 arg))
           %4  $(arg (state-4-to-5 arg))
           %5  $(arg (state-5-to-6 arg))
+          %6  $(arg (state-6-to-7 arg))
+          %7  $(arg (state-7-to-8 arg))
+          %8  $(arg (state-8-to-9 arg))
+          %9  $(arg (state-9-to-10 arg))
         ==
       arg
+    ::
+    ::  upgrade kernel state 9 to kernel state 10 with typed dynamic anchor timestamps
+    ++  state-9-to-10
+      |=  arg=kernel-state-9:dk
+      ^-  kernel-state-10:dk
+      =/  new-c=consensus-state-10:dk
+        %*  .  *consensus-state-10:dk
+          blocks-needed-by                blocks-needed-by.c.arg
+          excluded-txs                    excluded-txs.c.arg
+          spent-by                        spent-by.c.arg
+          pending-blocks                  pending-blocks.c.arg
+          balance                         balance.c.arg
+          txs                             txs.c.arg
+          raw-txs                         raw-txs.c.arg
+          blocks                          blocks.c.arg
+          heaviest-block                  heaviest-block.c.arg
+          min-timestamps                  min-timestamps.c.arg
+          asert-anchor-min-timestamps    *(map @tas (h-map block-id:t @))
+          epoch-start                     epoch-start.c.arg
+          targets                         targets.c.arg
+          btc-data                        btc-data.c.arg
+          genesis-seal                    genesis-seal.c.arg
+        ==
+      :*  %10
+          c=new-c
+          a=a.arg
+          m=m.arg
+          d=d.arg
+          constants=constants.arg
+      ==
+    ::  upgrade kernel state 8 to kernel state 9
+    ::    h-zoon replaces the remaining consensus z containers with
+    ::    digest-keyed h containers. kernel-state-8 already carries the
+    ::    full post-phase-2 constants shape. this migration preserves constants
+    ::    and only rewrites consensus container representation.
+    ++  state-8-to-9
+      |=  arg=kernel-state-8:dk
+      ^-  kernel-state-9:dk
+      =/  new-c=consensus-state-9:dk
+        %*  .  *consensus-state-9:dk
+          blocks-needed-by  (zh-jult blocks-needed-by.c.arg)
+          excluded-txs      (zh-silt excluded-txs.c.arg)
+          spent-by          (zh-jult spent-by.c.arg)
+          pending-blocks    (zh-molt pending-blocks.c.arg)
+          balance           (zh-balmilt blocks.c.arg balance.c.arg)
+          txs               (zh-milt txs.c.arg)
+          raw-txs           (zh-molt raw-txs.c.arg)
+          blocks            (zh-molt blocks.c.arg)
+          heaviest-block    heaviest-block.c.arg
+          min-timestamps    (zh-molt min-timestamps.c.arg)
+          epoch-start       (zh-molt epoch-start.c.arg)
+          targets           (zh-molt targets.c.arg)
+          btc-data          btc-data.c.arg
+          genesis-seal      genesis-seal.c.arg
+        ==
+      =/  new-m=mining-state-9:dk
+        %*  .  *mining-state-9:dk
+          mining           mining.m.arg
+          shares           shares.m.arg
+          v0-shares        v0-shares.m.arg
+          candidate-block  *page:t
+          candidate-acc    *tx-acc:t
+          next-nonce       next-nonce.m.arg
+        ==
+      :*  %9
+          c=new-c
+          a=a.arg
+          m=new-m
+          d=d.arg
+          constants=constants.arg
+      ==
+    ::
+    ::  upgrade kernel state 7 to kernel state 8
+    ::    blockchain-constants:v1 gained a sixth asert-* field
+    ::    (asert-anchor-min-timestamp) at phase 2 of 014-aletheia.
+    ::    kernel-state-7 uses the frozen phase-1 shape (five asert
+    ::    fields) so old %7 states still decode; kernel-state-8 uses
+    ::    the full post-phase-2 blockchain-constants:v1. we discard
+    ::    the old constants noun and let update-constants reseed it
+    ::    from *blockchain-constants:t (which now pins the canonical
+    ::    mainnet anchor median-of-11).
+    ++  state-7-to-8
+      |=  arg=kernel-state-7:dk
+      ^-  kernel-state-8:dk
+      :*  %8
+          c=c.arg
+          a=a.arg
+          ::  discard stale pre-upgrade candidate; miner will rebuild on next tick
+          m=m.arg(candidate-block *page:t, candidate-acc *tx-acc:t)
+          d=d.arg
+          constants=*blockchain-constants:t
+      ==
+    ::
+    ::  upgrade kernel state 6 to kernel state 7
+    ::    blockchain-constants:v1 was extended with five ASERT fields in
+    ::    the original aletheia phase 1. kernel-state-6 uses
+    ::    blockchain-constants-v1-pre-asert (the frozen pre-ASERT shape) so
+    ::    that old %6 states can decode cleanly. kernel-state-7 uses the
+    ::    phase-1 snapshot of blockchain-constants:v1 (five asert-* fields,
+    ::    no asert-anchor-min-timestamp). we discard the old constants and
+    ::    let the chained state-7-to-8 upgrade plus update-constants fill
+    ::    in current defaults below.
+    ++  state-6-to-7
+      |=  arg=kernel-state-6:dk
+      ^-  kernel-state-7:dk
+      ::  guard: refuse if mainnet chain has already crossed ASERT activation.
+      ::  replicates is-mainnet logic inline to avoid calling dumb-derived with
+      ::  pre-ASERT constants (incompatible type).
+      =/  on-mainnet=?
+        ?~  genesis-seal.c.arg
+          ?^  genesis-id=(~(get z-by heaviest-chain.d.arg) 0)
+            =/  genesis  (~(get z-by blocks.c.arg) u.genesis-id)
+            ?~  genesis  %.n
+            =((hash:page-msg:t ~(msg get:local-page:t u.genesis)) realnet-genesis-msg:dk)
+          %.n
+        =(realnet-genesis-msg:dk msg-hash.u.genesis-seal.c.arg)
+      =/  phase  asert-phase:*blockchain-constants:t
+      ?:  &(on-mainnet ?=(^ highest-block-height.d.arg) (gte u.highest-block-height.d.arg phase))
+        ~>  %slog.[0 'FATAL: late-upgrade - mainnet chain crossed ASERT activation under pre-ASERT rules']
+        !!
+      :*  %7
+          c=c.arg
+          a=a.arg
+          ::  discard stale pre-upgrade candidate; miner will rebuild on next tick
+          m=m.arg(candidate-block *page:t, candidate-acc *tx-acc:t)
+          d=d.arg
+          constants=*blockchain-constants-v1-phase-1:dk
+      ==
     ::
     ::  upgrade kernel state 5 to kernel state 6
     ++  state-5-to-6
@@ -95,8 +247,14 @@
           next-nonce       next-nonce.m.arg
         ==
       =/  default-constants=blockchain-constants:t  *blockchain-constants:t
-      =/  new-constants=blockchain-constants:t
-        default-constants(+>+ constants.arg)
+      =/  new-constants=blockchain-constants-v1-pre-asert:dk
+        :*  v1-phase.default-constants
+            bythos-phase.default-constants
+            data.default-constants
+            base-fee.default-constants
+            input-fee-divisor.default-constants
+            constants.arg
+        ==
       :*  %6
           c=new-c
           a=a.arg
@@ -126,9 +284,9 @@
             ~
         (~(put z-ju bnb) tx-id block-id)
       ~>  %slog.[0 'load: Indexed blocks by transaction id']
-      =/  rtx=(map tx-id:v0:t *)  raw-txs.c.arg
-      =/  bnb=(map tx-id:v0:t *)  blocks-needed-by
-      =/  excluded-map=(map tx-id:v0:t *)  (~(dif z-by rtx) bnb)
+      =/  rtx=(z-map tx-id:v0:t *)  raw-txs.c.arg
+      =/  bnb=(z-map tx-id:v0:t *)  blocks-needed-by
+      =/  excluded-map=(z-map tx-id:v0:t *)  (~(dif z-by rtx) bnb)
       =/  excluded-txs=(z-set tx-id:v0:t)  ~(key z-by excluded-map)
       =+
         ?:  =(*(z-set tx-id:v0:t) excluded-txs)
@@ -273,8 +431,10 @@
   ::
   ::TODO make referentially transparent by requiring event number in the scry path
   ++  peek
+    ~/  %peek
     |=  arg=path
     ^-  (unit (unit *))
+    |^
     ~>  %slog.[0 (cat 3 'peek: %' -.arg)]
     =/  =(pole)  arg
     ?+  pole  ~
@@ -284,22 +444,48 @@
     ::
         [%genesis-seal-set ~]
       ``?=(^ genesis-seal.c.k)
+    ::  Expose the active blockchain constants so external tools (E2E
+    ::  harness, diagnostics) can verify a running node's configuration
+    ::  without relying on hardcoded values.
+        [%constants ~]
+      ``constants.k
+    ::
+        [%blockchain-constants ~]
+      ^-  (unit (unit blockchain-constants:t))
+      ``constants.k
     ::
         [%blocks ~]
       ^-  (unit (unit (z-map block-id:t page:t)))
-      ``(~(run z-by blocks.c.k) to-page:local-page:t)
+      ``(hz-molt (~(run h-by blocks.c.k) to-page:local-page:t))
+    ::
+        [%h-blocks ~]
+      ^-  (unit (unit (h-map block-id:t page:t)))
+      ``(~(run h-by blocks.c.k) to-page:local-page:t)
     ::
         [%transactions ~]
       ^-  (unit (unit (z-mip block-id:t tx-id:t tx:t)))
+      ``(hz-milt txs.c.k)
+    ::
+        [%h-transactions ~]
+      ^-  (unit (unit (h-mip block-id:t tx-id:t tx:t)))
       ``txs.c.k
     ::
         [%raw-transactions ~]
       ^-  (unit (unit (z-map tx-id:t [=raw-tx:t heard-at=@])))
+      ``(hz-molt raw-txs.c.k)
+    ::
+        [%h-raw-transactions ~]
+      ^-  (unit (unit (h-map tx-id:t [=raw-tx:t heard-at=@])))
       ``raw-txs.c.k
     ::
       :: transactions unneeded by any block
         [%excluded-txs ~]
       ^-  (unit (unit (z-set tx-id:t)))
+      ``(hz-silt excluded-txs.c.k)
+    ::
+      :: transactions unneeded by any block
+        [%h-excluded-txs ~]
+      ^-  (unit (unit (h-set tx-id:t)))
       ``excluded-txs.c.k
     ::
     ::  For %block, %transaction, %raw-transaction, and %balance scries, the ID is
@@ -308,7 +494,7 @@
       ^-  (unit (unit page:t))
       :: scry for a validated block (this does not look at pending state)
       =/  block-id  (from-b58:hash:t bid.pole)
-      `(bind (~(get z-by blocks.c.k) block-id) to-page:local-page:t)
+      `(bind (~(get h-by blocks.c.k) block-id) to-page:local-page:t)
     ::
         [%elders bid=@ ~]
       ::  get ancestor block IDs up to 24 deep for a given block
@@ -323,7 +509,16 @@
       ::  scry for txs included in a validated block
       ^-  (unit (unit (z-map tx-id:t tx:t)))
       :-  ~
-      %-  ~(get z-by txs.c.k)
+      %+  bind
+      %-  ~(get h-by txs.c.k)
+      (from-b58:hash:t bid.pole)
+      hz-molt
+    ::
+        [%h-block-transactions bid=@ ~]
+      ::  scry for txs included in a validated block
+      ^-  (unit (unit (h-map tx-id:t tx:t)))
+      :-  ~
+      %-  ~(get h-by txs.c.k)
       (from-b58:hash:t bid.pole)
     ::
         [%block-transaction bid=@ tid=@ ~]
@@ -331,9 +526,9 @@
       ^-  (unit (unit tx:t))
       =/  tx-id  (from-b58:hash:t tid.pole)
       =/  block-id  (from-b58:hash:t bid.pole)
-      =/  block-txs  (~(get z-by txs.c.k) block-id)
+      =/  block-txs  (~(get h-by txs.c.k) block-id)
       ?~  block-txs  ~
-      =/  maybe-tx  (~(get z-by u.block-txs) tx-id)
+      =/  maybe-tx  (~(get h-by u.block-txs) tx-id)
       ?~  maybe-tx  ~
       ``u.maybe-tx
     ::
@@ -342,6 +537,14 @@
       ^-  (unit (unit raw-tx:t))
       :-  ~
       (get-raw-tx:con (from-b58:hash:t tid.pole))
+    ::
+        [%heavy-txs pag=@ ~]
+      ^-  (unit (unit heavy-txs))
+      ?~  height=((soft page-number:t) pag.pole)
+        ~
+      ?~  found=(heavy-txs-at u.height)
+        [~ ~]
+      ``u.found
     ::
         [%heavy ~]
       ^-  (unit (unit (unit block-id:t)))
@@ -357,57 +560,28 @@
         (~(get z-by heaviest-chain.d.k) u.num)
       ?~  id
         [~ ~]
-      `(bind (~(get z-by blocks.c.k) u.id) to-page:local-page:t)
+      `(bind (~(get h-by blocks.c.k) u.id) to-page:local-page:t)
     ::
         [%heaviest-chain ~]
+      ::  the tip, not highest-block-height: that is a monotone max over every
+      ::  accepted block, side chains included, so it names a height the
+      ::  heaviest chain need not have reached.
       ^-  (unit (unit [page-number:t block-id:t]))
-      ?~  highest=highest-block-height.d.k
+      ?~  heaviest-block.c.k
         [~ ~]
-      =/  block-id=(unit block-id:t)
-        (~(get z-by heaviest-chain.d.k) u.highest)
-      ?~  block-id
+      =/  lp=(unit local-page:t)  (~(get h-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp
         [~ ~]
       %-  some
       %-  some
-      [u.highest u.block-id]
+      [~(height get:local-page:t u.lp) u.heaviest-block.c.k]
     ::
         [%heaviest-chain-map ~]
       ^-  (unit (unit (z-map page-number:t block-id:t)))
       ``heaviest-chain.d.k
     ::
         [%heaviest-chain-blocks-range start=@ end=@ ~]
-      ^-  (unit (unit (list [page-number:t block-id:t page:t (z-map tx-id:t tx:t)])))
-      =/  start-height  ((soft page-number:t) start.pole)
-      =/  end-height  ((soft page-number:t) end.pole)
-      ?~  start-height  ~
-      ?~  end-height  ~
-      ::  ensure start <= end
-      ?:  (gth u.start-height u.end-height)
-        ``~
-      ::  build list of blocks in range from heaviest chain
-      =/  result=(list [page-number:t block-id:t page:t (z-map tx-id:t tx:t)])
-        =/  height  u.start-height
-        |-  ^-  (list [page-number:t block-id:t page:t (z-map tx-id:t tx:t)])
-        ?:  (gth height u.end-height)
-          ~
-        ::  get block-id from heaviest chain
-        =/  block-id=(unit block-id:t)
-          (~(get z-by heaviest-chain.d.k) height)
-        ?~  block-id
-          $(height +(height))
-        ::  get block data
-        =/  local-block=(unit local-page:t)
-          (~(get z-by blocks.c.k) u.block-id)
-        ?~  local-block
-          $(height +(height))
-        ::  get transactions for this block
-        =/  block-txs=(unit (z-map tx-id:t tx:t))
-          (~(get z-by txs.c.k) u.block-id)
-        =/  txs-map  ?~(block-txs ~ u.block-txs)
-        ::  add to result list
-        :-  [height u.block-id (to-page:local-page:t u.local-block) txs-map]
-        $(height +(height))
-      ``result
+      (heaviest-chain-blocks-range start.pole end.pole)
     ::
         [%desk-hash ~]
       ^-  (unit (unit (unit @uvI)))
@@ -424,14 +598,22 @@
         [%balance bid=@ ~]
       ^-  (unit (unit (z-map nname:t nnote:t)))
       :-  ~
-      %-  ~(get z-by balance.c.k)
+      %+  bind
+      %-  ~(get h-by balance.c.k)
+      (from-b58:hash:t bid.pole)
+      hz-molt
+    ::
+        [%h-balance bid=@ ~]
+      ^-  (unit (unit (h-map nname:t nnote:t)))
+      :-  ~
+      %-  ~(get h-by balance.c.k)
       (from-b58:hash:t bid.pole)
     ::
         [%heaviest-block ~]
       ^-  (unit (unit page:t))
       ?~  heaviest-block.c.k
         [~ ~]
-      =/  heaviest-block  (~(get z-by blocks.c.k) u.heaviest-block.c.k)
+      =/  heaviest-block  (~(get h-by blocks.c.k) u.heaviest-block.c.k)
       ?~  heaviest-block  ~
       ``(to-page:local-page:t u.heaviest-block)
     ::
@@ -439,10 +621,22 @@
       ^-  (unit (unit (z-map nname:t nnote:t)))
       ?~  heaviest-block.c.k
         [~ ~]
-      ?.  (~(has z-by blocks.c.k) u.heaviest-block.c.k)
+      ?.  (~(has h-by blocks.c.k) u.heaviest-block.c.k)
         [~ ~]
       :-  ~
-      %-  ~(get z-by balance.c.k)
+      %+  bind
+      %-  ~(get h-by balance.c.k)
+      u.heaviest-block.c.k
+      hz-molt
+    ::
+        [%h-current-balance ~]
+      ^-  (unit (unit (h-map nname:t nnote:t)))
+      ?~  heaviest-block.c.k
+        [~ ~]
+      ?.  (~(has h-by blocks.c.k) u.heaviest-block.c.k)
+        [~ ~]
+      :-  ~
+      %-  ~(get h-by balance.c.k)
       u.heaviest-block.c.k
     ::
         [%balance-by-first-name first-name=@t ~]
@@ -450,17 +644,15 @@
       =/  first-name=hash:t  (from-b58:hash:t first-name.pole)
       ?~  heaviest-block.c.k
         [~ ~]
-      ?.  (~(has z-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp=(~(get h-by blocks.c.k) u.heaviest-block.c.k)
         [~ ~]
-      ?~  bal=(~(get z-by balance.c.k) u.heaviest-block.c.k)
-        [~ ~]
-      ?~  highest=highest-block-height.d.k
+      ?~  bal=(~(get h-by balance.c.k) u.heaviest-block.c.k)
         [~ ~]
       %-  some
       %-  some
-      :+  u.highest
+      :+  ~(height get:local-page:t u.lp)
         u.heaviest-block.c.k
-      %-  ~(rep z-by u.bal)
+      %-  ~(rep h-by u.bal)
       |=  [[k=nname:t v=nnote:t] bal=(z-map nname:t nnote:t)]
       ?.  =(~(first-name get:nnote:t v) first-name)
         bal
@@ -471,17 +663,15 @@
       =/  pubkey=schnorr-pubkey:t  (from-b58:schnorr-pubkey:t key-b58.pole)
       ?~  heaviest-block.c.k
         [~ ~]
-      ?.  (~(has z-by blocks.c.k) u.heaviest-block.c.k)
+      ?~  lp=(~(get h-by blocks.c.k) u.heaviest-block.c.k)
         [~ ~]
-      ?~  bal=(~(get z-by balance.c.k) u.heaviest-block.c.k)
-        [~ ~]
-      ?~  highest=highest-block-height.d.k
+      ?~  bal=(~(get h-by balance.c.k) u.heaviest-block.c.k)
         [~ ~]
       %-  some
       %-  some
-      :+  u.highest
+      :+  ~(height get:local-page:t u.lp)
         u.heaviest-block.c.k
-      %-  ~(rep z-by u.bal)
+      %-  ~(rep h-by u.bal)
       |=  [[k=nname:t v=nnote:t] pub-bal=(z-map nname:t nnote:t)]
       ::  only include v0 notes; v1 notes use lock-roots
       ?.  ?=(^ -.v)
@@ -496,7 +686,7 @@
       ^-  (unit (unit [(each (z-set sig:t) (z-set hash:t)) (unit page-summary:t)]))
       ?~  heaviest-block.c.k
         ``[[%& ~(key z-by v0-shares.m.k)] ~]
-      =/  heaviest-block  (~(get z-by blocks.c.k) u.heaviest-block.c.k)
+      =/  heaviest-block  (~(get h-by blocks.c.k) u.heaviest-block.c.k)
       ?~  heaviest-block
         ``[[%& ~(key z-by v0-shares.m.k)] ~]
       ?~  highest-block-height.d.k
@@ -515,7 +705,8 @@
       :-  ~
       %~  tap  z-by
       ^-  (z-map block-id:t page:t)
-      %-  ~(run z-by blocks.c.k)
+      %-  hz-molt
+      %-  ~(run h-by blocks.c.k)
       |=  lp=local-page:t
       ^-  page:t
       ?^  -.lp  lp(pow ~)
@@ -524,54 +715,106 @@
         [%tx-accepted tid-b58=@t ~]
       ^-  (unit (unit ?))
       =+  tid=(from-b58:hash:t tid-b58:pole)
-      ``(~(has z-by raw-txs.c.k) tid)
+      ``(~(has h-by raw-txs.c.k) tid)
     ==
+    ::
+    +$  heavy-tx  [=tx-id:t =raw-tx:t]
+    +$  heavy-txs
+      $:  =page-number:t
+          =block-id:t
+          =page:t
+          txs=(list heavy-tx)
+      ==
+    ::
+    ++  heavy-txs-at
+      |=  =page-number:t
+      ^-  (unit heavy-txs)
+      ?~  block-id=(~(get z-by heaviest-chain.d.k) page-number)
+        ~
+      ?~  local-page=(~(get h-by blocks.c.k) u.block-id)
+        ~
+      =/  =page:t  (to-page:local-page:t u.local-page)
+      =/  txs=(list heavy-tx)
+        %+  turn  ~(tap z-in ~(tx-ids get:page:t page))
+        |=  =tx-id:t
+        [tx-id (got-raw-tx:con tx-id)]
+      `[page-number u.block-id page txs]
+    ::
+    ++  heaviest-chain-blocks-range
+      |=  [start=@ end=@]
+      ^-  (unit (unit (list [page-number:t block-id:t page:t (z-map tx-id:t raw-tx:t)])))
+      =/  start-height  ((soft page-number:t) start)
+      =/  end-height  ((soft page-number:t) end)
+      ?~  start-height  ~
+      ?~  end-height  ~
+      ?:  (gth u.start-height u.end-height)
+        ``~
+      =/  result=(list [page-number:t block-id:t page:t (z-map tx-id:t raw-tx:t)])
+        =/  height  u.start-height
+        |-  ^-  (list [page-number:t block-id:t page:t (z-map tx-id:t raw-tx:t)])
+        ?:  (gth height u.end-height)
+          ~
+        ?~  heavy-txs=(heavy-txs-at height)
+          $(height +(height))
+        =/  txs-map=(z-map tx-id:t raw-tx:t)
+          %+  roll  txs.u.heavy-txs
+          |=  [[=tx-id:t =raw-tx:t] acc=(z-map tx-id:t raw-tx:t)]
+          (~(put z-by acc) tx-id raw-tx)
+        :-  [height block-id.u.heavy-txs page.u.heavy-txs txs-map]
+        $(height +(height))
+      ``result
+    --
   ::
   ++  poke
+    ~/  %poke
     |=  [wir=wire eny=@ our=@ux now=@da dat=*]
     ^-  [(list effect:dk) kernel-state:dk]
-    |^
-    =/  old-state  m.k
-    =/  cause  ((soft cause:dk) dat)
-    ?~  cause
-      ~>  %slog.[1 [%leaf "Error: badly formatted cause, should never occur."]]
-      ~&  ;;([thing=@t ver=@ type=@t] [-.dat +<.dat +>-.dat])
-      =/  peer-id  (get-peer-id wir)
-      ?~  peer-id
-        `k
-      ~>  %slog.[1 [leaf+"Peer-id found in wire of badly formatted cause, emitting %liar-peer"]]
-      [[%liar-peer u.peer-id %invalid-fact]~ k]
-    =/  cause  u.cause
-    ::~&  "inner dumbnet cause: {<[-.cause -.+.cause]>}"
-    =^  effs  k
-      ?+    wir  ~|("Unsupported wire: {<wir>}" !!)
-          [%poke src=?(%nc %timer %sys %miner %grpc) ver=@ *]
-        ?-  -.cause
-          %command  (handle-command now eny p.cause)
-          %fact     (handle-fact wir eny our now p.cause)
+    =<  $
+    ~%  %poke-helpers  ..ut  ~
+    |%
+    ++  $
+      =/  old-state  m.k
+      =/  cause  ((soft cause:dk) dat)
+      ?~  cause
+        ~>  %slog.[1 [%leaf "Error: badly formatted cause, should never occur."]]
+        ~&  ;;([thing=@t ver=@ type=@t] [-.dat +<.dat +>-.dat])
+        =/  peer-id  (get-peer-id wir)
+        ?~  peer-id
+          `k
+        ~>  %slog.[1 [leaf+"Peer-id found in wire of badly formatted cause, emitting %liar-peer"]]
+        [[%liar-peer u.peer-id %invalid-fact]~ k]
+      =/  cause  u.cause
+      ::~&  "inner dumbnet cause: {<[-.cause -.+.cause]>}"
+      =^  effs  k
+        ?+    wir  ~|("Unsupported wire: {<wir>}" !!)
+            [%poke src=?(%nc %timer %sys %zk-pow-miner %grpc) ver=@ *]
+          ?-  -.cause
+            %command  (handle-command now eny p.cause)
+            %fact     (handle-fact wir eny our now p.cause)
+          ==
+        ::
+           [%poke %libp2p ver=@ typ=?(%gossip %response) %peer-id =peer-id:dk *]
+          ?>  ?=(%fact -.cause)
+          (handle-fact wir eny our now p.cause)
         ==
-      ::
-         [%poke %libp2p ver=@ typ=?(%gossip %response) %peer-id =peer-id:dk *]
-        ?>  ?=(%fact -.cause)
-        (handle-fact wir eny our now p.cause)
+      ::  possibly update candidate block for mining
+      =^  candidate-changed  m.k  (update-candidate-block:min c.k now)
+      :_  k
+      ?.  candidate-changed  effs
+      :_  effs
+      =/  version=proof-version:sp
+        (height-to-proof-version:con ~(height get:page:t candidate-block.m.k))
+      =/  target  ~(target get:page:t candidate-block.m.k)
+      =/  commit  (block-commitment:page:t candidate-block.m.k)
+      ?-  version
+        %0  [%mine-zk %0 commit target pow-len:t]
+        %1  [%mine-zk %1 commit target pow-len:t]
+        %2  [%mine-zk %2 commit target pow-len:t]
       ==
-    ::  possibly update candidate block for mining
-    =^  candidate-changed  m.k  (update-candidate-block:min c.k now)
-    :_  k
-    ?.  candidate-changed  effs
-    :_  effs
-    =/  version=proof-version:sp
-      (height-to-proof-version:con ~(height get:page:t candidate-block.m.k))
-    =/  target  (~(got z-by targets.c.k) ~(parent get:page:t candidate-block.m.k))
-    =/  commit  (block-commitment:page:t candidate-block.m.k)
-    ?-  version
-      %0  [%mine %0 commit target pow-len:t]
-      %1  [%mine %1 commit target pow-len:t]
-      %2  [%mine %2 commit target pow-len:t]
-    ==
     ::
     ::  +heard-genesis-block: check if block is a genesis block and decide whether to keep it
     ++  heard-genesis-block
+      ~/  %heard-genesis-block
       |=  [wir=wire now=@da eny=@ pag=page:t]
       ^-  [(list effect:dk) kernel-state:dk]
       ?:  (check-duplicate-block ~(digest get:page:t pag))
@@ -591,6 +834,7 @@
       (accept-block now eny pag *tx-acc:t)
     ::
     ++  heard-block
+      ~/  %heard-block
       |=  [wir=wire now=@da pag=page:t eny=@]
       ^-  [(list effect:dk) kernel-state:dk]
       ?:  =(*page-number:t ~(height get:page:t pag))
@@ -606,9 +850,9 @@
         (missing-parent-effects ~(digest get:page:t pag) ~(height get:page:t pag) u.peer-id)
       ::  if we don't have parent and block claims to be heaviest
       ::  request ancestors to catch up or handle reorg
-      ?.  (~(has z-by blocks.c.k) ~(parent get:page:t pag))
+      ?.  (~(has h-by blocks.c.k) ~(parent get:page:t pag))
         ?:  %+  compare-heaviness:page:t  pag
-            (~(got z-by blocks.c.k) u.heaviest-block.c.k)
+            (~(got h-by blocks.c.k) u.heaviest-block.c.k)
           =/  peer-id=(unit @)  (get-peer-id wir)
           ?~  peer-id
             ~|("heard-block: Unsupported wire: {<wir>}" !!)
@@ -657,7 +901,7 @@
         ::  block has bad data
         :_  k
         ::  the order here matters since we want to add the block to tracking
-        ::  and then ban the peer who sent it. we do this instead of %liar-peer
+        ::  and then ban the peer who sent it. this path replaces %liar-peer
         ::  since its possible for another poke to be processed after %track %add
         ::  but before %liar-block-id, so more peers may be added to tracking
         ::  before %liar-block-id is processed.
@@ -673,7 +917,7 @@
       ::
       ::  tell driver we have seen this block so don't send it back to the kernel again
       =.  block-effs
-        [[%seen %block ~(digest get:page:t pag) `~(height get:page:t pag)] block-effs]
+        [[%seen %block ~(digest get:page:t pag) ~] block-effs]
       ::  stop tracking block id as soon as we verify pow
       =.  block-effs
         %+  snoc  block-effs
@@ -694,7 +938,7 @@
           [%request %raw-tx %by-id tx-id]
         :_  k
         ?:  %+  compare-heaviness:page:t  pag
-            (~(got z-by blocks.c.k) (need heaviest-block.c.k))
+            (~(got h-by blocks.c.k) (need heaviest-block.c.k))
           ~>  %slog.[0 'heard-block: Gossiping new heaviest block (transactions pending validation)']
           :-  [%gossip %0 %heard-block pag]
           block-effs
@@ -706,6 +950,7 @@
     ::
     ::  +heard-elders: handle response to parent hashes request
     ++  heard-elders
+      ~/  %heard-elders
       |=  [wir=wire now=@da oldest=page-number:t ids=(list block-id:t)]
       ^-  [(list effect:dk) kernel-state:dk]
       ::  extract peer ID from wire
@@ -730,6 +975,14 @@
         ::  either oldest is genesis OR we must have received exactly 24 ids
         :_  k
         [[%liar-peer u.peer-id %less-than-24-parent-hashes]~]
+      ::  +get-elders seeds its accumulator with the block at the top of the
+      ::  window, so an elders response naming no ancestor at all is not one
+      ::  this kernel can produce. Rejecting it also keeps the walk below,
+      ::  which starts at .oldest + .ids-lent - 1, from decrementing zero.
+      ?:  =(0 ids-lent)
+        ~>  %slog.[1 'heard-elders: No parent hashes received']
+        :_  k
+        [[%liar-peer u.peer-id %no-parent-hashes]~]
       ::
       =/  log-message
         %^  cat  3
@@ -741,9 +994,12 @@
         =/  height  (dec (add oldest ids-lent))
         |-
         ?~  ids  ~
-        ?:  =(height 0)  ~
-        ?:  (~(has z-by blocks.c.k) i.ids)
+        ?:  (~(has h-by blocks.c.k) i.ids)
           `[i.ids height]
+        ::  a window reaching genesis intersects there or not at all: genesis is
+        ::  the last id such a window carries, and its height cannot be
+        ::  decremented. the membership test must therefore precede this.
+        ?:  =(height *page-number:t)  ~
         $(ids t.ids, height (dec height))
       ?~  latest-known
         ?:  =(oldest *page-number:t)
@@ -783,12 +1039,14 @@
       [%request %block %by-height +(page-number.u.latest-known)]~
     ::
     ++  check-duplicate-block
+      ~/  %check-duplicate-block
       |=  digest=block-id:t
-      ?|  (~(has z-by blocks.c.k) digest)
-          (~(has z-by pending-blocks.c.k) digest)
+      ?|  (~(has h-by blocks.c.k) digest)
+          (~(has h-by pending-blocks.c.k) digest)
       ==
     ::
     ++  check-genesis
+      ~/  %check-genesis
      |=  [pag=page:t btc-hash=(unit btc-hash:t) =genesis-seal:t]
      ^-  ?
      =/  check-digest  (check-digest:page:t pag)
@@ -852,6 +1110,7 @@
          check-btc-hash
      ==
     ++  check-pow
+      ~/  %check-pow
       |=  pag=page:t
       ^-  ?
       ?.  check-pow-flag:t
@@ -864,6 +1123,7 @@
       ::
       ::  validate that powork puzzle in the proof is correct.
       ?&  (check-pow-puzzle u.pow pag)
+          (canonical-pow-proof:dk [~(height get:page:t pag) u.pow])
           ::
           ::  validate the powork. this is done separately since the
           ::  other checks are much cheaper.
@@ -871,6 +1131,7 @@
       ==
     ::
     ++  check-pow-puzzle
+      ~/  %check-pow-puzzle
       |=  [pow=proof:sp pag=page:t]
       ^-  ?
       ?:  =((lent objects.pow) 0)
@@ -883,6 +1144,7 @@
       ==
     ::
     ++  heard-tx
+      ~/  %heard-tx
       |=  [wir=wire now=@da raw=raw-tx:t eny=@]
       ^-  [(list effect:dk) kernel-state:dk]
       ~>  %slog.[0 'heard-tx: Received raw transaction']
@@ -891,20 +1153,45 @@
       ::
       ::  check if we already have raw-tx
       ?:  (has-raw-tx:con ~(id get:raw-tx:t raw))
-        :: do almost nothing (idempotency), we already have it
-        :: but do tell the runtime we've already seen it
+        ::  Duplicate txs are never re-added to the mempool. Peer-origin
+        ::  duplicates emit only %seen; echoing them would create gossip loops.
+        ::  Local grpc duplicates are operator re-submissions and are gossiped
+        ::  immediately. New-heaviest events also announce retained txs, but
+        ::  wallet resends should not wait for block progress.
+        =/  re-gossip=?  (local-tx-submission wir)
         =/  log-message
           %^  cat  3
-           'heard-tx: Transaction id already seen: '
+            ?:  re-gossip
+              'heard-tx: Transaction id already seen, re-broadcasting: '
+            'heard-tx: Transaction id already seen: '
           id-b58
         ~>  %slog.[1 log-message]
+        =/  seen=(list effect:dk)
+          [%seen %tx ~(id get:raw-tx:t raw)]~
         :_  k
-        [%seen %tx ~(id get:raw-tx:t raw)]~
+        ?.  re-gossip  seen
+        [[%gossip %0 %heard-tx raw] seen]
       ::
       ::  check if the raw-tx contents are in base field
       ?.  (based:raw-tx:t raw)
         :_  k
         [(liar-effect wir %raw-tx-not-based)]~
+      ::
+      ::  reject transactions too large to ever fit in a block. this closes
+      ::  the pre-packing / block-creation asymmetry: mempool acceptance did
+      ::  not bound tx size, so an oversize tx passed here, was gossiped, and
+      ::  then could never be mined -- consensus +check-size rejected any
+      ::  block that included it. we mirror that accounting here (a block is
+      ::  +compute-size-without-txs plus the size of every included tx) using
+      ::  an empty page as the block-overhead floor, so a tx that would not
+      ::  fit even in an otherwise-empty block is discarded on receipt rather
+      ::  than propagated.
+      =/  tx-size=@  ~(size get:raw-tx:t raw)
+      ?:  %+  gth
+            (add tx-size (compute-size-without-txs:page:t *page:t))
+          max-block-size:t
+        ~>  %slog.[1 'heard-tx: Transaction too large to fit in a block, discarding']
+        `k
       ::
       ::  check tx-id. this is faster than calling validate:raw-tx (which also checks the id)
       ::  so we do it first
@@ -932,9 +1219,9 @@
           ::  won't accidentally throw out a block that contained a valid tx-id
           ::  just because we received a tx that claimed the same id as the valid
           ::  one.
-          =/  tx-pending-blocks  (~(get z-ju blocks-needed-by.c.k) ~(id get:raw-tx:t raw))
+          =/  tx-pending-blocks  (~(get h-ju blocks-needed-by.c.k) ~(id get:raw-tx:t raw))
           =.  c.k
-            %-  ~(rep z-in tx-pending-blocks)
+            %-  ~(rep h-in tx-pending-blocks)
             |=  [id=block-id:t c=_c.k]
             =.  c.k  c
             (reject-pending-block:con id)
@@ -966,6 +1253,39 @@
         :_  k
         [(liar-effect wir %tx-inputs-not-in-spent-by-and-invalid)]~
       ::
+      ::  for v1 transactions, validate against current context so
+      ::  timelocks and lock requirements are enforced at receipt
+      =/  ctx-valid=(reason:t ~)
+        ?^  -.raw
+          [%.y ~]
+        %-  validate-with-context:spends:t
+        :*  get-cur-balance:con
+            spends.raw
+            get-cur-height:con
+            max-size.data.constants.k
+            bythos-phase.constants.k
+        ==
+      ?.  ?=(%.y -.ctx-valid)
+        ~>  %slog.[1 (cat 3 'heard-tx: Transaction context invalid: ' +.ctx-valid)]
+        `k
+      ::
+      ::  a tx must pay what a block carrying it will require. +v1-to-v1
+      ::  applies this bound during block validation and candidate packing, so
+      ::  a tx paying less can never be mined; admitting one anyway leaves it
+      ::  gossiped, retained, re-gossiped on every new heaviest block and
+      ::  re-processed by the miner on every candidate refresh, with its
+      ::  inputs pinned in .spent-by so the sender cannot replace it. the bound
+      ::  is measured at the earliest height that could carry the tx, which is
+      ::  the height +v1-to-v1 will measure it at.
+      =/  fee-sufficient=?
+        ?^  -.raw  %.y
+        =/  next-height=page-number:t  +(get-cur-height:con)
+        %+  gte  (roll-fees:spends:t spends.raw)
+        (calculate-min-fee:spends:t [spends.raw next-height])
+      ?.  fee-sufficient
+        ~>  %slog.[1 'heard-tx: Fee below what a block would require, discarding']
+        `k
+      ::
       =^  work  c.k
         (add-raw-tx:con raw)
       :: no blocks were depending on this so work should be empty
@@ -977,6 +1297,7 @@
     ::
     ::  +process-ready-blocks: process blocks no longer waitings on txs
     ++  process-ready-blocks
+      ~/  %process-ready-blocks
       |=  [now=@da eny=@ work=(list block-id:t) =raw-tx:t]
       ^-  [(list effect:dk) kernel-state:dk]
       ::  .work contains block-ids for blocks that no longer have any
@@ -990,7 +1311,7 @@
         =^  new-effs  k
           %:  process-block-with-txs
             now  eny
-            page:(~(got z-by pending-blocks.c.k) bid)
+            page:(~(got h-by pending-blocks.c.k) bid)
             :: if the block is bad, then tell the driver we dont want to see it
             :: again
             ~[[%seen %block bid ~]]
@@ -1016,6 +1337,7 @@
     ::    only if the block is bad. If the block is good then ++accept-block
     ::    emits effects and bad-block-effs is ignored.
     ++  process-block-with-txs
+      ~/  %process-block-with-txs
       |=  [now=@da eny=@ pag=page:t bad-block-effs=(list effect:dk)]
       ^-  [(list effect:dk) kernel-state:dk]
       =/  digest-b58  (to-b58:hash:t ~(digest get:page:t pag))
@@ -1042,6 +1364,7 @@
     ::
     ::  +accept-block: update kernel state with new valid block.
     ++  accept-block
+      ~/  %accept-block
       |=  [now=@da eny=@ pag=page:t acc=tx-acc:t]
       ^-  [(list effect:dk) kernel-state:dk]
       ::
@@ -1081,7 +1404,10 @@
         ~>  %slog.[0 'accept-block: New heaviest block!']
         =/  span=span-effect:dk
           :+  %span  %new-heaviest-chain
-          ~['block_height'^n+~(height get:page:t pag) 'heaviest_block_digest'^s+(to-b58:hash:t ~(digest get:page:t pag))]
+          :~  'block_height'^n+~(height get:page:t pag)
+              'heaviest_block_digest'^s+(to-b58:hash:t ~(digest get:page:t pag))
+              'block_target'^s+(scot %ux (merge:bignum:t ~(target get:page:t pag)))
+          ==
         :*  [%gossip %0 %heard-block pag]
             span
             effs
@@ -1117,29 +1443,52 @@
           ==
         [orphaned-block-span reorg-span effs]
       ::
+      ::  Update derived state BEFORE garbage collection, which needs the
+      ::  canonical page-number -> block-id index (heaviest-chain.d.k) to tell
+      ::  an orphaned block from one on the heaviest chain. On a reorg this
+      ::  index only names the winning chain once +update has run, so
+      ::  collecting first would classify blocks against the chain we just
+      ::  left. +update walks the heaviest chain's parents, which garbage
+      ::  collection never drops, and nothing between here and the old call
+      ::  site reads d.k -- so it is safe to hoist.
+      =.  d.k  (update:der c.k pag)
+      ::
+      ::  The reorg above abandoned the branch ending at .old-heavy. Hand that
+      ::  branch's transactions back to the mempool. +accept-block claimed every
+      ::  tx for the block that carried it, and until now nothing ever released
+      ::  an ACCEPTED block's claim (only +reject-pending-block, for pending
+      ::  ones) -- so every tx on an orphaned branch was stranded for good:
+      ::  invisible to the miner, never re-gossiped, never garbage collected,
+      ::  and with its inputs pinned in spent-by so no replacement tx could
+      ::  spend those notes either. Releasing here (rather than waiting for
+      ::  +sweep-orphan-blocks) is what makes an orphaned tx promptly mineable
+      ::  again. The blocks themselves stay in .blocks until the sweep retires
+      ::  them, so a chain that reorgs back is unaffected.
+      =?  c.k  is-reorg
+        ?~  old-heavy  c.k
+        (release-orphaned-branch:con u.old-heavy heaviest-chain.d.k)
+      ::
       ::  Garbage collect pending blocks and excluded transactions.
       ::  Garbage collection only runs when we receive a new heaviest
       ::  block, since that's when the block height advances and we can
       ::  determine what's expired. Pending blocks are removed based on
       ::  elapsed heaviest blocks since they were heard. Excluded txs are
       ::  removed based on the same criteria with the added check that they
-      ::  they aren't spent in the current heaviest chain.
+      ::  they aren't spent in the current heaviest chain -- which is also what
+      ::  drops a tx just handed back by +release-orphaned-branch above, if the
+      ::  winning chain spent its inputs via some other tx.
       =?  c.k  is-new-heaviest
         (garbage-collect:con retain.a.k)
       ::
       ::  if new block is heaviest, regossip txs that haven't been garbage collected
       =?  effs  is-new-heaviest
-        %-  ~(rep z-in excluded-txs.c.k)
-        |=  [=tx-id:t effs=_effs]
-        [[%gossip %0 %heard-tx (got-raw-tx:con tx-id)] effs]
+        (weld regossip-excluded-txs-effects effs)
       ::  regossip block transactions if mining
       =.  effs  (weld (regossip-block-txs-effects pag) effs)
       ::
       ::  tell the miner about the new block
       =.  m.k  (heard-new-block:min c.k now)
       ::
-      ::  update derived state
-      =.  d.k  (update:der c.k pag)
       ?.  =(old-heavy heaviest-block.c.k)
         =^  mining-effs  k  do-mine
         =.  effs  (weld mining-effs effs)
@@ -1154,6 +1503,7 @@
     ::    the miner module or +do-genesis. in this case we just emit a
     ::    warning and crash, since that means there's a bug.
     ++  liar-effect
+      ~/  %liar-effect
       |=  [wir=wire r=term]
       ^-  effect:dk
       ?+    wir  ~|("liar-effect: Bad wire for liar effect! {<wir>}" !!)
@@ -1164,12 +1514,9 @@
         ~|  'liar-effect: ATTN: received a bad block or tx via grpc driver'
         !!
       ::
-          [%poke %miner *]
-        ::  this indicates that the mining module built a bad block and then
-        ::  told the kernel about it. alternatively, +do-genesis produced
-        ::  a bad genesis block. this should never happen, it indicates
-        ::  a serious bug otherwise.
-        ~|  'liar-effect: ATTN: miner or +do-genesis produced a bad block!'
+          [%poke %zk-pow-miner *]
+        ::  A failed ZK-miner block is a local construction failure.
+        ~|  'liar-effect: ATTN: zk-pow-miner or +do-genesis produced a bad block!'
         !!
       ::
           [%poke %sys *]
@@ -1181,6 +1528,7 @@
       ==
     ::
     ++  get-peer-id
+      ~/  %get-peer-id
       |=  wir=wire
       ^-  (unit @)
       =/  =(pole)  wir
@@ -1188,7 +1536,23 @@
         ~
       (some id.pole)
     ::
+    ::  +local-tx-submission: did this poke come from the local grpc driver?
+    ::
+    ::    true only for the %grpc wire, which the grpc driver stamps on pokes
+    ::    it makes on behalf of a local client (e.g. `nockchain-wallet
+    ::    send-tx`). a tx gossiped to us by a peer arrives on a %libp2p wire
+    ::    and is never a local submission. used by +heard-tx to decide whether
+    ::    re-hearing a tx we already hold should re-announce it; answering
+    ::    %.y for a peer-sourced wire would create an infinite gossip loop.
+    ++  local-tx-submission
+      ~/  %local-tx-submission
+      |=  wir=wire
+      ^-  ?
+      =/  =(pole)  wir
+      ?=([%poke %grpc ver=@ *] pole)
+    ::
     ++  handle-command
+      ~/  %handle-command
       |=  [now=@da eny=@ =command:dk]
       ^-  [(list effect:dk) kernel-state:dk]
       ~>  %slog.[0 (cat 3 'handle-command: ' -.command)]
@@ -1262,7 +1626,7 @@
         :: of height N+1
         :: Also emit %seen for the heaviest block so our cache can start to update
         =/  height=page-number:t
-          +(~(height get:local-page:t (~(got z-by blocks.c.k) u.heaviest-block.c.k)))
+          +(~(height get:local-page:t (~(got h-by blocks.c.k) u.heaviest-block.c.k)))
         =/  born-effects=(list effect:dk)
           :~  [%request %block %by-height height]
               [%seen %block u.heaviest-block.c.k `height]
@@ -1277,19 +1641,22 @@
       ++  do-pow
         ^-  [(list effect:dk) kernel-state:dk]
         ?>  ?=([%pow *] command)
-        =/  commit=block-commitment:t
-          (block-commitment:page:t candidate-block.m.k)
-        ?.  =(bc.command commit)
-          ~>  %slog.[1 'do-pow: Mined for wrong (old) block commitment']
+        ?-  -.pv.command
+            %dumb-zkpow
+          =/  commit=block-commitment:t
+            (block-commitment:page:t candidate-block.m.k)
+          ?.  =(bc.pv.command commit)
+            ~>  %slog.[1 'do-pow: Mined for wrong (old) block commitment']
+            [~ k]
+          ?:  %+  check-target:mine  dig.pv.command
+              ~(target get:page:t candidate-block.m.k)
+            =.  m.k  (set-pow:min prf.pv.command)
+            =.  m.k  set-digest:min
+            =^  heard-block-effs  k  (heard-block /poke/zk-pow-miner now candidate-block.m.k eny)
+            :_  k
+            heard-block-effs
           [~ k]
-        ?:  %+  check-target:mine  dig.command
-            (~(got z-by targets.c.k) ~(parent get:page:t candidate-block.m.k))
-          =.  m.k  (set-pow:min prf.command)
-          =.  m.k  set-digest:min
-          =^  heard-block-effs  k  (heard-block /poke/miner now candidate-block.m.k eny)
-          :_  k
-          heard-block-effs
-        [~ k]
+        ==
       ::
       ++  do-set-mining-key
         ^-  [(list effect:dk) kernel-state:dk]
@@ -1318,12 +1685,10 @@
         ?:  (gth (lent v1.command) 2)
         ~>  %slog.[1 'do-set-mining-key-advanced: Coinbase split for more than two public-key hashes not yet supported, exiting']
           [[%exit 1]~ k]
-        ?~  v0.command
-        ~>  %slog.[1 'do-set-mining-key-advanced: Empty list of sigs, exiting.']
-          [[%exit 1]~ k]
-        ::
-        ?~  v1.command
-        ~>  %slog.[1 'do-set-mining-key-advanced: Empty list of public key hashes, exiting.']
+        ::  A standalone v1 miner supplies no legacy v0 signatures; only an
+        ::  entirely empty reward configuration is invalid.
+        ?:  ?&(?=(~ v0.command) ?=(~ v1.command))
+          ~>  %slog.[1 'do-set-mining-key-advanced: No keys provided, exiting.']
           [[%exit 1]~ k]
         ::
         =/  [v0-shares=(list [sig:t @]) crash=?]
@@ -1352,8 +1717,8 @@
         ?:  crash
           ~>  %slog.[1 'do-set-mining-key-advanced: Invalid public keys provided, exiting']
           [[%exit 1]~ k]
-        =.  m.k  (set-v0-shares:min v0-shares)
-        =.  m.k  (set-shares:min shares)
+        =?  m.k  ?=(^ v0-shares)  (set-v0-shares:min v0-shares)
+        =?  m.k  ?=(^ shares)     (set-shares:min shares)
         `k
       ::
       ++  do-enable-mining
@@ -1381,7 +1746,9 @@
         ::~&  >  'generation of candidate blocks enabled.'
         =.  m.k  (set-mining:min p.command)
         =.  m.k  (heard-new-block:min c.k now)
-        `k
+        ::  Enabling an external miner emits its first candidate without waiting
+        ::  for the periodic candidate refresh.
+        do-mine
       ::
       ++  do-timer
         ::TODO post-dumbnet: only rerequest transactions a max of once/twice (maybe an admin param)
@@ -1400,7 +1767,7 @@
         =/  heavy-height=page-number:t
           ?~  heaviest-block.c.k
             *page-number:t  ::  rerequest genesis block
-          +(~(height get:local-page:t (~(got z-by blocks.c.k) u.heaviest-block.c.k)))
+          +(~(height get:local-page:t (~(got h-by blocks.c.k) u.heaviest-block.c.k)))
         =.  effects
           [[%request %block %by-height heavy-height] effects]
         =.  effects
@@ -1429,6 +1796,7 @@
       --::+handle-command
     ::
     ++  handle-fact
+      ~/  %handle-fact
       |=  [wir=wire eny=@ our=@ux now=@da =fact:dk]
       ^-  [(list effect:dk) kernel-state:dk]
       ~>  %slog.[0 (cat 3 'handle-fact: ' +<.fact)]
@@ -1464,7 +1832,7 @@
             %2  [%2 commit target pow-len:t]
           ==
         :_  k
-        [%mine mine-start]~
+        [%mine-zk mine-start]~
       ::
       ::  only send a %elders request for reasonable heights
       ++  missing-parent-effects
@@ -1509,17 +1877,27 @@
         ~>  %slog.[0 log-message]
         [%request %block %elders block-id peer-id]~ :: ask for elders
     ::
+    ::  re-gossip retained mempool txs.
+    ++  regossip-excluded-txs-effects
+      ^-  (list effect:dk)
+      %-  ~(rep h-in excluded-txs.c.k)
+      |=  [=tx-id:t effects=(list effect:dk)]
+      ^-  (list effect:dk)
+      [[%gossip %0 %heard-tx (got-raw-tx:con tx-id)] effects]
+    ::
     ::  only if mining: re-gossip transactions included in block when block is fully validated
-    ::  precondition: all transactions for block are in raw-txs
+    ::  transactions can be absent after candidate filtering or block acceptance
     ++  regossip-block-txs-effects
+      ~/  %regossip-block-txs-effects
       |=  =page:t
       ^-  (list effect:dk)
       ?:  no-keys-set:min  ~
       %-  ~(rep z-in ~(tx-ids get:page:t page))
       |=  [=tx-id:t effects=(list effect:dk)]
       ^-  (list effect:dk)
-      =/  tx=raw-tx:t  raw-tx:(~(got z-by raw-txs.c.k) tx-id)
-      =/  fec=effect:dk  [%gossip %0 %heard-tx tx]
+      =/  tx  (~(get h-by raw-txs.c.k) tx-id)
+      ?~  tx  effects
+      =/  fec=effect:dk  [%gossip %0 %heard-tx raw-tx.u.tx]
       [fec effects]
     ::
     ::  only if mining: regossip transactions included in candidate block

@@ -1,0 +1,94 @@
+load("//:rules_hoon/defs.bzl", "honk_library", "hoon_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Arbitrary-build parity for the hoon-138 prelude, under Bazel: hoonc's
+# arbitrary build of hoon-138 vs honk's NATIVE self-mint
+# (HONK_NATIVE_PARITY=1, no embedded prelude), byte-compared with `cmp`.
+# Both sides compile inside the sandbox from the same full hoon source tree
+# (ALL_HOON_FILES below), so the artifacts are directly comparable with no
+# waiver. This is the
+# Bazel twin of `just honk-138-parity` (which builds the same pair locally).
+
+ALL_HOON_FILES = [
+    # An --arbitrary build scans the entire deps tree, and Bazel globs do not
+    # cross package boundaries — `//hoon:files` alone omits every subpackage.
+    # Both sides of the pairing MUST use this same list: the artifact embeds a
+    # hash of the directory tree the compiler sees.
+    "//hoon:files",
+    "//hoon/apps/bridge:files",
+    "//hoon/apps/dumbnet:files",
+    "//hoon/apps/dumbnet/lib:files",
+    "//hoon/apps/hoonc:files",
+    "//hoon/apps/peek:files",
+    "//hoon/apps/roswell:files",
+    "//hoon/apps/wallet:files",
+    "//hoon/apps/wallet/lib:files",
+    "//hoon/common:files",
+    "//hoon/common/markdown:files",
+    "//hoon/common/stark:files",
+    "//hoon/common/ztd:files",
+    "//hoon/dat:files",
+    "//hoon/jams:files",
+    "//hoon/tests:files",
+]
+
+hoon_library(
+    name = "hoon_138_ref",
+    src = "//hoon/common:hoon.hoon",
+    arbitrary = True,
+    output = True,
+    deps = ALL_HOON_FILES,
+)
+
+honk_library(
+    name = "hoon_138_native",
+    src = "//hoon/common:hoon.hoon",
+    arbitrary = True,
+    native_parity = True,
+    deps = ALL_HOON_FILES,
+)
+
+sh_test(
+    name = "hoon_138_arbitrary_parity_test",
+    srcs = ["//assets/native:kernel_parity_test.sh"],
+    size = "small",
+    args = [
+        "$(rootpath :hoon_138_ref)",
+        "$(rootpath :hoon_138_native)",
+    ],
+    data = [
+        ":hoon_138_native",
+        ":hoon_138_ref",
+    ],
+)
+
+# Uncached compile benchmark for the hoon-138 arbitrary build: times hoonc's
+# arbitrary build vs honk's native self-mint (HONK_NATIVE_PARITY=1) from cold
+# state at TEST TIME (outside Bazel's action cache) and reports a comparison.
+# Manual — invoke explicitly:
+#   bazel test --test_output=streamed //crates/honk/test-assets:hoon_138_compile_bench
+#   bazel run //crates/honk/test-assets:hoon_138_compile_bench
+# NOTE: the honk self-mint peaks ~14GB RSS.
+sh_test(
+    name = "hoon_138_compile_bench",
+    timeout = "eternal",
+    srcs = ["//assets/native:compile_bench.sh"],
+    args = [
+        "hoon-138",
+        "arbitrary",
+        "$(rootpath //crates/hoonc:hoonc_bin)",
+        "$(rootpath //crates/honk:honk)",
+        "$(rootpath //hoon/common:hoon.hoon)",
+        "hoon",
+    ],
+    data = [
+        "//crates/honk:honk",
+        "//crates/hoonc:hoonc_bin",
+        "//hoon/common:hoon.hoon",
+    ] + ALL_HOON_FILES,
+    tags = [
+        "benchmark",
+        "manual",
+    ],
+)

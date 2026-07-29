@@ -2,7 +2,6 @@
 name = "http-server"
 version = "0.1.0"
 edition = "2021"
-authors = ["N. E. Davis <neal@zorp.io>"]
 description = "A NockApp project"
 
 [[bin]]

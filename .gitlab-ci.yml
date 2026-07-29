@@ -1,0 +1,186 @@
+stages:
+  - docs
+  - kernels
+  - test
+  - sync
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/open-sync-/'
+    - if: '$CI_COMMIT_BRANCH == "open"'
+    - if: '$CI_MERGE_REQUEST_ID'
+    - when: never
+
+default:
+  tags:
+    - hetzner
+
+variables:
+  RUST_LOG: "warn,slogger=off"
+  GIT_CLEAN_FLAGS: "-ffdx -e .bazel/"
+
+open-sync-merge-train-gate:
+  stage: test
+  needs: []
+  rules:
+    - &open_sync_merge_train_rule
+      if: '$CI_MERGE_REQUEST_EVENT_TYPE == "merge_train" && $CI_MERGE_REQUEST_TARGET_BRANCH_NAME == "open" && $CI_MERGE_REQUEST_SOURCE_BRANCH_NAME =~ /^ci\/open-sync(-.*)?$/'
+  script:
+    - echo "Automated open-sync MR was already validated by the merged-result pipeline."
+
+docs-check:
+  stage: docs
+  needs: []
+  rules:
+    - <<: *open_sync_merge_train_rule
+      when: never
+    - if: '$CI_MERGE_REQUEST_ID'
+      changes:
+        - "**/*.md"
+        - "scripts/docs/**/*"
+        - "Makefile"
+        - ".gitlab-ci.yml"
+    - if: '$CI_COMMIT_BRANCH == "open"'
+      changes:
+        - "**/*.md"
+        - "scripts/docs/**/*"
+        - "Makefile"
+        - ".gitlab-ci.yml"
+    - if: '$CI_COMMIT_BRANCH =~ /^ci\/open-sync-/'
+      changes:
+        - "**/*.md"
+        - "scripts/docs/**/*"
+        - "Makefile"
+        - ".gitlab-ci.yml"
+    - when: never
+  script:
+    - |
+      nix develop -c bash -c '
+        set -euo pipefail
+        make docs-check
+      '
+
+build-kernels:
+  stage: kernels
+  # Kernel build + cargo-test gate the merge request into `open` (the
+  # required pre-merge check). Re-running them on the post-merge `open`
+  # push only delays sync-to-staging by ~2h, so skip them there.
+  rules:
+    - <<: *open_sync_merge_train_rule
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "open"'
+      when: never
+    - when: on_success
+  script:
+    - |
+      nix develop -c bash -c '
+        set -euo pipefail
+        make update-hoonc
+        # Hoon's compiler cache is process-global; build kernel jams serially.
+        make assets/dumb.jam
+        make assets/wal.jam
+        make assets/miner.jam
+        make assets/peek.jam
+        make assets/bridge.jam
+        make assets/roswell.jam
+      '
+  artifacts:
+    paths:
+      - assets/*.jam
+    expire_in: 1 day
+
+cargo-test:
+  stage: test
+  needs:
+    - job: build-kernels
+      artifacts: true
+  # See build-kernels: validated on the MR into `open`, skipped on push.
+  rules:
+    - <<: *open_sync_merge_train_rule
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "open"'
+      when: never
+    - when: on_success
+  script:
+    - |
+      nix develop -c bash -c '
+        set -euo pipefail
+        export PATH="$HOME/.local/bin:$PATH"
+        # Install Solidity dependencies for the bridge build script
+        make -C crates/bridge/contracts deps
+        make check-cargo-fmt
+        cargo test --release
+      '
+
+cargo-clippy:
+  stage: test
+  needs:
+    - job: build-kernels
+      artifacts: true
+  # See build-kernels: validated on the MR into `open`, skipped on push.
+  rules:
+    - <<: *open_sync_merge_train_rule
+      when: never
+    - if: '$CI_COMMIT_BRANCH == "open"'
+      when: never
+    - when: on_success
+  script:
+    - |
+      nix develop -c bash -c '
+        set -euo pipefail
+        export PATH="$HOME/.local/bin:$PATH"
+        # Install Solidity dependencies for the bridge build script
+        make -C crates/bridge/contracts deps
+        # Same clippy flags as the upstream repo (see `make lint-local`).
+        cargo clippy --all-targets -- -Dwarnings -Dclippy::unwrap_used -Aclippy::missing_safety_doc -Aclippy::result_large_err -Aclippy::unnecessary_cast -Aclippy::unnecessary_sort_by -Aclippy::collapsible_match -Aclippy::manual_checked_ops -Aclippy::while_let_loop
+      '
+
+sync-to-staging:
+  stage: sync
+  # Build/test validation already ran as a required check on the MR into
+  # `open`; the post-merge `open` pipeline only publishes, so don't gate on
+  # (or wait ~2h for) the build/test jobs.
+  needs: []
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "open" && $CI_PIPELINE_SOURCE == "push"'
+    - if: '$CI_COMMIT_BRANCH == "open" && $FORCE_SYNC_TO_STAGING == "1"'
+    - if: '$CI_COMMIT_BRANCH == "open" && $CI_PIPELINE_SOURCE == "web"'
+      when: manual
+    - when: never
+  script:
+    - |
+      nix develop -c bash -c '
+        set -euo pipefail
+
+        # Guardrails for accidental private-code export.
+        if git ls-files | rg -q "^closed/"; then
+          echo "closed/ paths detected; refusing to sync to staging" >&2
+          exit 1
+        fi
+
+        if git ls-files | rg -q "^open/"; then
+          echo "open/ subtree detected in open branch checkout; refusing to sync" >&2
+          exit 1
+        fi
+
+        if [ -z "${GITHUB_NOCKCHAIN_STAGING_TOKEN:-}" ]; then
+          echo "GITHUB_NOCKCHAIN_STAGING_TOKEN is required for sync-to-staging" >&2
+          exit 1
+        fi
+
+        # The committed Cargo.lock is derived from the monorepo lockfile by
+        # prepare_open_repo.rs (same dependency versions) and is required by
+        # the Bazel crate_universe; do not regenerate it here, that would
+        # re-resolve to different versions. Just verify it shipped.
+        if [ ! -f Cargo.lock ]; then
+          echo "Cargo.lock missing from open branch checkout; refusing to sync" >&2
+          exit 1
+        fi
+
+        echo "https://bitemyapp:${GITHUB_NOCKCHAIN_STAGING_TOKEN}@github.com" > ~/.git-credentials
+        git config --global credential.helper store
+        git config --global user.name "Nockchain CI"
+        git config --global user.email "ci@nockchain.org"
+
+        bash ./tools/sync_to_staging/sync_to_staging.sh
+      '

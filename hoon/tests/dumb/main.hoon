@@ -1,0 +1,43 @@
+/=  tt  /common/test
+/=  tx-tests  /tests/dumb/mod/unit/transact
+/=  tx-v1-tests  /tests/dumb/mod/unit/transact-v1
+/=  con-tests  /tests/dumb/mod/unit/consensus
+/=  h-zoon-con-tests  /tests/dumb/mod/unit/h-zoon-consensus
+/=  asert-tests  /tests/dumb/mod/unit/asert
+/=  asert-mainnet-vectors-tests  /tests/dumb/mod/unit/asert-mainnet-vectors
+/=  asert-int-tests  /tests/dumb/mod/integration/asert-activation
+/=  pen-tests  /tests/dumb/mod/integration/pending
+/=  mempool-tests  /tests/dumb/mod/integration/mempool
+/=  merk-proof-tests  /tests/dumb/mod/unit/lock-merkle-proof
+/=  bythos-tests  /tests/dumb/mod/unit/bythos-gating
+/=  review-fix-tests  /tests/dumb/mod/unit/review-fixes
+/=  emissions-tests  /tests/dumb/mod/unit/emissions
+/=  coinbase-split-tests  /tests/dumb/mod/unit/coinbase-split
+/=  block-size-tests  /tests/dumb/mod/unit/block-size
+/=  fund-split-tests  /tests/dumb/mod/integration/fund-split
+/=  benches  /tests/dumb/mod/benchmarks/huge-tx
+/=  h-zoon-benches  /tests/dumb/mod/benchmarks/h-zoon-hot-path
+/=  pending-scale-benches  /tests/dumb/mod/benchmarks/pending-blocks-scale
+|=  name=term
+^-  (list test-arm:tt)
+;:  weld
+  (get-prefix-arms:tt name !>(tx-tests))
+  (get-prefix-arms:tt name !>(tx-v1-tests))
+  (get-prefix-arms:tt name !>(con-tests))
+  (get-prefix-arms:tt name !>(h-zoon-con-tests))
+  (get-prefix-arms:tt name !>(asert-tests))
+  (get-prefix-arms:tt name !>(asert-mainnet-vectors-tests))
+  (get-prefix-arms:tt name !>(asert-int-tests))
+  (get-prefix-arms:tt name !>(pen-tests))
+  (get-prefix-arms:tt name !>(mempool-tests))
+  (get-prefix-arms:tt name !>(merk-proof-tests))
+  (get-prefix-arms:tt name !>(bythos-tests))
+  (get-prefix-arms:tt name !>(review-fix-tests))
+  (get-prefix-arms:tt name !>(emissions-tests))
+  (get-prefix-arms:tt name !>(coinbase-split-tests))
+  (get-prefix-arms:tt name !>(block-size-tests))
+  (get-prefix-arms:tt name !>(fund-split-tests))
+  (get-prefix-arms:tt name !>(benches))
+  (get-prefix-arms:tt name !>(h-zoon-benches))
+  (get-prefix-arms:tt name !>(pending-scale-benches))
+==

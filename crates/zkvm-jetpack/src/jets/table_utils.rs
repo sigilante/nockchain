@@ -1,10 +1,14 @@
+use nockvm::jets::util::BAIL_FAIL;
 use nockvm::jets::JetErr;
-use nockvm::noun::Noun;
+use nockvm::noun::{Noun, NounSpace};
 
 use crate::form::belt::Belt;
 use crate::form::felt::*;
 use crate::form::mary::*;
 use crate::form::structs::HoonList;
+
+pub const NUM_EXT_CHALS: u32 = 42;
+pub const NUM_MEGA_EXT_CHALS: u32 = 36;
 
 pub struct ExtChals {
     pub a: Felt,
@@ -53,24 +57,13 @@ pub struct MegaExtChals {
     pub gam: Felt,
 }
 
-pub fn init_ext_chals(chals: Noun) -> Result<ExtChals, JetErr> {
-    let mut belts: Vec<u64> = Vec::<u64>::with_capacity(100);
-    for b in HoonList::try_from(chals)?.into_iter() {
-        belts.push(b.as_atom()?.as_u64()?);
-    }
-    let mut felts: Vec<Felt> = Vec::<Felt>::with_capacity(30);
-    for trip in belts.chunks(3) {
-        let felt: Felt = Felt::try_from(trip).unwrap_or_else(|err| {
-            panic!(
-                "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                file!(),
-                line!(),
-                option_env!("GIT_SHA")
-            )
-        });
-        felts.push(felt);
-    }
+pub fn init_ext_chals(chals: Noun, space: &NounSpace) -> Result<ExtChals, JetErr> {
+    let belts = belts_from_noun(chals, space, NUM_EXT_CHALS as usize)?;
+    init_ext_chals_from_belts(&belts)
+}
 
+pub fn init_ext_chals_from_belts(chals: &[Belt]) -> Result<ExtChals, JetErr> {
+    let felts = felts_from_belts(chals, 14)?;
     Ok(ExtChals {
         a: felts[0],
         b: felts[1],
@@ -89,24 +82,13 @@ pub fn init_ext_chals(chals: Noun) -> Result<ExtChals, JetErr> {
     })
 }
 
-pub fn init_mega_ext_chals(chals: Noun) -> Result<MegaExtChals, JetErr> {
-    let mut belts: Vec<u64> = Vec::<u64>::with_capacity(100);
-    for b in HoonList::try_from(chals)?.into_iter() {
-        belts.push(b.as_atom()?.as_u64()?);
-    }
-    let mut felts: Vec<Felt> = Vec::<Felt>::with_capacity(30);
-    for trip in belts.chunks(3) {
-        let felt: Felt = Felt::try_from(trip).unwrap_or_else(|err| {
-            panic!(
-                "Panicked with {err:?} at {}:{} (git sha: {:?})",
-                file!(),
-                line!(),
-                option_env!("GIT_SHA")
-            )
-        });
-        felts.push(felt);
-    }
+pub fn init_mega_ext_chals(chals: Noun, space: &NounSpace) -> Result<MegaExtChals, JetErr> {
+    let belts = belts_from_noun(chals, space, (NUM_EXT_CHALS + NUM_MEGA_EXT_CHALS) as usize)?;
+    init_mega_ext_chals_from_belts(&belts)
+}
 
+pub fn init_mega_ext_chals_from_belts(chals: &[Belt]) -> Result<MegaExtChals, JetErr> {
+    let felts = felts_from_belts(chals, 26)?;
     Ok(MegaExtChals {
         a: felts[0],
         b: felts[1],
@@ -137,6 +119,22 @@ pub fn init_mega_ext_chals(chals: Noun) -> Result<MegaExtChals, JetErr> {
     })
 }
 
+fn belts_from_noun(chals: Noun, space: &NounSpace, capacity: usize) -> Result<Vec<Belt>, JetErr> {
+    let mut belts = Vec::<Belt>::with_capacity(capacity);
+    for b in HoonList::try_from(chals, space)?.into_iter() {
+        belts.push(Belt(b.in_space(space).as_atom()?.as_u64()?));
+    }
+    Ok(belts)
+}
+
+fn felts_from_belts(chals: &[Belt], capacity: usize) -> Result<Vec<Felt>, JetErr> {
+    let mut felts = Vec::<Felt>::with_capacity(capacity);
+    for trip in chals.chunks(3) {
+        felts.push(Felt::try_from(trip).map_err(|_| BAIL_FAIL)?);
+    }
+    Ok(felts)
+}
+
 pub struct Row(pub usize);
 pub struct Col(pub usize);
 
@@ -163,6 +161,12 @@ pub fn grab_belt(row: &[u64], idx: usize) -> Belt {
     Belt(row[idx])
 }
 
+pub fn read_pelt(row: &[u64], idx: usize, out: &mut [Belt]) {
+    out[0] = Belt(row[idx]);
+    out[1] = Belt(row[idx + 1]);
+    out[2] = Belt(row[idx + 2]);
+}
+
 pub fn get_row<'a>(table: &'a MarySlice<'a>, num_u32: u32) -> &'a [u64] {
     let num: usize = num_u32 as usize;
     let step = table.step as usize;
@@ -170,11 +174,25 @@ pub fn get_row<'a>(table: &'a MarySlice<'a>, num_u32: u32) -> &'a [u64] {
     &table.dat[(step * num)..(step * (num + 1))]
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct Ion {
     pub size: Felt,
     pub leaf: Felt,
     pub dyck: Felt,
+}
+
+/// Compute the Ion (size/dyck/leaf shape encoding) of a proof subject under the
+/// round-1 challenges. Bundles already-open helpers (`init_ext_chals_from_belts` +
+/// `build_tree_data`); this is the subject-shape encoding the table mega-extension
+/// consumes.
+pub fn compute_subj_ion(chals_rd1: &[Belt], subj: Noun, space: &NounSpace) -> Result<Ion, JetErr> {
+    let chals = init_ext_chals_from_belts(chals_rd1)?;
+    let triple = crate::form::math::gen_trace::build_tree_data(subj, &chals.alf, space)?;
+    Ok(Ion {
+        size: triple.size,
+        dyck: triple.dyck,
+        leaf: triple.leaf,
+    })
 }
 
 pub fn fadd_all(felts: Vec<Felt>) -> Felt {

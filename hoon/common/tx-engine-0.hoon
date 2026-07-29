@@ -35,8 +35,20 @@
 ::  when using non-default constants.
 +$  blockchain-constants
   $+  blockchain-constants
-  $~  :*  ::  max block size in bits
-          max-block-size=`@`8.000.000
+  $~  :*  ::  max block size in bits (size is @bits; +compute-size-jam is
+          ::    (met 0 (jam n)), i.e. a bit count -- so 8.000.000 bits == 1 MB
+          ::    and 16.000.000 bits == 2 MB). this cap already INCLUDES the
+          ::    proof: +compute-size-without-txs reserves +max-size:proof
+          ::    inside this budget, and the real proof is <= that reservation,
+          ::    so the whole block (proof included) stays at or under 2 MB --
+          ::    well under the 10 MB ceiling.
+          ::    raised from 8.000.000 (1 MB) to 16.000.000 (2 MB) so that
+          ::    large but legitimate transactions -- e.g. a protocol-fund
+          ::    spend that fans in many hundreds of small fund-note inputs,
+          ::    each carrying a 3-of-4 multisig witness -- fit in a block.
+          ::    consensus parameter: every node must run the same value, so
+          ::    treat any change as a coordinated upgrade.
+          max-block-size=`@`16.000.000
           :: actual number of blocks, not 2017 by counting from 0
           blocks-per-epoch=2.016
           ::  14 days measured in seconds, 1.209.600
@@ -169,11 +181,17 @@
   |%
   +$  form  ^proof
   ::
-  ::  +max-size:  max size of proof in bits. We upper bound it to
-  ::    125kb or 125000 bytes or 1000000 bits
+  ::  +max-size:  upper bound on a proof's size in bits (2.000.000 bits ~= 250 kB).
+  ::    +compute-size-without-txs reserves this constant for the proof instead of
+  ::    jamming the actual proof, so a mining candidate (pow=~) and the mined block
+  ::    (full proof) size identically and the miner guard agrees with consensus
+  ::    +check-size. Proofs are not all the same size, so this must stay a genuine
+  ::    upper bound over the largest real proof: raised from 1.000.000 (~125 kB)
+  ::    to 2.000.000 bits (~250 kB) for margin. Consensus-critical: every node
+  ::    must use the same value.
   ++  max-size
     ^-  size
-    `size``@`1.000.000
+    `size``@`2.000.000
   ::
   ++  hash  |=(=form (hash-proof form))
   --
@@ -266,7 +284,7 @@
   ++  hashable
     |=  =form
     ^-  hashable:tip5
-    ?~  form  leaf+form
+    ?@  form  leaf+form
     :+  [hash+(hash:schnorr-pubkey p.n.form) (hashable:schnorr-signature q.n.form)]
       $(form l.form)
     $(form r.form)
@@ -541,7 +559,7 @@
   ++  hashable-tx-ids
     |=  tx-ids=(z-set tx-id)
     ^-  hashable:tip5
-    ?~  tx-ids  leaf+tx-ids
+    ?@  tx-ids  leaf+tx-ids
     :+  hash+n.tx-ids
       $(tx-ids l.tx-ids)
     $(tx-ids r.tx-ids)
@@ -719,7 +737,8 @@
     |=  target-bn=bignum:bn
     ^-  bignum:bn
     =/  target-atom=@  (merge:bn target-bn)
-    (chunk:bn (div max-target-atom +(target-atom)))
+    =/  raw=@  (div max-target-atom +(target-atom))
+    (chunk:bn ?:(=(0 raw) 1 raw))
   ::
   ++  to-page-summary
     |=  pag=form
@@ -767,6 +786,11 @@
     |=  lp=form
     ^-  page
     lp(pow (biff pow.lp |=(j=@ ((soft proof) (cue j)))))
+  ::
+  ++  to-page-no-pow
+    |=  lp=form
+    ^-  page
+    lp(pow ~)
   --
 ::
 ::  +page-msg: (list belt) that enforces that each elt is a belt
@@ -938,7 +962,7 @@
   ++  hashable
     |=  =form
     ^-  hashable:tip5
-    ?~  form  leaf+form
+    ?@  form  leaf+form
     :+  [(hashable:nname p.n.form) (hashable:input q.n.form)]
       $(form l.form)
     $(form r.form)
@@ -1604,7 +1628,7 @@
     ++  hashable-pubkeys
       |=  pubkeys=(z-set schnorr-pubkey)
       ^-  hashable:tip5
-      ?~  pubkeys  leaf+pubkeys
+      ?@  pubkeys  leaf+pubkeys
       :+  hash+(hash:schnorr-pubkey n.pubkeys)
         $(pubkeys l.pubkeys)
       $(pubkeys r.pubkeys)
@@ -1839,7 +1863,7 @@
   ++  hashable
     |=  =form
     ^-  hashable:tip5
-    ?~  form  leaf+form
+    ?@  form  leaf+form
     :+  [(hashable:sig p.n.form) leaf+q.n.form]
       $(form l.form)
     $(form r.form)
@@ -2013,7 +2037,7 @@
   ++  hashable
     |=  =form
     ^-  hashable:tip5
-    ?~  form  leaf+form
+    ?@  form  leaf+form
     :+  (hashable:seed n.form)
       $(form l.form)
     $(form r.form)
@@ -2021,7 +2045,7 @@
   ++  sig-hashable
     |=  =form
     ^-  hashable:tip5
-    ?~  form  leaf+form
+    ?@  form  leaf+form
     :+  (sig-hashable:seed n.form)
       $(form l.form)
     $(form r.form)

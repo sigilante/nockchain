@@ -1,0 +1,13 @@
+{
+  "comment": "h-zoon perf gate baseline. ratios = h-net / z-net (lower = better for h). ceilings are absolute (h must beat z by at least this much). regression-factor in scripts/bench-h-zoon-gate.py applies to ratio vs baseline. Update only via reviewed PR after a >=10% improvement is observed by the gate script.",
+  "ratios": {
+    "build": 0.60,
+    "read": 0.60,
+    "update": 0.70
+  },
+  "ceilings": {
+    "build": 0.70,
+    "read": 0.70,
+    "update": 0.80
+  }
+}

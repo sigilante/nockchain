@@ -1,18 +1,17 @@
 #![allow(clippy::len_without_is_empty)]
 
+use std::fmt::LowerHex;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
 use nockvm::jets::util::BAIL_EXIT;
 use nockvm::jets::JetErr;
-use nockvm::noun::Noun;
+use nockvm::noun::NounSpace;
 use noun_serde::{NounDecode, NounEncode};
 use num_traits::Pow;
 use rkyv::{Archive, Deserialize, Serialize};
 use serde::de::Error as SerdeError;
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 use tracing::debug;
-
-use crate::based;
 
 // Base field arithmetic functions.
 pub const PRIME: u64 = 18446744069414584321;
@@ -39,7 +38,19 @@ pub const ORDER: u64 = 2_u64.pow(32);
     Default,
 )]
 #[repr(transparent)]
+/// Prime-field element modulo [`PRIME`].
+///
+/// Do not blanket-convert with `D(belt.0)` when encoding nouns. A `Belt` value
+/// may be valid in the field but still exceed the atom direct-immediate limit
+/// (`DIRECT_MAX`). Always allocate through `Atom::new` (or equivalent) so large
+/// field elements are encoded correctly.
 pub struct Belt(pub u64);
+
+impl LowerHex for Belt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:x}", self.0)
+    }
+}
 
 impl SerdeSerialize for Belt {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -63,6 +74,7 @@ impl<'de> SerdeDeserialize<'de> for Belt {
     }
 }
 
+#[inline]
 pub fn based_check(a: u64) -> bool {
     a < PRIME
 }
@@ -80,13 +92,18 @@ macro_rules! based {
 // Manual implementation for Belt to encode/decode as atom
 impl NounEncode for Belt {
     fn to_noun<A: nockvm::noun::NounAllocator>(&self, allocator: &mut A) -> nockvm::noun::Noun {
+        // Intentionally avoid `D(self.0)`: field elements can be above DIRECT_MAX.
         nockvm::noun::Atom::new(allocator, self.0).as_noun()
     }
 }
 
 impl NounDecode for Belt {
-    fn from_noun(noun: &nockvm::noun::Noun) -> Result<Self, noun_serde::NounDecodeError> {
+    fn from_noun(
+        noun: &nockvm::noun::Noun,
+        space: &NounSpace,
+    ) -> Result<Self, noun_serde::NounDecodeError> {
         let atom = noun
+            .in_space(space)
             .as_atom()
             .map_err(|_| noun_serde::NounDecodeError::ExpectedAtom)?;
         let value = atom
@@ -137,6 +154,10 @@ impl Belt {
     #[inline(always)]
     pub fn ordered_root(&self) -> Result<Self, FieldError> {
         // Belt(bpow(H, ORDER / self.0))
+        if self.0 == 0 {
+            debug!("ordered_root: zero");
+            return Err(FieldError::OrderedRootError);
+        }
         let log_of_self = self.0.ilog2();
         if (log_of_self as usize) >= ROOTS.len() {
             debug!("ordered_root: out of bounds");
@@ -255,19 +276,6 @@ impl TryFrom<&u64> for Belt {
     fn try_from(f: &u64) -> Result<Self, Self::Error> {
         based!(*f);
         Ok(Belt(*f))
-    }
-}
-
-impl TryFrom<Noun> for Belt {
-    type Error = ();
-
-    #[inline(always)]
-    fn try_from(n: Noun) -> std::result::Result<Self, Self::Error> {
-        if !n.is_atom() {
-            Err(())
-        } else {
-            Belt::try_from(&n.as_atom()?.as_u64()?)
-        }
     }
 }
 

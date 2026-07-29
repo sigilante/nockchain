@@ -21,7 +21,8 @@ pub struct Site {
 impl Site {
     /// Prepare a locally cached gate to call repeatedly.
     pub fn new(ctx: &mut Context, core: &mut Noun) -> Site {
-        let mut battery = slot(*core, 2).unwrap_or_else(|err| {
+        let space = ctx.stack.noun_space();
+        let mut battery = slot(*core, 2, &space).unwrap_or_else(|err| {
             panic!(
                 "Panicked with {err:?} at {}:{} (git sha: {:?})",
                 file!(),
@@ -29,7 +30,7 @@ impl Site {
                 option_env!("GIT_SHA")
             )
         });
-        let context = slot(*core, 7).unwrap_or_else(|err| {
+        let context = slot(*core, 7, &space).unwrap_or_else(|err| {
             panic!(
                 "Panicked with {err:?} at {}:{} (git sha: {:?})",
                 file!(),
@@ -38,9 +39,10 @@ impl Site {
             )
         });
 
+        let dispatch = ctx.jet_dispatch;
         let mut warm_result = ctx
             .warm
-            .find_jet(&mut ctx.stack, core, &mut battery)
+            .find_jet(&mut ctx.stack, core, &mut battery, dispatch)
             .filter(|(_jet, mut path, _test)| {
                 // check that 7 is a prefix of the parent battery axis,
                 // to ensure that the sample (axis 6) is not part of the jet match.
@@ -53,7 +55,8 @@ impl Site {
                 let mut ret = true;
                 for mut batteries in batteries_list {
                     if let Some((_battery, parent_axis)) = batteries.next() {
-                        let parent_axis_prefix_bits = &parent_axis.as_bitslice()[0..3];
+                        let parent_axis_handle = parent_axis.in_space(&space);
+                        let parent_axis_prefix_bits = &parent_axis_handle.as_bitslice()[0..3];
                         if parent_axis_prefix_bits == axis_7_bits {
                             continue;
                         } else {

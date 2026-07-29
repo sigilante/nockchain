@@ -37,8 +37,60 @@
   ==
 ::
 +$  prove-result  (each =proof err=prove-err)
-+$  prove-err     $%([%too-big heights=(list @)])
++$  prove-err     $%([%too-big heights=(list @)] [%invalid-stream ~])
 +$  prover-output    [=proof deep-codeword=fpoly]
++$  proof-snapshot
+  $:  format=@
+      ext=codeword-commitments
+      =proof
+      num-tables=@
+      base=codeword-commitments
+      tables=(list table-mary)
+      chals-rd1=(list belt)
+      s=*
+      f=*
+      return=fock-return
+      heights=(list @)
+      num-extra-constraints=@
+      version=proof-version
+      constraint-map=(map @ constraints)
+      count-map=(map @ constraint-counts)
+  ==
+:::
++$  proof-stream-range
+  $:  start=@
+      end=(unit @)
+  ==
+:::
++$  proof-stream-context
+  $:  total=@
+      digest=noun-digest:tip5
+  ==
+:::
++$  proof-stream-window
+  $:  format=@
+      version=proof-version
+      range=proof-stream-range
+      objects=proof-objects
+      context=proof-stream-context
+  ==
+:::
++$  proof-stream-window-result
+  (each =proof-stream-window err=prove-err)
+:::
+::
++$  proof-work
+  $:  ext=codeword-commitments
+      =proof
+      num-tables=@
+      base=codeword-commitments
+      tables=(list table-dat)
+      chals-rd1=(list belt)
+      heights=(list @)
+      fri-domain-len=@
+      num-extra-constraints=@
+  ==
+::
 ::
 ::  +prove: prove the Nock computation [s f]
 ++  prove
@@ -94,6 +146,131 @@
         ==
   [version header nonce pow-len s f prod return]
 ::
+++  snapshot
+  ~/  %snapshot
+  |=  prover-input
+  ^-  proof-snapshot
+  =/  [s=* f=*]  (puzzle-nock header nonce pow-len)
+  =/  [prod=* return=fock-return]  (fink:fock [s f])
+  =/  nock-common=_nock-common-v0-v1
+    ?-  version
+      %0  nock-common-v0-v1
+      %1  nock-common-v0-v1
+      %2  nock-common-v2
+    ==
+  =/  compute-funcs=table-funcs
+    ?-  version
+      %0  funcs:compute-table-v0-v1
+      %1  funcs:compute-table-v0-v1
+      %2  funcs:compute-table-v2
+    ==
+  =/  compute-common=static-table-common
+    ?-  version
+      %0  static:common:compute-table-v0-v1
+      %1  static:common:compute-table-v0-v1
+      %2  static:common:compute-table-v2
+    ==
+  =/  memory-funcs=table-funcs
+    ?-  version
+      %0  funcs:memory-table-v0-v1
+      %1  funcs:memory-table-v0-v1
+      %2  funcs:memory-table-v2
+    ==
+  =/  memory-common=static-table-common
+    ?-  version
+      %0  static:common:memory-table-v0-v1
+      %1  static:common:memory-table-v0-v1
+      %2  static:common:memory-table-v2
+    ==
+  =/  pre=preprocess-data
+    ?-  version
+      %0  p.pre-0-1.prep.stark-config
+      %1  p.pre-0-1.prep.stark-config
+      %2  p.pre-2.prep.stark-config
+    ==
+  %-  %~  make-proof-snapshot
+        prove-door
+      :*  nock-common
+          compute-funcs
+          compute-common
+          memory-funcs
+          memory-common
+          pre
+        ==
+  [version header nonce pow-len s f prod return]
+::
+::
+++  make-proof-stream-window
+  |=  [input=prover-input range=proof-stream-range]
+  ^-  proof-stream-window-result
+  =/  res=prove-result  (prove input)
+  ?-  -.res
+    %|  [%| p.res]
+    %&  [%& (stream-window p.res range)]
+  ==
+::
+:::
+++  assemble-proof-stream
+  |=  windows=(list proof-stream-window)
+  ^-  prove-result
+  ?~  windows  [%| [%invalid-stream ~]]
+  =/  first=proof-stream-window  i.windows
+  ?.  =(format.first 0)  [%| [%invalid-stream ~]]
+  =/  ctx=proof-stream-context  context.first
+  =/  version=proof-version  version.first
+  =/  expected=@  0
+  =/  objects=proof-objects  ~
+  =/  remaining=(list proof-stream-window)  windows
+  |-  ^-  prove-result
+  ?~  remaining
+    ?.  =(expected total.ctx)  [%| [%invalid-stream ~]]
+    =/  proof=proof
+      ?-  version
+        %0  [%0 objects ~ 0]
+        %1  [%1 objects ~ 0]
+        %2  [%2 objects ~ 0]
+      ==
+    ?.  =(digest.ctx (hash-proof proof))  [%| [%invalid-stream ~]]
+    [%& proof]
+  =/  win=proof-stream-window  i.remaining
+  ?.  =(format.win 0)  [%| [%invalid-stream ~]]
+  ?.  =(version.win version)  [%| [%invalid-stream ~]]
+  ?.  =(context.win ctx)  [%| [%invalid-stream ~]]
+  ?.  =(start.range.win expected)  [%| [%invalid-stream ~]]
+  =/  end=@  ?~(end.range.win total.ctx u.end.range.win)
+  ?.  =(end (add start.range.win (lent objects.win)))  [%| [%invalid-stream ~]]
+  $(remaining t.remaining, expected end, objects (weld objects objects.win))
+:::
+++  assemble-proof-continuation
+  |=  [snapshot=proof-snapshot context=proof-stream-context windows=(list proof-stream-window)]
+  ^-  prove-result
+  ?.  =(format.snapshot 0)  [%| [%invalid-stream ~]]
+  =/  p=proof  proof.snapshot
+  =/  prefix-len=@  (lent objects.p)
+  =/  prefix=proof-stream-window
+    :*  0
+        version.snapshot
+        [0 (some prefix-len)]
+        objects.p
+        context
+    ==
+  (assemble-proof-stream [prefix windows])
+::
+++  stream-window
+  |=  [p=proof range=proof-stream-range]
+  ^-  proof-stream-window
+  =/  total=@  (lent objects.p)
+  =/  end=@  ?~(end.range total u.end.range)
+  ?>  ?&  (lte start.range end)
+          (lte end total)
+      ==
+  =/  count=@  (sub end start.range)
+  :*  0
+      version.p
+      range
+      (scag count (slag start.range objects.p))
+      [total (hash-proof p)]
+  ==
 ++  prove-door
   ~/  %prove-door
   |_  $:  nock-common=_nock-common-v0-v1
@@ -103,6 +280,109 @@
           memory-common=static-table-common
           pre=preprocess-data
       ==
+  ::
+  ++  make-proof-snapshot
+    |=  $:  version=proof-version
+            header=noun-digest:tip5
+            nonce=noun-digest:tip5
+            pow-len=@
+            s=*
+            f=*
+            prod=*
+            return=fock-return
+        ==
+    ^-  proof-snapshot
+    =/  work=proof-work  (make-proof-work +<)
+    :*  0
+        ext.work
+        proof.work
+        num-tables.work
+        base.work
+        (turn tables.work |=(t=table-dat p.t))
+        chals-rd1.work
+        s
+        f
+        return
+        heights.work
+        num-extra-constraints.work
+        version
+        constraint-map.pre
+        count-map.pre
+    ==
+  ::
+  ++  make-proof-work
+    |=  $:  version=proof-version
+            header=noun-digest:tip5
+            nonce=noun-digest:tip5
+            pow-len=@
+            s=*
+            f=*
+            prod=*
+            return=fock-return
+        ==
+    ^-  proof-work
+    =|  =proof
+    =.  proof  (~(push proof-stream proof) [%puzzle header nonce pow-len prod])
+    =/  tables=(list table-dat)
+      (build-table-dats return)
+    =/  num-tables  (lent tables)
+    =/  heights=(list @)
+      %+  turn  tables
+      |=  t=table-dat
+      =/  len  len.array.p.p.t
+      ?:(=(len 0) 0 (bex (xeb (dec len))))
+    =.  proof  (~(push proof-stream proof) [%heights heights])
+    =/  clc  ~(. calc heights cd.pre)
+    =*  fri-domain-len=@  init-domain-len:fri:clc
+    =/  [base-marys=(list mary) width=@]
+      %^  spin  tables
+        0
+      |=([t=table-dat width=@] [p.p.t (add width base-width.p.t)])
+    =/  base=codeword-commitments
+      (compute-codeword-commitments base-marys fri-domain-len width)
+    =.  proof  (~(push proof-stream proof) [%m-root h.q.merk-heap.base])
+    =/  rng  ~(prover-fiat-shamir proof-stream proof)
+    =^  chals-rd1=(list belt)  rng  (belts:rng num-chals-rd1:chal)
+    =/  table-exts=(list table-mary)
+      %+  turn  tables
+      |=  t=table-dat
+      ^-  table-mary
+      (extend:q.t p.t chals-rd1 return)
+    =.  tables
+      %+  turn
+      (zip-up tables table-exts)
+      |=  [t=table-dat ext=table-mary]
+      ^-  table-dat
+      :_  [q.t r.t]
+      (weld-exts:tlib p.t ext)
+    =/  [ext-marys=(list mary) width=@]
+      %^  spin  table-exts
+        0
+      |=([t=table-mary width=@] [p.t (add width ext-width.t)])
+    =/  ext=codeword-commitments
+      (compute-codeword-commitments ext-marys fri-domain-len width)
+    =/  num-extra-constraints=@
+      %+  roll  (range num-tables)
+      |=  [i=@ acc=@]
+      =/  cs  (~(got by count-map.pre) i)
+      ;:  add
+        acc
+        boundary.cs
+        row.cs
+        transition.cs
+        terminal.cs
+        extra.cs
+      ==
+    :*  ext
+        proof
+        num-tables
+        base
+        tables
+        chals-rd1
+        heights
+        fri-domain-len
+        num-extra-constraints
+    ==
   ::
   :: generate-proof is the main body of the prover.
   ++  generate-proof
@@ -118,94 +398,20 @@
             return=fock-return
         ==
     ^-  prove-result
-    =|  =proof  ::  the proof stream
-    =.  proof  (~(push proof-stream proof) [%puzzle header nonce pow-len prod])
-    ::
-    ::  build tables
-    ::~&  %building-tables
-    =/  tables=(list table-dat)
-      (build-table-dats return)
-    ::
-    ::  check that the tables have correct base width. Comment this out for production.
-    ::?:  %+  levy  tables
-    ::    |=  t=table-dat
-    ::    !=(step.p.p.t base-width.p.t)
-    ::  ~&  %widths-mismatch
-    ::  ~|("prove: mismatch between table full widths and actual widths" !!)
-    ::
-    =/  num-tables  (lent tables)
-    =/  table-names  (turn tables |=(t=table-dat name.p.t))
-    =/  heights=(list @)
-      %+  turn  tables
-      |=  t=table-dat
-      =/  len  len.array.p.p.t
-      ?:(=(len 0) 0 (bex (xeb (dec len))))
-    ::~&  heights+heights
-    ::
-    =.  proof  (~(push proof-stream proof) [%heights heights])
-    ::
+    =/  work=proof-work  (make-proof-work +<)
+    =/  proof  proof.work
+    =/  tables  tables.work
+    =/  num-tables  num-tables.work
+    =/  heights  heights.work
+    =/  fri-domain-len  fri-domain-len.work
     =/  clc  ~(. calc heights cd.pre)
-    =*  num-colinearity-tests=@  num-colinearity-tests:fri:clc
-    =*  fri-domain-len=@  init-domain-len:fri:clc
-    ::
-    ::  convert the base columns to marys, this is a temporary preprocessing step until
-    ::  we change the table struct to contain a mary rather than a (list fpoly)
-    ::
-    ::  think of each mary as a list of the table's rows
-    =/  [base-marys=(list mary) width=@]
-      %^  spin  tables
-        0
-      |=([t=table-dat width=@] [p.p.t (add width base-width.p.t)])
-    =/  base=codeword-commitments
-      (compute-codeword-commitments base-marys fri-domain-len width)
-    =.  proof  (~(push proof-stream proof) [%m-root h.q.merk-heap.base])
-    ::
-    ::  generate first round of randomness
-    =/  rng  ~(prover-fiat-shamir proof-stream proof)
-    ::
-    ::  get coefficients for table extensions, extend tables
-    ::  round one challenges: a, b, c, ..., α
-    =^  chals-rd1=(list belt)  rng  (belts:rng num-chals-rd1:chal)
-    ::
-    ::  extension columns: list or mary? probably should be a list
-    ::
-    ::  build extension columns
-    =/  table-exts=(list table-mary)
-      %+  turn  tables
-      |=  t=table-dat
-      ^-  table-mary
-      (extend:q.t p.t chals-rd1 return)
-    =.  tables
-      %+  turn
-      (zip-up tables table-exts)
-      |=  [t=table-dat ext=table-mary]
-      ^-  table-dat
-      :_  [q.t r.t]
-      (weld-exts:tlib p.t ext)
-    ::
-    ::  check that the tables have correct num of ext cols. Comment this out for production.
-    ::
-    ::?:  %+  levy  (zip-up tables table-exts)
-        ::|=  [table=table-dat ext=table-mary]
-        ::!=(step.p.ext ext-width.p.table)
-      ::~&  %widths-mismatch
-      ::~|("prove: mismatch between table ext widths and actual ext widths" !!)
-    ::~&  %ext-cols
-    ::
-    ::  convert the ext columns to marys
-    ::
-    ::  think of each mary as a list of the table's rows
-    =/  [ext-marys=(list mary) width=@]
-      %^  spin  table-exts
-        0
-      |=([t=table-mary width=@] [p.t (add width ext-width.t)])
-    ::
-    =/  ext=codeword-commitments
-      (compute-codeword-commitments ext-marys fri-domain-len width)
+    =/  base  base.work
+    =/  ext  ext.work
+    =/  chals-rd1  chals-rd1.work
     =.  proof  (~(push proof-stream proof) [%m-root h.q.merk-heap.ext])
     ::
     ::  reseed the rng
-    =.  rng  ~(prover-fiat-shamir proof-stream proof)
+    =/  rng  ~(prover-fiat-shamir proof-stream proof)
     ::
     ::  get coefficients for table extensions, extend tables
     ::  round two challenges: β, z

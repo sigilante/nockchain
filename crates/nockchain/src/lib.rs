@@ -1,10 +1,22 @@
+// Allow architectural patterns
+#![allow(clippy::result_large_err)]
+#![allow(clippy::collapsible_else_if)]
+#![allow(clippy::let_underscore_future)]
+#![allow(clippy::manual_map)]
+#![allow(clippy::redundant_field_names)]
+#![allow(clippy::new_without_default)]
+#![allow(clippy::vec_init_then_push)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
+pub mod backbone;
 pub mod config;
-pub mod mining;
 pub mod setup;
+pub mod traces;
 
 use std::error::Error;
 use std::fs;
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 
 pub use config::NockchainCli;
 use libp2p::identity::Keypair;
@@ -18,13 +30,11 @@ pub mod colors;
 
 use colors::*;
 use nockapp::noun::slab::{Jammer, NounSlab};
+use nockchain_types::{fakenet_blockchain_constants, Seconds};
 use nockvm::jets::hot::HotEntry;
 use nockvm::noun::{D, T, YES};
 use nockvm_macros::tas;
 use tracing::{debug, info, instrument};
-
-use crate::mining::{MiningKeyConfig, MiningPkhConfig};
-use crate::setup::fakenet_blockchain_constants;
 
 /// Module for handling driver initialization signals
 pub mod driver_init {
@@ -153,6 +163,19 @@ impl NockchainAPIConfig {
     }
 }
 
+/// Boots and runs the Nockchain node with the supplied public API config.
+pub async fn run_nockchain_app(
+    cli: config::NockchainCli,
+    hot_state: &[HotEntry],
+    server_config: NockchainAPIConfig,
+) -> Result<(), Box<dyn Error>> {
+    let mut nockchain =
+        init_with_kernel::<chaff::Chaff>(cli, kernels_open_dumb::KERNEL, hot_state, server_config)
+            .await?;
+    nockchain.run().await?;
+    Ok(())
+}
+
 /// # Load a keypair from a file or create a new one if the file doesn't exist
 ///
 /// This function attempts to read a keypair from a specified file. If the file exists, it reads the keypair from the file.
@@ -210,16 +233,23 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
 
     cli.validate()?;
 
-    let mut nockapp_cli = cli.nockapp_cli.clone();
-    nockapp_cli.stack_size = nockapp::kernel::boot::NockStackSize::Medium;
+    let nockapp_cli = cli.nockapp_cli.clone();
 
     let mut nockapp =
         boot::setup::<J>(kernel_jam, nockapp_cli, hot_state, "nockchain", None).await?;
 
-    let keypair = {
-        let keypair_path = Path::new(config::IDENTITY_PATH);
-        load_keypair(keypair_path, cli.no_new_peer_id)?
-    };
+    let identity_path = cli
+        .identity_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(config::IDENTITY_PATH));
+    // Persist the existing libp2p identity across restarts by default so the node
+    // keeps a stable peer ID. A node that rerolls its peer ID every restart gets
+    // rejected by peers that still map its IP to the old ID (wrong-peer-id) and
+    // can be IP-banned, isolating it from the network. Only generate a fresh
+    // identity when explicitly requested via --new-peer-id. (`--no-new-peer-id`
+    // is retained for backward compatibility and now matches the default.)
+    let persist_identity = !cli.new_peer_id;
+    let keypair = { load_keypair(identity_path.as_path(), persist_identity)? };
     info!("allowed_peers_path: {:?}", cli.allowed_peers_path);
     let allowed = cli.allowed_peers_path.as_ref().map(|path| {
         let contents = fs::read_to_string(path).expect("failed to read allowed peers file: {}");
@@ -290,27 +320,31 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         }
     };
 
-    let default_backbone_peers = if cli.fakenet {
+    // Full backbone pool. The libp2p driver dials a rotating round-robin window
+    // of these on each attempt rather than all of them at once, so we hand it
+    // the whole set (empty when the user opts out or on fakenet).
+    let default_backbone_peers: &[&str] = if cli.fakenet {
         config::TESTNET_BACKBONE_NODES
     } else {
-        config::REALNET_BACKBONE_NODES
+        backbone::BACKBONE_NODES
     };
 
-    let backbone_peers = default_backbone_peers
-        .iter()
-        .map(|multiaddr_str| {
-            multiaddr_str
-                .parse()
-                .expect("could not parse multiaddr from built-in string")
-        })
-        .collect();
-
-    // Set up initial peer addresses to connect to
-    let mut initial_peer_multiaddrs: Vec<Multiaddr> = if cli.no_default_peers {
+    let backbone_peers: Vec<Multiaddr> = if cli.no_default_peers {
         Vec::new()
     } else {
-        backbone_peers
+        default_backbone_peers
+            .iter()
+            .map(|multiaddr_str| {
+                multiaddr_str
+                    .parse()
+                    .expect("could not parse multiaddr from built-in string")
+            })
+            .collect()
     };
+
+    // Set up initial peer addresses to connect to. Backbone peers are dialed
+    // separately (round-robin) by the driver, so they are not folded in here.
+    let mut initial_peer_multiaddrs: Vec<Multiaddr> = Vec::new();
 
     let v: Vec<Multiaddr> = cli
         .peer
@@ -349,7 +383,6 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
     let mut born_driver_signals = driver_init::DriverInitSignals::new();
 
     // Register drivers that need initialization signals
-    let mining_init_tx = born_driver_signals.register_driver("mining");
     let libp2p_init_tx = born_driver_signals.register_driver("libp2p");
 
     // Create the born task that waits for all drivers to initialize
@@ -392,15 +425,25 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         // Set the require fakenet constants first, then handle the optional ones
         let mut fakenet_constants =
             fakenet_blockchain_constants(cli.fakenet_pow_len, cli.fakenet_log_difficulty);
-        if let Some(coinbase_timelock_min) = cli.fakenet_coinbase_timelock_min {
-            fakenet_constants = fakenet_constants.with_coinbase_timelock_min(coinbase_timelock_min);
-        }
         if let Some(v1_phase) = cli.fakenet_v1_phase {
             fakenet_constants = fakenet_constants.with_v1_phase(v1_phase);
         }
+        if let Some(bythos_phase) = cli.fakenet_bythos_phase {
+            fakenet_constants = fakenet_constants.with_bythos_phase(bythos_phase);
+        }
+        if let Some(asert) = cli.fakenet_asert.into_config()? {
+            fakenet_constants = fakenet_constants
+                .with_asert_phase(asert.phase)
+                .with_asert_anchor_height(asert.anchor_height)
+                .with_asert_anchor_target_bex(asert.anchor_target_bex);
+        }
+        if let Some(interval_secs) = cli.fakenet_update_candidate_interval_secs {
+            fakenet_constants =
+                fakenet_constants.with_update_candidate_timestamp_interval(Seconds(interval_secs));
+        }
         setup::poke(
             &mut nockapp,
-            setup::SetupCommand::PokeFakenetConstants(fakenet_constants),
+            setup::SetupCommand::PokeFakenetConstants(Box::new(fakenet_constants)),
         )
         .await?;
         if let Some(true) = is_kernel_mainnet {
@@ -443,38 +486,12 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
     };
     setup::poke(&mut nockapp, setup::SetupCommand::PokeSetBtcData).await?;
 
-    // Set up empty mining config by default (TODO remove when taking out pubkey infra)
-    let mining_config: Option<Vec<MiningKeyConfig>> = { None };
-
-    let mining_pkh_config = if let Some(pkh) = &cli.mining_pkh {
-        Some(vec![MiningPkhConfig {
-            share: 1,
-            pkh: pkh.clone(),
-        }])
-    } else if let Some(mining_pkh_adv) = &cli.mining_pkh_adv {
-        Some(mining_pkh_adv.clone())
-    } else {
-        None
-    };
-
     let prune_inbound = cli.prune_inbound;
 
-    let mine = cli.mine;
-
-    let threads = if let Some(num_threads) = &cli.num_threads {
-        *num_threads
-    } else {
-        1
-    };
-
-    let mining_driver = crate::mining::create_mining_driver(
-        mining_config,
-        mining_pkh_config,
-        mine,
-        threads,
-        Some(mining_init_tx),
-    );
-    nockapp.add_io_driver(mining_driver).await;
+    // Mining lives in an external process (see `crates/nockchain-mining-common`
+    // and forthcoming miner binaries). The node still emits `%mine` effects
+    // from the kernel; miners subscribe via the private NockAppService's
+    // WatchEffects RPC.
 
     let libp2p_driver = nockchain_libp2p_io::driver::make_libp2p_driver(
         keypair,
@@ -483,9 +500,10 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         limits,
         memory_limits,
         &initial_peer_multiaddrs,
+        &backbone_peers,
+        backbone::DEFAULT_BACKBONE_PEER_COUNT,
         &force_peers,
         prune_inbound,
-        cli.fast_sync,
         equix_builder,
         config::CHAIN_INTERVAL,
         Some(libp2p_init_tx),
@@ -513,12 +531,16 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
             .add_io_driver(nockapp_grpc::public_nockchain::grpc_server_driver(addr))
             .await;
     }
+    let private_grpc_addr = cli.bind_private_grpc_addr.unwrap_or_else(|| {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.bind_private_grpc_port)
+    });
     nockapp
         .add_io_driver(nockapp_grpc::private_nockapp::grpc_server_driver(
-            cli.bind_private_grpc_port,
+            private_grpc_addr,
         ))
         .await;
 
+    nockapp.add_io_driver(crate::traces::traces_driver()).await;
     nockapp.add_io_driver(nockapp::exit_driver()).await;
 
     Ok(nockapp)

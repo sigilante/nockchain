@@ -4,6 +4,7 @@ use nockapp::noun::slab::NounSlab;
 use nockapp::NockAppError;
 use nockapp_grpc::{private_nockapp, public_nockchain};
 use tracing::info;
+use wallet_tx_builder::adapter::NormalizedSnapshot;
 
 use crate::command::ClientType;
 use crate::Wallet;
@@ -19,7 +20,7 @@ pub(crate) struct ConnectionCli {
     pub private_grpc_server_port: u16,
 
     /// Address of the public server (host[:port] or URI)
-    #[arg(long, value_parser = GrpcEndpoint::parse, default_value = "https://nockchain-api.zorp.io", global = true)]
+    #[arg(long, value_parser = GrpcEndpoint::parse, default_value = "23.252.122.18:5556", global = true)]
     pub public_grpc_server_addr: GrpcEndpoint,
 }
 
@@ -86,8 +87,8 @@ impl GrpcEndpoint {
             ));
         }
 
-        let host = uri.host().unwrap();
-        let port = uri.port_u16().unwrap_or_else(|| match scheme_str {
+        let host = uri.host().expect("URI should have a host");
+        let port = uri.port_u16().unwrap_or(match scheme_str {
             "https" => 443,
             _ => 80,
         });
@@ -143,12 +144,20 @@ impl GrpcTarget {
     }
 }
 
+/// Output of one wallet balance sync round.
+pub(crate) struct BalanceSyncResult {
+    /// Pokes that must be applied to the wallet kernel to update synced state.
+    pub pokes: Vec<NounSlab>,
+    /// Optional deduplicated snapshot from the sync source for planner-driven create-tx.
+    pub normalized_snapshot: Option<NormalizedSnapshot>,
+}
+
 pub(crate) async fn sync_wallet_balance(
     wallet: &mut Wallet,
     target: &GrpcTarget,
     pubkeys: Vec<String>,
     tracked_names: Vec<String>,
-) -> Result<Vec<NounSlab>, NockAppError> {
+) -> Result<BalanceSyncResult, NockAppError> {
     match target {
         GrpcTarget::Private { endpoint } => {
             let mut client = private_nockapp::PrivateNockAppGrpcClient::connect(endpoint.clone())

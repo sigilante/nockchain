@@ -1,25 +1,76 @@
-resolver = "2"
-
 [workspace]
-members = ["crates/nockchain-api", "crates/nockchain-explorer-tui", "crates/nockchain-peek", "crates/equix-latency", "crates/hoon", "crates/hoonc", "crates/kernels", "crates/nockapp", "crates/nockapp-grpc", "crates/nockapp-grpc-proto", "crates/nockchain", "crates/nockchain-libp2p-io", "crates/nockchain-math", "crates/nockchain-types", "crates/nockchain-wallet", "crates/raw-tx-checker", "crates/nockvm/rust/ibig", "crates/nockvm/rust/murmur3", "crates/nockvm/rust/nockvm", "crates/nockvm/rust/nockvm_macros", "crates/noun-serde", "crates/noun-serde-derive", "crates/zkvm-jetpack", "crates/nockup"]
+members = ["crates/bridge", "crates/bridge-dev", "crates/equix-latency", "crates/habit", "crates/hatch", "crates/honc-cold-138", "crates/honk", "crates/honk-tools", "crates/hoon", "crates/hoonc", "crates/kernels", "crates/kernels/bridge", "crates/kernels/dumb", "crates/kernels/miner", "crates/kernels/nockchain-peek", "crates/kernels/roswell", "crates/kernels/wallet", "crates/nockapp", "crates/nockapp-grpc", "crates/nockapp-grpc-proto", "crates/nockchain", "crates/nockchain-api", "crates/nockchain-bridge-sequencer", "crates/nockchain-e2e", "crates/nockchain-explorer-tui", "crates/nockchain-libp2p-io", "crates/nockchain-math", "crates/nockchain-mining-common", "crates/nockchain-peek", "crates/nockchain-testkit", "crates/nockchain-types", "crates/nockchain-wallet", "crates/nockup", "crates/nockvm/rust/ibig", "crates/nockvm/rust/murmur3", "crates/nockvm/rust/nockvm", "crates/nockvm/rust/nockvm_macros", "crates/noun-serde", "crates/noun-serde-derive", "crates/raw-tx-checker", "crates/roswell", "crates/wallet-tx-builder", "crates/zk-pow-miner", "crates/zkvm-jetpack"]
+resolver = "2"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 
+# Lints enforced workspace-wide so `cargo`/`cargo clippy`/rust-analyzer flag these
+# locally and in-editor, instead of only at the CI `cargo-clippy` / bazel `make
+# lint` gate. Mirrors exactly the flags applied in those gates:
+#   .bazelrc:            -Dwarnings  -Dclippy::unwrap_used  -Aclippy::missing_safety_doc
+#   open/.gitlab-ci.yml: -Dclippy::unwrap_used  -Aclippy::missing_safety_doc  -Dwarnings
+#   Makefile lint-local: (same cargo flags)
+# Each member crate opts in with `[lints] workspace = true`. The `warnings` group
+# is given priority = -1 so the explicit clippy allow (missing_safety_doc) still
+# wins, matching the `-A...` after `-D warnings` ordering on the CLI.
+[workspace.lints.rust]
+warnings = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+missing_safety_doc = "allow"
+# Allowed for the nightly-2026-04-03 toolchain bump: the newer clippy newly flags these on
+# pre-existing code across the tree (nockapp, nockup, the verifier crates, ...). Deferred to a
+# dedicated cleanup pass; kept in sync with the `-A` clippy flags in `.bazelrc`.
+result_large_err = "allow"
+unnecessary_cast = "allow"
+unnecessary_sort_by = "allow"
+collapsible_match = "allow"
+manual_checked_ops = "allow"
+while_let_loop = "allow"
+# Style/complexity lints that are pervasive and idiomatic in the numeric / AIR /
+# STARK-prover code (explicit trace-index loops, prover functions with many
+# statement parameters, complex circuit-prover data types). Fixing them would hurt
+# clarity or force churny struct-wrapping without changing behaviour.
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+# Pedantic style lints where the existing form is deliberate: mnemonic hex
+# constants (`0xC0FFEE_42`) and nested indented doc-list structure in the AIR
+# constraint documentation.
+unusual_byte_groupings = "allow"
+doc_overindented_list_items = "allow"
+doc_lazy_continuation = "allow"
+# Noun decoders dispatch on tag cords via `x if x == tas!(b"..")` guards (the
+# `tas!` macro cannot appear in pattern position), and some driver enums carry
+# one intentionally-large proof/artifact variant.
+redundant_guards = "allow"
+large_enum_variant = "allow"
+
 [workspace.dependencies]
 aes = { version = "0.8.3", default-features = false }
 aes-siv = { version = "0.7.0", default-features = false, features = ["alloc"] }
+alloy = "=1.8.2"
 anyhow = "1.0"
 argon2 = "0.5.3"
 arrayref = "0.3.7"
+askama = "0.12.1"
+assert_cmd = "2.0"
 async-trait = "0.1"
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
 axum = "0.8.1"
-axum-server = { version = "0.7.2", features = ["tls-rustls"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+backon = { version = "1.6", features = ["tokio-sleep"] }
 bardecoder = "0.5.0"
 bincode = "2.0.0-rc.3"
 bitcoincore-rpc = "0.19.0"
-bitvec = "1.0.1"
+bitvec = { version = "1.0.1", default-features = true }
 blake3 = { version = "1.5.1", features = ["serde"] }
 bs58 = "0.5.1"
 byteorder = "1.5.0"
@@ -27,7 +78,8 @@ bytes = "1.5.0"
 cbor4ii = "1.0.0"
 cfg-if = "1.0.0"
 chrono = "0.4.40"
-clap = { version = "4.4.4", features = ["derive"] }
+clap = "4.4.4"
+colored = "2.0"
 config = "0.15"
 console-subscriber = "0.4.1"
 criterion = { git = "https://github.com/vlovich/criterion.rs.git", rev = "9b485aece85a3546126b06cc25d33e14aba829b3", features = [
@@ -36,32 +88,43 @@ criterion = { git = "https://github.com/vlovich/criterion.rs.git", rev = "9b485a
 crossterm = "0.29"
 curve25519-dalek = { version = "4.1.1", default-features = false }
 dashmap = "6.1.0"
+deadpool-diesel = { version = "0.6.1", features = ["rt_tokio_1", "sqlite"] }
+diesel = { version = "2.1.4", features = ["sqlite"] }
+diesel_migrations = { version = "2.3.2", features = ["sqlite"] }
 dirs = "6.0.0"
 divan = "0.1.21"
 ed25519-dalek = { version = "2.1.0", default-features = false }
 either = "1.9.0"
 equix = "0.2.2"
+flate2 = "1.1.5"
+fs_extra = "1.3"
 futures = "0.3.31"
 gdt-cpus = "25.5.0"
 getrandom = { version = "0.3.3", features = ["std"] }
 glob = "0.3"
-gnort = "0.1.1"
+gnort = "0.2.0"
+handlebars = "6.3.2"
 hex = "0.4"
 hex-literal = "1.0.0"
 hickory-proto = "0.25.0-alpha.4"
 hickory-resolver = { version = "0.25.0-alpha.4", features = ["system-config"] }
+hmac = "0.12.1"
 image = "0.24.7"
 instant-acme = "0.7.2"
 intmap = "3.1.0"
-json = "0.12.4"
 lazy_static = "1.4.0"
 libc = "0.2.171"
 libp2p = { git = "https://github.com/libp2p/rust-libp2p.git", rev = "da0017ee887a868e231ed78c7de892779c17800d" }
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"] }
 memmap2 = "^0.9.5"
+nu-ansi-term = "0.50"
+num-bigint = "0.4.6"
 num-derive = "0.4.2"
-num-traits = "0.2"
+num-traits = { version = "0.2", default-features = true }
 num_cpus = "1.16.0"
 once_cell = "1.21.3"
+op-alloy = "=0.23.1"
+openssl-sys = "0.9"
 opentelemetry = { version = "0.30.0", features = [
     "trace",
     "logs",
@@ -76,31 +139,40 @@ opentelemetry-otlp = { version = "0.30.0", features = [
 opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
 parking_lot = "0.12.4"
 pin-project-lite = "0.2.16"
+predicates = "3.0"
 proc-macro2 = "1.0.91"
+proptest = "1.9.0"
 prost = "0.14.1"
 prost-build = "0.14.1"
+protoc-bin-vendored = "3.2.0"
 prost-types = "0.14.1"
 qrcode = "0.14.1"
 quickcheck = "1.0.3"
 quickcheck_macros = "1.0"
 quote = "1.0.37"
-rand = { version = "0.9.2", features = ["std"] }
+rand = { version = "0.9.2", default-features = true, features = ["std"] }
 ratatui = "0.29.0"
 rayon = "1.8.0"
 rcgen = "0.14.3"
+regex = "1.10.4"
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "http2",
     "charset",
     "json",
+    "blocking",
 ] }
-rkyv = "0.8.10"
+rkyv = "0.8.13"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+rustix = { version = "0.38", features = ["fs", "mm"] }
 rustls = "0.23.0"
 rustls-pemfile = "2.0.0"
+rustls-pki-types = "1.13.1"
 serde = "1.0.217"
 serde_bytes = { version = "0.11.15", features = ["alloc"] }
 serde_cbor = "0.11"
 serde_json = "1.0.104"
+serde_yaml = "0.9.34"
 sha1 = { version = "0.10.6", default-features = false }
 sha2 = { version = "0.10.8", default-features = false }
 sha3 = "0.10.8"
@@ -108,14 +180,16 @@ signal-hook = "0.3"
 signal-hook-tokio = "0.3.1"
 slotmap = "1.0.7"
 smallvec = "1.15.1"
+snmalloc-rs = { git = "https://github.com/litlep-nibbyt/snmalloc.git", rev = "060d5b9fa1c5777a52deae8dbdd82da91babf35f", default-features = false, features = ["build_cc", "usewait-on-address"] }
 static_assertions = "1.1.0"
 strum = { version = "0.27.2", features = ["derive"] }
 syn = { version = "2.0.39", features = ["full"] }
+tar = "0.4.44"
 tempfile = "3.3"
 termcolor = "1.4"
 termimad = "0.33.0"
-testcontainers = { git = "https://github.com/bitemyapp/testcontainers-rs.git", rev = "54851fd9faf9b9cded9d681b46f87c056880d870" }
 test-log = "0.2.18"
+testcontainers = "0.27.3"
 thiserror = "2.0.11"
 tikv-jemallocator = { version = "0.6" }
 tiny-keccak = { version = "2", features = ["keccak"] }
@@ -132,14 +206,17 @@ tokio = { version = "1.32", features = [
 tokio-rustls = "0.26.0"
 tokio-stream = "0.1"
 tokio-util = "0.7.11"
+toml = "0.9.8"
 tonic = { version = "0.14.0", features = ["tls-webpki-roots"] }
 tonic-build = "0.14"
 tonic-health = "0.14.2"
 tonic-prost = "0.14.0"
 tonic-prost-build = "0.14.0"
 tonic-reflection = "0.14.0"
+tonic-web = "0.14.5"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1.41"
+tracing-appender = "0.2.4"
 tracing-core = "0.1"
 tracing-opentelemetry = { version = "0.31.0", features = ["metrics"] }
 tracing-subscriber = { version = "0.3.18", features = [
@@ -151,14 +228,23 @@ tracing-test = "0.2.5"
 tracing-tracy = { version = "0.11.4" }
 tracy-client = { version = "0.18.2" }
 unroll = "0.1.5"
+uuid = { version = "1.23.1", features = ["v4"] }
 vergen = "8.3.2"
 void = "1.0.2"
+walkdir = "2.5.0"
 webpki-roots = "1.0.2"
+which = "8.0"
 x25519-dalek = { version = "2.0.0", features = [
     "static_secrets",
 ], default-features = false }
 x509-parser = "0.17.0"
 yaque = "0.6.6"
+
+[workspace.dependencies.chaff]
+path = "crates/chaff"
+
+[workspace.dependencies.habit]
+path = "crates/habit"
 
 [workspace.dependencies.hoon]
 path = "crates/hoon"
@@ -172,26 +258,53 @@ path = "crates/nockvm/rust/ibig"
 [workspace.dependencies.kernels]
 path = "crates/kernels"
 
+[workspace.dependencies.kernels-open-bridge]
+path = "crates/kernels/bridge"
+[workspace.dependencies.kernels-open-dumb]
+path = "crates/kernels/dumb"
+
+[workspace.dependencies.kernels-open-miner]
+path = "crates/kernels/miner"
+
+[workspace.dependencies.kernels-open-nockchain-peek]
+path = "crates/kernels/nockchain-peek"
+
+[workspace.dependencies.kernels-open-wallet]
+path = "crates/kernels/wallet"
+
+[workspace.dependencies.kernels-roswell]
+path = "crates/kernels/roswell"
+
 [workspace.dependencies.murmur3]
 path = "crates/nockvm/rust/murmur3"
 
 [workspace.dependencies.nockapp]
 path = "crates/nockapp"
 
+[workspace.dependencies.nockapp-grpc]
+path = "crates/nockapp-grpc"
+default-features = true
+
 [workspace.dependencies.nockapp-grpc-proto]
 path = "crates/nockapp-grpc-proto"
 
-[workspace.dependencies.nockapp-grpc]
-path = "crates/nockapp-grpc"
-
 [workspace.dependencies.nockchain]
 path = "crates/nockchain"
+
+[workspace.dependencies.nockchain-e2e]
+path = "crates/nockchain-e2e"
 
 [workspace.dependencies.nockchain-libp2p-io]
 path = "crates/nockchain-libp2p-io"
 
 [workspace.dependencies.nockchain-math]
 path = "crates/nockchain-math"
+
+[workspace.dependencies.nockchain-testkit]
+path = "crates/nockchain-testkit"
+
+[workspace.dependencies.nockchain-mining-common]
+path = "crates/nockchain-mining-common"
 
 [workspace.dependencies.nockchain-types]
 path = "crates/nockchain-types"
@@ -201,7 +314,6 @@ path = "crates/nockchain-wallet"
 
 [workspace.dependencies.nockvm]
 path = "crates/nockvm/rust/nockvm"
-
 
 [workspace.dependencies.nockvm_crypto]
 path = "crates/nockvm/rust/nockvm_crypto"
@@ -215,8 +327,23 @@ path = "crates/noun-serde"
 [workspace.dependencies.noun-serde-derive]
 path = "crates/noun-serde-derive"
 
+[workspace.dependencies.wallet-tx-builder]
+path = "crates/wallet-tx-builder"
+
 [workspace.dependencies.zkvm-jetpack]
 path = "crates/zkvm-jetpack"
+
+[patch]
+
+[patch.crates-io]
+aws-runtime = { path = "patches/aws-runtime-1.7.4" }
+op-alloy-consensus = { git = "https://github.com/ethereum-optimism/optimism", rev = "0c6a03eac768122819c05b71f233bba1e90cf426", package = "op-alloy-consensus" }
+op-alloy-network = { git = "https://github.com/ethereum-optimism/optimism", rev = "0c6a03eac768122819c05b71f233bba1e90cf426", package = "op-alloy-network" }
+op-alloy-rpc-types = { git = "https://github.com/ethereum-optimism/optimism", rev = "0c6a03eac768122819c05b71f233bba1e90cf426", package = "op-alloy-rpc-types" }
+
+# [lints.clippy]
+# pedantic = { level = "warn", priority = -1 }
+# restriction = { level = "warn", priority = -2 }
 
 # Comment out this block if gdb is lacking info
 [profile.dev]
@@ -239,3 +366,13 @@ debug = 1
 opt-level = 3
 codegen-units = 1
 debug = 1
+
+# Memory profiling with bytehound. Keeps release optimizations but emits full debug info.
+[profile.bytehound]
+inherits = "release"
+debug = 2
+
+[profile.bytehound.package."*"]
+opt-level = 3
+codegen-units = 1
+debug = 2
