@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Rc as NRc};
 
-use hatch::ast::hoon::{BaseType, Hoon, Note, NounExpr, ParsedAtom, Pint, Skin, Spec, Spot, Tome};
+use hatch::ast::hoon::{BaseType, Hoon, NounExpr, ParsedAtom, Pint, Skin, Spec, Spot, Tome};
 use nockapp::noun::slab::NounSlab;
 use nockvm::ext::AtomExt;
 use nockvm::noun::{Atom, Noun, NounAllocator, D, T};
@@ -2724,14 +2724,6 @@ fn chunked_tisgar_chain_matches_monolithic_mint() {
 // resolver), and a recursive trap (`|-`/`$`) inside `c` that drives `%hold`/
 // fan-leg interning. Must mint deterministically run-to-run (a fresh `Context`
 // per compile gives each an isolated cache universe).
-//
-// PRE-EXISTING failure (NOT introduced by the nest/C8 flip): with a FRESH native
-// intern context, minting this bare-%noun-subject wet-`|-` core fails with
-// `arm c: arm $: coil missing tail: not a cell` — confirmed by A/B against the
-// pre-C8 commit, where it also fails in isolation. Same bare-%noun wet-mint
-// corner as `wet_gate_function_sample_mint_deterministic`. Tracked in
-// docs/native-compiler/ATOMIC-FLIP-TRACKER.md.
-#[ignore = "pre-existing bare-%noun wet-|- mint failure; see ATOMIC-FLIP-TRACKER.md"]
 #[test]
 fn core_mint_deterministic() {
     use std::path::Path;
