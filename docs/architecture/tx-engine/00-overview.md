@@ -113,3 +113,4 @@ Present
 | [13 — Merkle Trees & Commitments](13-merkle-trees-and-commitments.md) | Merkle proof construction and hashable commitment trees |
 | [14 — Goldilocks Field Arithmetic](14-goldilocks-field-arithmetic.md) | Base and extension field types (ztd one and two) |
 | [15 — ZTD STARK Proof Stack](15-ztd-stark-proof-stack.md) | Full STARK prover hierarchy (ztd three through eight) |
+| [16 — ZK PoW Proof Data Encoding](16-zk-pow-proof-data-encoding.md) | Proof transcript objects, packed polynomials, and canonical `%poly` encoding |
