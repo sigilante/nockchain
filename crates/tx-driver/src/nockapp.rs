@@ -89,10 +89,7 @@ impl TxEffect {
             } => TxIntent {
                 id,
                 from: vec![src_lock],
-                recipients: vec![Recipient {
-                    lock: trg_lock,
-                    amount_nicks,
-                }],
+                recipients: vec![Recipient::to_condition(trg_lock, amount_nicks)],
                 refund_to: None,
                 fee: FeePolicy::Auto,
                 note_selection: NoteSelection::Auto,
@@ -338,13 +335,7 @@ mod tests {
     use crate::error::{RejectReason, TxDriverError};
 
     fn hash(seed: u64) -> Hash {
-        Hash([
-            Belt(seed + 1),
-            Belt(seed + 2),
-            Belt(seed + 3),
-            Belt(seed + 4),
-            Belt(seed + 5),
-        ])
+        Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
     }
 
     /// Builds the noun a kernel would emit for `[%tx %send id src trg amount]`.
@@ -390,10 +381,15 @@ mod tests {
         assert_eq!(intent.id, IntentId::from_u128(0xdead_beef));
         assert_eq!(intent.from, vec![src]);
         assert_eq!(intent.recipients.len(), 1);
-        assert_eq!(intent.recipients[0].lock, trg);
+        assert_eq!(
+            intent.recipients[0].destination,
+            crate::intent::Destination::Condition(trg)
+        );
         assert_eq!(intent.recipients[0].amount_nicks, 100_000);
         // The key never appears anywhere in the effect.
-        intent.validate().expect("a decoded effect is a valid intent");
+        intent
+            .validate()
+            .expect("a decoded effect is a valid intent");
     }
 
     #[test]
@@ -487,10 +483,7 @@ mod tests {
                 },
                 "tx-submitted",
             ),
-            (
-                TxOutcome::SignedNotSubmitted { id, tx_id },
-                "tx-signed",
-            ),
+            (TxOutcome::SignedNotSubmitted { id, tx_id }, "tx-signed"),
             (
                 TxOutcome::Rejected {
                     id,
@@ -513,8 +506,7 @@ mod tests {
             let (tag, encoded_id) = decode_cause(&slab);
             assert_eq!(tag, expected_tag);
             assert_eq!(
-                encoded_id,
-                0xabcd_1234,
+                encoded_id, 0xabcd_1234,
                 "the {expected_tag} cause dropped its correlation id"
             );
         }

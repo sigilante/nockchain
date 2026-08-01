@@ -156,7 +156,9 @@ pub fn validate_signed(
     }
 
     let computed = signed.compute_id().map_err(|err| {
-        RejectReason::SignerMismatch(format!("signed transaction id could not be computed: {err}"))
+        RejectReason::SignerMismatch(format!(
+            "signed transaction id could not be computed: {err}"
+        ))
     })?;
     if computed != signed.id {
         return Err(RejectReason::SignerMismatch(format!(
@@ -270,10 +272,12 @@ fn check_outputs_and_fee(
 
     let mut planned_outputs: BTreeMap<[u64; 5], u64> = BTreeMap::new();
     for output in &plan.assembled.outputs {
-        let entry = planned_outputs.entry(output.lock_root.to_array()).or_insert(0);
-        *entry = entry.checked_add(output.amount).ok_or_else(|| {
-            RejectReason::SignerMismatch("planned outputs overflow u64".into())
-        })?;
+        let entry = planned_outputs
+            .entry(output.lock_root.to_array())
+            .or_insert(0);
+        *entry = entry
+            .checked_add(output.amount)
+            .ok_or_else(|| RejectReason::SignerMismatch("planned outputs overflow u64".into()))?;
     }
 
     if actual_outputs != planned_outputs {
@@ -360,7 +364,7 @@ where
 #[cfg(test)]
 pub(crate) mod tests {
     use nockchain_math::belt::Belt;
-    use nockchain_types::tx_engine::common::{Nicks, Version};
+    use nockchain_types::tx_engine::common::{BlockHeight, Nicks, Version};
     use nockchain_types::tx_engine::v1::note::NoteData;
     use nockchain_types::tx_engine::v1::tx::{Seed, Seeds, Spend1, Witness};
     use wallet_tx_builder::types::{
@@ -368,16 +372,9 @@ pub(crate) mod tests {
     };
 
     use super::*;
-    use nockchain_types::tx_engine::common::BlockHeight;
 
     pub(crate) fn hash(seed: u64) -> Hash {
-        Hash([
-            Belt(seed + 1),
-            Belt(seed + 2),
-            Belt(seed + 3),
-            Belt(seed + 4),
-            Belt(seed + 5),
-        ])
+        Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
     }
 
     fn name(seed: u64) -> Name {
@@ -433,11 +430,7 @@ pub(crate) mod tests {
     }
 
     /// A signed transaction spending `input_name`, paying `seeds`, charging `fee`.
-    pub(crate) fn signed_with(
-        input_name: Name,
-        seeds: Vec<(Hash, u64)>,
-        fee: u64,
-    ) -> v1::RawTx {
+    pub(crate) fn signed_with(input_name: Name, seeds: Vec<(Hash, u64)>, fee: u64) -> v1::RawTx {
         let spend = Spend::Witness(Spend1 {
             witness: witness(),
             seeds: Seeds(
@@ -566,7 +559,8 @@ pub(crate) mod tests {
             },
         };
         if let Spend::Witness(spend1) = &mut signed.spends.0[0].1 {
-            spend1.witness.pkh_signature = nockchain_types::tx_engine::v1::tx::PkhSignature(vec![entry]);
+            spend1.witness.pkh_signature =
+                nockchain_types::tx_engine::v1::tx::PkhSignature(vec![entry]);
         }
         signed.id = signed.compute_id().expect("id computes");
 

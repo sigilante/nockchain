@@ -83,7 +83,11 @@ pub fn plan(
         .iter()
         .map(|recipient| {
             Ok(PlannedOutput {
-                lock_root: lock_root(&recipient.lock)?,
+                lock_root: recipient.destination.lock_root().map_err(|err| {
+                    RejectReason::MalformedIntent(format!(
+                        "recipient destination could not be hashed: {err}"
+                    ))
+                })?,
                 amount: recipient.amount_nicks,
                 note_data: Vec::new(),
             })
@@ -191,12 +195,10 @@ fn run_planner(
                 available: classified.spendable_total(),
             }
         }
-        PlanError::ManualNoteMissing { first, last } => {
-            RejectReason::PlanRejected {
-                message: format!("manually selected note {first}/{last} is not in the balance"),
-                debug_trace: Vec::new(),
-            }
-        }
+        PlanError::ManualNoteMissing { first, last } => RejectReason::PlanRejected {
+            message: format!("manually selected note {first}/{last} is not in the balance"),
+            debug_trace: Vec::new(),
+        },
         PlanError::UnknownLock { first, last, .. }
         | PlanError::MissingPlanningSpendCondition { first, last, .. } => {
             // The matcher admitted the note but could not produce a spend
@@ -343,13 +345,7 @@ mod tests {
     use crate::notes::classify;
 
     fn hash(seed: u64) -> Hash {
-        Hash([
-            Belt(seed + 1),
-            Belt(seed + 2),
-            Belt(seed + 3),
-            Belt(seed + 4),
-            Belt(seed + 5),
-        ])
+        Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
     }
 
     fn height(n: u64) -> BlockHeight {
@@ -357,7 +353,10 @@ mod tests {
     }
 
     fn note_for(condition: &SpendCondition, seed: u64, assets: u64) -> (Name, v1::Note) {
-        let first = condition.first_name().expect("first-name derives").into_hash();
+        let first = condition
+            .first_name()
+            .expect("first-name derives")
+            .into_hash();
         let name = Name::new(first, hash(seed));
         let note = v1::Note::V1(NoteV1 {
             version: Version::V1,
@@ -424,18 +423,13 @@ mod tests {
         let (from, classified, matcher, context) = wallet(&[1_000_000]);
         let intent = intent_for(from, 100_000, FeePolicy::Auto);
 
-        let plan =
-            plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
+        let plan = plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
 
         assert_eq!(plan.input_count(), 1);
         assert!(plan.fee() >= 100, "fee must respect the minimum floor");
         // Recipient output plus refund.
         assert_eq!(plan.assembled.outputs.len(), 2);
-        assert!(plan
-            .assembled
-            .outputs
-            .iter()
-            .any(|o| o.amount == 100_000));
+        assert!(plan.assembled.outputs.iter().any(|o| o.amount == 100_000));
     }
 
     #[test]
@@ -456,13 +450,9 @@ mod tests {
 
         let (from, classified, matcher, context) = wallet(&[1_000_000]);
         let intent = intent_for(from, 100_000, FeePolicy::Auto);
-        let plan =
-            plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
+        let plan = plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
         assert!(
-            plan.assembled
-                .outputs
-                .iter()
-                .any(|o| o.lock_root == root),
+            plan.assembled.outputs.iter().any(|o| o.lock_root == root),
             "the recipient output must carry the recipient's own lock root"
         );
     }
@@ -519,11 +509,7 @@ mod tests {
         assert!(raised.fee() >= raised_floor);
         // The extra fee must come out of the refund, never out of the
         // recipient's output.
-        assert!(raised
-            .assembled
-            .outputs
-            .iter()
-            .any(|o| o.amount == 100_000));
+        assert!(raised.assembled.outputs.iter().any(|o| o.amount == 100_000));
         assert!(raised.total_spent() <= 1_000_000);
     }
 
@@ -532,8 +518,7 @@ mod tests {
         let (from, classified, matcher, context) = wallet(&[400_000, 400_000, 400_000]);
         let intent = intent_for(from.clone(), 900_000, FeePolicy::Auto);
 
-        let plan =
-            plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
+        let plan = plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
 
         assert!(plan.input_count() >= 3);
         assert!(plan.assembled.inputs.iter().all(|i| i.lock == from));
@@ -545,8 +530,7 @@ mod tests {
     fn zero_value_refund_output_is_not_emitted() {
         let (from, classified, matcher, context) = wallet(&[1_000_000]);
         let intent = intent_for(from, 100_000, FeePolicy::Auto);
-        let plan =
-            plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
+        let plan = plan(&intent, &classified, &matcher, &context, &chain_context()).expect("plans");
         assert!(plan.assembled.outputs.iter().all(|o| o.amount > 0));
     }
 

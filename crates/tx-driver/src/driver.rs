@@ -612,8 +612,12 @@ mod tests {
     #[tokio::test]
     async fn a_payment_is_planned_signed_submitted_and_confirmed() {
         let dir = tempfile::tempdir().unwrap();
-        let (driver, log) =
-            driver_with(dir.path(), chain(1_000_000), MockSigner::new(vec![hash(KEY)])).await;
+        let (driver, log) = driver_with(
+            dir.path(),
+            chain(1_000_000),
+            MockSigner::new(vec![hash(KEY)]),
+        )
+        .await;
 
         let outcome = driver.submit(intent(100_000)).await.expect("runs");
 
@@ -691,13 +695,9 @@ mod tests {
         let timelocked = SpendCondition::coinbase_pkh(hash(KEY), 5_000);
         let chain = MockChainSource::new(
             1000,
-            vec![
-                note_for(&my_lock(), 100, 1, 1_000),
-                note_for(&timelocked, 101, 900, 10_000_000),
-            ],
+            vec![note_for(&my_lock(), 100, 1, 1_000), note_for(&timelocked, 101, 900, 10_000_000)],
         );
-        let (driver, log) =
-            driver_with(dir.path(), chain, MockSigner::new(vec![hash(KEY)])).await;
+        let (driver, log) = driver_with(dir.path(), chain, MockSigner::new(vec![hash(KEY)])).await;
 
         let mut intent = intent(5_000_000);
         intent.from = vec![my_lock(), timelocked];
@@ -724,7 +724,8 @@ mod tests {
     #[tokio::test]
     async fn a_rejection_is_safe_to_roll_back_and_a_failure_is_not() {
         let dir = tempfile::tempdir().unwrap();
-        let (driver, _) = driver_with(dir.path(), chain(10), MockSigner::new(vec![hash(KEY)])).await;
+        let (driver, _) =
+            driver_with(dir.path(), chain(10), MockSigner::new(vec![hash(KEY)])).await;
         let rejected = driver.submit(intent(1_000_000)).await.expect("runs");
         assert!(rejected.is_safe_to_roll_back());
 
@@ -1062,13 +1063,9 @@ mod tests {
         let timelocked = SpendCondition::coinbase_pkh(hash(KEY), 5_000);
         let chain = MockChainSource::new(
             1000,
-            vec![
-                note_for(&my_lock(), 100, 1, 1_000),
-                note_for(&timelocked, 101, 900, 10_000),
-            ],
+            vec![note_for(&my_lock(), 100, 1, 1_000), note_for(&timelocked, 101, 900, 10_000)],
         );
-        let (driver, log) =
-            driver_with(dir.path(), chain, MockSigner::new(vec![hash(KEY)])).await;
+        let (driver, log) = driver_with(dir.path(), chain, MockSigner::new(vec![hash(KEY)])).await;
 
         let mut intent = intent(100);
         intent.from = vec![my_lock(), timelocked];

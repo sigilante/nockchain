@@ -13,10 +13,10 @@
 
 use async_trait::async_trait;
 use nockapp::noun::slab::{NockJammer, NounSlab};
-use nockvm::noun::NounAllocator;
 use nockchain_types::tx_engine::common::{BlockHeight, FirstName, Hash, Name, TxId};
-use nockchain_types::BlockchainConstants;
 use nockchain_types::tx_engine::v1;
+use nockchain_types::BlockchainConstants;
+use nockvm::noun::NounAllocator;
 use noun_serde::{NounDecode, NounEncode};
 use wallet_tx_builder::types::ChainContext;
 
@@ -163,9 +163,7 @@ impl ChainConstants {
     /// Returns the node's full [`BlockchainConstants`] alongside the projection,
     /// so a caller can compare against its own expectations — see
     /// [`ChainConstants::fetch_from_node_checked`].
-    pub async fn fetch_from_node(
-        private_endpoint: &str,
-    ) -> Result<(Self, BlockchainConstants)> {
+    pub async fn fetch_from_node(private_endpoint: &str) -> Result<(Self, BlockchainConstants)> {
         let mut client = nockapp_grpc::private_nockapp::client::PrivateNockAppGrpcClient::connect(
             private_endpoint,
         )
@@ -183,9 +181,7 @@ impl ChainConstants {
         let response = client
             .peek(PEEK_CLIENT_PID, path_slab.jam().to_vec())
             .await
-            .map_err(|err| {
-                TxDriverError::Chain(format!("blockchain-constants peek: {err}"))
-            })?;
+            .map_err(|err| TxDriverError::Chain(format!("blockchain-constants peek: {err}")))?;
 
         let constants = decode_blockchain_constants(response)?;
         Ok((Self::from_blockchain_constants(&constants), constants))
@@ -221,8 +217,10 @@ fn decode_blockchain_constants(bytes: Vec<u8>) -> Result<BlockchainConstants> {
         .cue_into(bytes::Bytes::from(bytes))
         .map_err(|err| TxDriverError::Noun(format!("blockchain-constants did not cue: {err}")))?;
     let space = slab.noun_space();
-    let payload = Option::<Option<BlockchainConstants>>::from_noun(&noun, &space)
-        .map_err(|err| TxDriverError::Noun(format!("blockchain-constants did not decode: {err}")))?;
+    let payload =
+        Option::<Option<BlockchainConstants>>::from_noun(&noun, &space).map_err(|err| {
+            TxDriverError::Noun(format!("blockchain-constants did not decode: {err}"))
+        })?;
     payload.flatten().ok_or_else(|| {
         TxDriverError::Chain("node returned an empty blockchain-constants payload".into())
     })
@@ -235,9 +233,11 @@ impl GrpcChainSource {
     /// alongside its own node, which is the intended deployment.
     pub async fn connect(endpoint: &str, constants: ChainConstants) -> Result<Self> {
         let client =
-            nockapp_grpc::public_nockchain::v2::client::PublicNockchainGrpcClient::connect(endpoint)
-                .await
-                .map_err(|err| TxDriverError::Chain(format!("connect to {endpoint}: {err}")))?;
+            nockapp_grpc::public_nockchain::v2::client::PublicNockchainGrpcClient::connect(
+                endpoint,
+            )
+            .await
+            .map_err(|err| TxDriverError::Chain(format!("connect to {endpoint}: {err}")))?;
         Ok(Self { client, constants })
     }
 
@@ -308,9 +308,8 @@ impl ChainSource for GrpcChainSource {
             notes.extend(update.notes.0);
         }
 
-        let (height, block_id) = pinned.ok_or_else(|| {
-            TxDriverError::Chain("balance requested for zero first-names".into())
-        })?;
+        let (height, block_id) = pinned
+            .ok_or_else(|| TxDriverError::Chain("balance requested for zero first-names".into()))?;
 
         // The same note can be returned once per queried first-name when a
         // caller passes overlapping locks. Deduplicate on the full name.
@@ -398,14 +397,8 @@ impl ChainSource for GrpcChainSource {
 /// abandoning a good transaction is the less recoverable mistake.
 fn classify_submit_error(message: &str) -> Result<SubmitStatus> {
     const TERMINAL_MARKERS: &[&str] = &[
-        "invalid",
-        "malformed",
-        "double spend",
-        "double-spend",
-        "signature",
-        "insufficient fee",
-        "conflict",
-        "rejected",
+        "invalid", "malformed", "double spend", "double-spend", "signature", "insufficient fee",
+        "conflict", "rejected",
     ];
     let lowered = message.to_ascii_lowercase();
     if TERMINAL_MARKERS.iter().any(|m| lowered.contains(m)) {

@@ -30,13 +30,7 @@ use crate::sign::{SignError, SignRequest, Signer};
 /// Builds a deterministic hash from a seed. Shared by tests so that the same
 /// seed always names the same key, note, or lock root.
 pub fn hash(seed: u64) -> Hash {
-    Hash([
-        Belt(seed + 1),
-        Belt(seed + 2),
-        Belt(seed + 3),
-        Belt(seed + 4),
-        Belt(seed + 5),
-    ])
+    Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
 }
 
 /// A note locked to `condition`, worth `assets` nicks, minted at `origin_page`.
@@ -237,9 +231,7 @@ impl Signer for MockSigner {
 
     async fn sign(&self, request: SignRequest) -> std::result::Result<v1::RawTx, SignError> {
         match &self.behaviour {
-            SignerBehaviour::Decline(message) => {
-                return Err(SignError::Declined(message.clone()))
-            }
+            SignerBehaviour::Decline(message) => return Err(SignError::Declined(message.clone())),
             SignerBehaviour::Unavailable(message) => {
                 return Err(SignError::Unavailable(message.clone()))
             }

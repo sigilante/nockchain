@@ -101,9 +101,7 @@ impl std::fmt::Display for UnspendableReason {
             }
             Self::Burned => f.write_str("burned; unspendable by anyone"),
             Self::Undecodable { message } => write!(f, "note data did not decode: {message}"),
-            Self::LegacyV0Note => {
-                f.write_str("v0 note; spendable only via the v0 migration sweep")
-            }
+            Self::LegacyV0Note => f.write_str("v0 note; spendable only via the v0 migration sweep"),
         }
     }
 }
@@ -295,7 +293,10 @@ pub fn check_spend_condition(
                     .filter(|hash| context.holds_key(hash))
                     .count() as u64;
                 if have < pkh.m {
-                    return Err(UnspendableReason::ThresholdUnmet { needed: pkh.m, have });
+                    return Err(UnspendableReason::ThresholdUnmet {
+                        needed: pkh.m,
+                        have,
+                    });
                 }
             }
             LockPrimitive::Hax(hax) => {
@@ -500,13 +501,7 @@ mod tests {
     use super::*;
 
     fn hash(seed: u64) -> Hash {
-        Hash([
-            Belt(seed + 1),
-            Belt(seed + 2),
-            Belt(seed + 3),
-            Belt(seed + 4),
-            Belt(seed + 5),
-        ])
+        Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
     }
 
     fn height(n: u64) -> BlockHeight {
@@ -516,7 +511,10 @@ mod tests {
     /// Builds a note locked to `condition`, so that its first-name is the one
     /// the matcher will derive from that same condition.
     fn note_for(condition: &SpendCondition, origin_page: u64, assets: u64) -> (Name, v1::Note) {
-        let first = condition.first_name().expect("first-name derives").into_hash();
+        let first = condition
+            .first_name()
+            .expect("first-name derives")
+            .into_hash();
         let name = Name::new(first, hash(999));
         let note = v1::Note::V1(NoteV1 {
             version: Version::V1,
@@ -755,8 +753,7 @@ mod tests {
             note_for(&burned, 1, 800),
         ];
         let snapshot = snapshot(50, notes);
-        let (matcher, _) =
-            SpendConditionMatcher::new([mine, theirs.clone(), timelocked, burned]);
+        let (matcher, _) = SpendConditionMatcher::new([mine, theirs.clone(), timelocked, burned]);
         let context = UnlockContext::new().with_signer_pkh(hash(1));
 
         let classified = classify(&snapshot, &matcher, &context);
@@ -787,4 +784,3 @@ mod tests {
         assert_eq!(matcher.first_names(), vec![expected]);
     }
 }
-

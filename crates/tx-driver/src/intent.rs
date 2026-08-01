@@ -15,8 +15,10 @@
 
 use std::fmt;
 
-use nockchain_types::tx_engine::common::{BlockHeight, Name, TxId};
-use nockchain_types::tx_engine::v1::tx::SpendCondition;
+use nockchain_types::tx_engine::common::{BlockHeight, FirstName, Hash, Name, TxId};
+use nockchain_types::tx_engine::v1::tx::{
+    FirstNameFromLockRootError, Lock, LockHashError, SpendCondition,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{RejectReason, TxDriverError};
@@ -69,23 +71,86 @@ impl fmt::Debug for IntentId {
     }
 }
 
+/// Where an output's value goes.
+///
+/// An on-chain output commits only to a *lock root*, so a payer never has to
+/// understand the structure of what it is paying into. Both variants exist
+/// because most callers have a spend condition in hand and should not have to
+/// hash it themselves, while a caller paying into a multi-branch [`Lock`] tree
+/// has only the root — and could not express that at all if this were a bare
+/// `SpendCondition`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// A single spend condition. The common case.
+    Condition(SpendCondition),
+    /// A multi-branch lock tree, of which the spender later reveals one branch.
+    Tree(Lock),
+    /// A pre-computed lock root, for a payer that was handed one and does not
+    /// know or need the structure behind it.
+    LockRoot(Hash),
+}
+
+impl Destination {
+    /// The consensus lock root this destination commits to.
+    ///
+    /// For a single condition, `Lock::SpendCondition(sc).hash()` and
+    /// `sc.hash()` are the same digest — `Lock`'s hashable form delegates
+    /// straight through for that variant — so all three variants agree with the
+    /// derivation the wallet and the Hoon tx-engine use.
+    pub fn lock_root(&self) -> std::result::Result<Hash, LockHashError> {
+        match self {
+            Self::Condition(condition) => condition.hash(),
+            Self::Tree(lock) => lock.hash(),
+            Self::LockRoot(root) => Ok(root.clone()),
+        }
+    }
+
+    /// The first-name a recipient will query their balance under.
+    pub fn first_name(&self) -> std::result::Result<FirstName, LockHashError> {
+        FirstName::from_lock_root(&self.lock_root()?).map_err(|err| match err {
+            FirstNameFromLockRootError::HashableEncoding(inner) => {
+                LockHashError::HashableEncoding(inner)
+            }
+        })
+    }
+}
+
 /// A single transaction output.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Recipient {
-    /// The spend condition the output is locked to. Using a full
-    /// [`SpendCondition`] rather than a bare public-key hash is what lets the
-    /// driver pay into timelocked, hashlocked, and multisig outputs, not just
-    /// simple 1-of-1 PKH ones.
-    pub lock: SpendCondition,
+    /// Where the value goes.
+    pub destination: Destination,
     /// Amount in nicks. One NOCK is `wallet_tx_builder::fee::NICKS_PER_NOCK`.
     pub amount_nicks: u64,
 }
 
 impl Recipient {
     /// The common case: pay a single public-key hash.
-    pub fn to_pkh(pkh: nockchain_types::tx_engine::common::Hash, amount_nicks: u64) -> Self {
+    pub fn to_pkh(pkh: Hash, amount_nicks: u64) -> Self {
+        Self::to_condition(SpendCondition::simple_pkh(pkh), amount_nicks)
+    }
+
+    /// Pay into an arbitrary single spend condition — timelocked, hashlocked,
+    /// multisig, or any conjunction of those.
+    pub fn to_condition(lock: SpendCondition, amount_nicks: u64) -> Self {
         Self {
-            lock: SpendCondition::simple_pkh(pkh),
+            destination: Destination::Condition(lock),
+            amount_nicks,
+        }
+    }
+
+    /// Pay into a multi-branch lock tree.
+    pub fn to_tree(lock: Lock, amount_nicks: u64) -> Self {
+        Self {
+            destination: Destination::Tree(lock),
+            amount_nicks,
+        }
+    }
+
+    /// Pay to a lock root supplied by the recipient.
+    pub fn to_lock_root(lock_root: Hash, amount_nicks: u64) -> Self {
+        Self {
+            destination: Destination::LockRoot(lock_root),
             amount_nicks,
         }
     }
@@ -157,10 +222,7 @@ impl TxIntent {
         Self {
             id,
             from: vec![from],
-            recipients: vec![Recipient {
-                lock: to,
-                amount_nicks,
-            }],
+            recipients: vec![Recipient::to_condition(to, amount_nicks)],
             refund_to: None,
             fee: FeePolicy::Auto,
             note_selection: NoteSelection::Auto,
@@ -247,10 +309,7 @@ pub enum TxOutcome {
     },
     /// Non-terminal. The driver could not finish; the spend's status is
     /// unknown. **Do not roll back on this.**
-    Failed {
-        id: IntentId,
-        error: TxDriverError,
-    },
+    Failed { id: IntentId, error: TxDriverError },
 }
 
 impl TxOutcome {
@@ -287,8 +346,9 @@ impl TxOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use nockchain_types::tx_engine::common::Hash;
+
+    use super::*;
 
     fn pkh(byte: u64) -> Hash {
         Hash([

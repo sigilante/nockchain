@@ -38,9 +38,9 @@ use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
 use nockapp::noun::slab::NounSlab;
-use nockvm::noun::NounAllocator;
 use nockchain_types::tx_engine::common::{BlockHeight, TxId};
 use nockchain_types::tx_engine::v1;
+use nockvm::noun::NounAllocator;
 use noun_serde::{NounDecode, NounEncode};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
@@ -270,11 +270,7 @@ impl Journal {
     /// Records a signed transaction. **This is the durability barrier**: after
     /// this returns, the driver is committed to these exact bytes and must
     /// never re-plan or re-sign this intent.
-    pub async fn signed(
-        &mut self,
-        id: IntentId,
-        raw_tx: &v1::RawTx,
-    ) -> Result<(), JournalError> {
+    pub async fn signed(&mut self, id: IntentId, raw_tx: &v1::RawTx) -> Result<(), JournalError> {
         let bytes = jam_raw_tx(raw_tx);
         self.append(Record::Signed {
             id,
@@ -492,13 +488,13 @@ fn apply(
             // Submission carries no bytes of its own; it promotes the signed
             // bytes already on record. An intent cannot be submitted without
             // having been signed first, which this lookup enforces.
-            let (signed_tx_id, raw_tx) = current
-                .and_then(|state| state.signed_bytes())
-                .ok_or(JournalError::IllegalTransition {
+            let (signed_tx_id, raw_tx) = current.and_then(|state| state.signed_bytes()).ok_or(
+                JournalError::IllegalTransition {
                     intent: id,
                     from: current.map(IntentState::label).unwrap_or("none"),
                     to: "submitted",
-                })?;
+                },
+            )?;
             let recorded = parse_tx_id(tx_id, id)?;
             if recorded != *signed_tx_id {
                 return Err(JournalError::Corrupt {
@@ -630,13 +626,7 @@ mod tests {
     use super::*;
 
     fn hash(seed: u64) -> Hash {
-        Hash([
-            Belt(seed + 1),
-            Belt(seed + 2),
-            Belt(seed + 3),
-            Belt(seed + 4),
-            Belt(seed + 5),
-        ])
+        Hash([Belt(seed + 1), Belt(seed + 2), Belt(seed + 3), Belt(seed + 4), Belt(seed + 5)])
     }
 
     fn raw_tx(seed: u64) -> v1::RawTx {

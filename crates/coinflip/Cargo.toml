@@ -1,0 +1,28 @@
+[package]
+name = "coinflip"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "coinflip-demo"
+path = "src/main.rs"
+
+[dependencies]
+nockchain-math.workspace = true
+tempfile.workspace = true
+nockchain-types.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tx-driver = { workspace = true, features = ["testing"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+
+[dependencies.tokio]
+workspace = true
+features = ["macros", "rt-multi-thread"]
+
+[lints]
+workspace = true

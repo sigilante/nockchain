@@ -24,7 +24,9 @@ use nockchain_types::tx_engine::common::{BlockHeight, Name};
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RejectReason {
     /// The spendable balance is below the requested amount plus the computed fee.
-    #[error("insufficient funds: need {needed} nicks (amount + fee), have {available} nicks spendable")]
+    #[error(
+        "insufficient funds: need {needed} nicks (amount + fee), have {available} nicks spendable"
+    )]
     InsufficientFunds { needed: u64, available: u64 },
 
     /// The intent named notes that the balance snapshot does not contain.
