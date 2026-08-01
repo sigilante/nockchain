@@ -1,0 +1,40 @@
+[package]
+name = "tx-driver"
+version.workspace = true
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+publish = false
+
+[features]
+default = ["nockapp-driver"]
+# The NockApp `IODriverFn` adapter. Off by default for non-NockApp hosts
+# (services, tests, WASM) that only want the library core.
+nockapp-driver = []
+# In-memory ChainSource/Signer mocks, for downstream integration suites.
+testing = []
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+hex = { workspace = true }
+nockapp.workspace = true
+nockapp-grpc.workspace = true
+nockapp-grpc-proto.workspace = true
+nockchain-math.workspace = true
+nockchain-types.workspace = true
+nockvm.workspace = true
+nockvm_macros.workspace = true
+noun-serde.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tracing.workspace = true
+wallet-tx-builder.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

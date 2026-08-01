@@ -10540,6 +10540,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "tx-driver"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "hex",
+ "nockapp",
+ "nockapp-grpc",
+ "nockapp-grpc-proto",
+ "nockchain-math",
+ "nockchain-types",
+ "nockvm",
+ "nockvm_macros",
+ "noun-serde",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wallet-tx-builder",
+]
+
+[[package]]
 name = "typeid"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
