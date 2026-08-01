@@ -20,7 +20,9 @@ rust_library(
     deps = [
         "//crates/nockapp",
         "//crates/nockapp-grpc",
-        "//crates/nockapp-grpc-proto",
+        # The proto package's library target is named `nockapp-grpc`, not after
+        # its package; `crate_name` is `nockapp_grpc_proto`.
+        "//crates/nockapp-grpc-proto:nockapp-grpc",
         "//crates/nockchain-math",
         "//crates/nockchain-types",
         "//crates/nockvm/rust/nockvm",
