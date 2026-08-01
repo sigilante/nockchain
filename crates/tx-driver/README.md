@@ -98,11 +98,32 @@ threshold shortfall — so "insufficient funds" is falsifiable and a UI can say
 can be checked against an expected set so a fork is caught at connect time rather
 than as a silently underpriced transaction.
 
+**Signing against a real wallet kernel** is available behind the `kernel-signer`
+feature. `KernelSigner` boots the Hoon wallet, seeds it with keys and with the
+balance the driver planned against, and pins it to that plan: inputs are named
+explicitly, the fee is passed as a number, and *every* output — change included —
+is handed over as a `%lock-root` order, so the kernel's own change logic has
+nothing left to compute. The signed transaction comes back through the kernel's
+`%file` effect and is decoded in memory; nothing is written to disk.
+
+The feature is off by default because it pulls in the wallet kernel image and
+the prover hot state, which a host that signs remotely has no use for.
+
+> **Requires a current `assets/wal.jam`.** That file is a local build artifact
+> (gitignored), and `make` will not notice when it goes stale: `HOON_SRCS` in the
+> Makefile is written `$(find ...)` rather than `$(shell find ...)`, so it
+> expands to nothing and every jam rule's source dependency list is empty. A jam
+> is therefore only rebuilt when its own entry point changes — never when a
+> library under it does.
+>
+> A kernel older than the `multisig` field `create-tx-cause` grew in
+> `hoon/apps/wallet/lib/types.hoon` rejects the poke outright, as it does the
+> `nockchain-wallet` CLI's own `create-tx`. Rebuild with `make assets/wal.jam`
+> (`rm` it first, or the rule may consider it up to date). A stale kernel shows
+> up as `the wallet kernel built no transaction. It said: ## Poke failed`.
+
 ## Not implemented
 
-- **`KernelSigner`.** The trait, a `RemoteSigner` and a `MockSigner` exist;
-  a wallet-kernel-backed signer does not. Design in
-  [`KERNEL_SIGNER_SPEC.md`](KERNEL_SIGNER_SPEC.md).
 - **Spending from multi-branch lock trees.** `Recipient::to_tree` lets you pay
   *into* one, but `SpendConditionMatcher` derives first-names via the
   single-condition path, so tree-locked notes are not recognised as inputs. They
@@ -119,7 +140,8 @@ than as a silently underpriced transaction.
 ## Testing
 
 ```sh
-cargo test -p tx-driver              # 88 tests
+cargo test -p tx-driver                          # library core, in-memory
+cargo test -p tx-driver --features kernel-signer # adds the wallet-kernel suite
 cargo clippy -p tx-driver --all-targets
 ```
 

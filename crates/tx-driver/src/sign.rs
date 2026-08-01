@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
-use nockchain_types::tx_engine::common::{Hash, Name, TxId};
+use nockchain_types::tx_engine::common::{BlockHeight, Hash, Name, TxId};
 use nockchain_types::tx_engine::v1;
 use nockchain_types::tx_engine::v1::tx::{Spend, SpendCondition};
 use wallet_tx_builder::types::CandidateNote;
@@ -49,16 +49,44 @@ pub struct SignRequest {
     pub notes: Vec<CandidateNote>,
     /// The spend conditions unlocking those notes, deduplicated.
     pub spend_conditions: Vec<SpendCondition>,
+    /// The chain state the plan was made against.
+    ///
+    /// A signer that wants to check a timelock, or that has to reproduce the
+    /// plan against a kernel of its own, needs the same height the planner
+    /// used. Without it a signer either guesses or fetches its own — and two
+    /// views of the chain means a plan the signer cannot reproduce.
+    pub chain_state: ChainState,
+    /// The notes being spent, in the form a balance snapshot carries them.
+    ///
+    /// `notes` is the planner's projection and is lossy; this is the value the
+    /// chain reported. A signer that must seed a wallet with the balance it is
+    /// spending needs the latter.
+    pub spent_notes: Vec<(Name, v1::Note)>,
+}
+
+/// The chain state a plan was made against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChainState {
+    pub height: BlockHeight,
+    pub block_id: Hash,
 }
 
 impl SignRequest {
-    pub fn new(intent_id: IntentId, plan: TxPlan, notes: Vec<CandidateNote>) -> Self {
+    pub fn new(
+        intent_id: IntentId,
+        plan: TxPlan,
+        notes: Vec<CandidateNote>,
+        chain_state: ChainState,
+        spent_notes: Vec<(Name, v1::Note)>,
+    ) -> Self {
         let spend_conditions = plan.spend_conditions.clone();
         Self {
             intent_id,
             plan,
             notes,
             spend_conditions,
+            chain_state,
+            spent_notes,
         }
     }
 
@@ -381,6 +409,13 @@ pub(crate) mod tests {
         Name::new(hash(seed), hash(seed + 1000))
     }
 
+    pub(crate) fn chain_state() -> ChainState {
+        ChainState {
+            height: BlockHeight(Belt(1000)),
+            block_id: hash(7),
+        }
+    }
+
     /// A plan spending one note, paying `outputs`, charging `fee`.
     pub(crate) fn plan_with(outputs: Vec<(Hash, u64)>, fee: u64) -> TxPlan {
         TxPlan {
@@ -615,7 +650,13 @@ pub(crate) mod tests {
 
         assert_eq!(signer.signer_pkhs().await.unwrap(), vec![hash(1)]);
         let plan = plan_with(vec![(hash(50), 900)], 50);
-        let request = SignRequest::new(IntentId::from_u128(1), plan.clone(), vec![]);
+        let request = SignRequest::new(
+            IntentId::from_u128(1),
+            plan.clone(),
+            vec![],
+            chain_state(),
+            vec![],
+        );
         let signed = signer.sign(request).await.expect("signs");
         validate_signed(&plan, &signed).expect("validates");
     }

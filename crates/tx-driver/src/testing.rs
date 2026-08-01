@@ -104,6 +104,16 @@ impl MockChainSource {
         }
     }
 
+    /// Replaces the fee constants and height this chain reports.
+    ///
+    /// Needed whenever the transaction goes on to be priced somewhere else as
+    /// well — a wallet kernel re-checks the fee against its own constants — so
+    /// that both sides are working from the same numbers.
+    pub fn with_context(mut self, context: ChainContext) -> Self {
+        self.context = context;
+        self
+    }
+
     /// Never confirms submitted transactions; they sit in the mempool.
     pub fn never_confirming(mut self) -> Self {
         self.confirm_at = None;

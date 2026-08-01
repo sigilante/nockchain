@@ -24,6 +24,14 @@
 //! external authority is involved: [`chain::ChainSource`] for the network and
 //! [`sign::Signer`] for key material. Neither the planner nor the driver ever
 //! sees a private key.
+//!
+//! # Signers
+//!
+//! [`sign::RemoteSigner`] covers a signer reached over some transport. Behind
+//! the `kernel-signer` feature, [`kernel_signer::KernelSigner`] drives a
+//! resident Hoon wallet kernel — the only thing in this repository that can
+//! actually produce a Schnorr signature. It is feature-gated because it pulls
+//! in the wallet kernel image, which a host that signs elsewhere does not want.
 
 // Tests use `unwrap` freely; a panic there is the failure signal.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -34,6 +42,8 @@ pub mod driver;
 pub mod error;
 pub mod intent;
 pub mod journal;
+#[cfg(feature = "kernel-signer")]
+pub mod kernel_signer;
 #[cfg(feature = "nockapp-driver")]
 pub mod nockapp;
 pub mod notes;
@@ -45,5 +55,7 @@ pub use chain::{BalanceSnapshot, ChainSource, GrpcChainSource, SubmitStatus};
 pub use driver::{ConfirmPolicy, TxDriver, TxDriverConfig};
 pub use error::{JournalError, RejectReason, Result, TxDriverError};
 pub use intent::{FeePolicy, IntentId, NoteSelection, Recipient, TxIntent, TxOutcome};
+#[cfg(feature = "kernel-signer")]
+pub use kernel_signer::{KernelSigner, KernelSignerConfig, KeySource};
 pub use notes::{ClassifiedNotes, SpendConditionMatcher, UnlockContext, UnspendableReason};
-pub use sign::{SignError, SignRequest, Signer};
+pub use sign::{ChainState, SignError, SignRequest, Signer};
