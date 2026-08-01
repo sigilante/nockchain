@@ -33,7 +33,7 @@ use crate::error::{RejectReason, Result, TxDriverError};
 use crate::intent::{IntentId, TxIntent, TxOutcome};
 use crate::journal::{cue_raw_tx, IntentState, Journal};
 use crate::notes::{classify, ClassifiedNotes, SpendConditionMatcher, UnlockContext};
-use crate::sign::{validate_signed, SignError, SignRequest, Signer};
+use crate::sign::{validate_signed, ChainState, SignError, SignRequest, Signer};
 
 /// How hard the driver tries to see a transaction land in a block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,7 +301,7 @@ impl TxDriver {
             journal.planned(id).await?;
         }
 
-        let signed = match self.sign(id, &plan, &classified).await {
+        let signed = match self.sign(id, &plan, &classified, &snapshot).await {
             Ok(signed) => signed,
             Err(outcome) => return Ok(outcome),
         };
@@ -391,23 +391,39 @@ impl TxDriver {
         id: IntentId,
         plan: &TxPlan,
         classified: &ClassifiedNotes,
+        snapshot: &crate::chain::BalanceSnapshot,
     ) -> std::result::Result<nockchain_types::tx_engine::v1::RawTx, TxOutcome> {
+        let is_input = |name: &nockchain_types::tx_engine::common::Name| {
+            plan.assembled
+                .inputs
+                .iter()
+                .any(|input| &input.note.name == name)
+        };
+
         // Hand the signer the notes it is actually spending, not the whole
         // wallet: an approval prompt should show the inputs of this
         // transaction.
         let spent: Vec<_> = classified
             .spendable
             .iter()
-            .filter(|candidate| {
-                plan.assembled
-                    .inputs
-                    .iter()
-                    .any(|input| input.note.name == candidate.identity().name)
-            })
+            .filter(|candidate| is_input(&candidate.identity().name))
+            .cloned()
+            .collect();
+        // The same notes as the chain reported them. A signer driving a wallet
+        // kernel has to seed that kernel's balance, and the planner's
+        // `CandidateNote` projection is not enough to rebuild a note from.
+        let spent_notes: Vec<_> = snapshot
+            .notes
+            .iter()
+            .filter(|(name, _)| is_input(name))
             .cloned()
             .collect();
 
-        let request = SignRequest::new(id, plan.clone(), spent);
+        let chain_state = ChainState {
+            height: snapshot.height.clone(),
+            block_id: snapshot.block_id.clone(),
+        };
+        let request = SignRequest::new(id, plan.clone(), spent, chain_state, spent_notes);
         match self.signer.sign(request).await {
             Ok(signed) => Ok(signed),
             Err(err) if err.is_terminal() => {

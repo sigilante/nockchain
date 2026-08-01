@@ -12,11 +12,16 @@ default = ["nockapp-driver"]
 nockapp-driver = []
 # In-memory ChainSource/Signer mocks, for downstream integration suites.
 testing = []
+# `KernelSigner`, backed by a resident Hoon wallet kernel. Off by default: it
+# pulls in the wallet kernel image and the prover hot state, which a host that
+# signs remotely (a service, a browser extension, WASM) has no use for.
+kernel-signer = ["dep:kernels-open-wallet", "dep:zkvm-jetpack"]
 
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
 hex = { workspace = true }
+kernels-open-wallet = { workspace = true, optional = true }
 nockapp.workspace = true
 nockapp-grpc.workspace = true
 nockapp-grpc-proto.workspace = true
@@ -31,10 +36,14 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
 tracing.workspace = true
 wallet-tx-builder.workspace = true
+zkvm-jetpack = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints]
 workspace = true
