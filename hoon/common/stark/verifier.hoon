@@ -21,12 +21,14 @@
       %0  nock-common-v0-v1
       %1  nock-common-v0-v1
       %2  nock-common-v2
+      %3  nock-common-v2
     ==
   =/  pre=preprocess-data
     ?-  version.proof
       %0  p.pre-0-1.prep.stark-config
       %1  p.pre-0-1.prep.stark-config
       %2  p.pre-2.prep.stark-config
+      %3  p.pre-2.prep.stark-config
     ==
   ::
   =/  verify  ~(verify verify-door [nock-common pre])
@@ -48,6 +50,10 @@
     ~/  %verify-inner
     |=  [=proof override=(unit (list term)) verifier-eny=@ test-mode=?]
     ^-  verify-result
+    =/  original-version=proof-version  version.proof
+    ?>  ?|  !=(%3 original-version)
+            (proof-arrays-valid proof)
+        ==
     ?>  =(~ hashes.proof)
     =^  puzzle  proof
       =^(c proof ~(pull proof-stream proof) ?>(?=(%puzzle -.c) c^proof))
@@ -218,6 +224,17 @@
     ::
     =^  extra-comp-bpoly  proof
       =^(c proof ~(pull proof-stream proof) ?>(?=(%poly -.c) p.c^proof))
+    ::  Version 3 admits one canonical encoding of object 5 and caps it at the
+    ::  declared degree bound.  The degree-processing bound is D-1, so at most
+    ::  D coefficients are allowed.  Canonicalization removes trailing-zero
+    ::  transcript entropy without rejecting an honestly lower-degree result.
+    =/  extra-dp  (degree-processing heights constraint-map.pre %.y)
+    ?>  ?|  !=(%3 original-version)
+            ?&  (lte len.extra-comp-bpoly (add 1 fri-deg-bound.extra-dp))
+                ~(cank bop extra-comp-bpoly)
+                =(extra-comp-bpoly (bpcan extra-comp-bpoly))
+            ==
+        ==
     ::
     =.  rng  ~(verifier-fiat-shamir proof-stream proof)
     ::
@@ -300,6 +317,9 @@
     ::  read the composition piece codewords
     =^  comp-root  proof
       =^(c proof ~(pull proof-stream proof) ?>(?=(%comp-m -.c) [p.c num.c]^proof))
+    ?>  ?|  !=(%3 original-version)
+            =(+.comp-root (get-max-constraint-degree cd.pre))
+        ==
     ::
     ::
     =.  rng  ~(verifier-fiat-shamir proof-stream proof)
@@ -326,6 +346,33 @@
     ::  columns across all tables
     ?>  =(len.trace-evaluations (mul 2 total-cols))
     ?>  ~(chck fop trace-evaluations)
+    ::
+    ::  Version 3 binds the PoW-mutable extra composition polynomial to
+    ::  committed trace codewords at the post-commitment DEEP challenge.
+    ::  Earlier versions intentionally retain their historical acceptance
+    ::  rules so old blocks remain verifiable.
+    =/  extra-composition-deep-check=?
+      ?.  =(%3 original-version)
+        %.y
+      =/  extra-composition-deep-eval=felt
+        %-  eval-composition-poly
+        :*  trace-evaluations
+            heights
+            constraint-map.pre
+            count-map.pre
+            dyn-list
+            extra-composition-weights
+            augmented-chals
+            deep-challenge
+            table-full-widths
+            %.y
+        ==
+      =/  extra-comp-bpoly-deep-eval=felt
+        (bpeval-lift extra-comp-bpoly deep-challenge)
+      =(extra-composition-deep-eval extra-comp-bpoly-deep-eval)
+    ?.  extra-composition-deep-check
+      ~&  %extra-composition-deep-eval-failed
+      ~&  %invalid-proof  !!
     ::
     ::  read the composition piece evaluations at the DEEP challenge point
     =^  composition-piece-evaluations=fpoly  proof
@@ -369,10 +416,16 @@
     ::
     ::
     ::  generate random weights for DEEP composition polynomial
+    =/  num-base-deep-weights=@
+      :(add len.trace-evaluations len.extra-trace-evaluations len.composition-piece-evaluations)
+    =/  num-deep-weights=@
+      ?:  =(%3 original-version)
+        (add num-base-deep-weights total-cols)
+      num-base-deep-weights
     =^  deep-weights=fpoly  rng
       =^  felt-list  rng
         %-  felts:rng
-        :(add len.trace-evaluations len.extra-trace-evaluations len.composition-piece-evaluations)
+        num-deep-weights
       [(init-fpoly felt-list) rng]
     ::
     ::  read the merkle root of the DEEP composition polynomial
@@ -395,6 +448,12 @@
     ::
     ::  Open trace and composition piece polynomials at the top level FRI indices
     ::
+    =/  expected-base-opening-len=@
+      (roll table-base-widths-static:nock-common add)
+    =/  expected-ext-opening-len=@
+      (roll table-ext-widths-static:nock-common add)
+    =/  expected-mega-opening-len=@
+      (roll table-mega-ext-widths-static:nock-common add)
     =^  [elems=elem-list merk-proofs=(list merk-data:merkle)]
         proof
       %+  roll  fri-indices
@@ -414,6 +473,15 @@
       =^  comp-opening  proof
         =^(mp proof ~(pull proof-stream proof) ?>(?=(%m-pathbf -.mp) p.mp^proof))
       ::
+      ::  In v3 every Merkle leaf has its committed semantic width.  A larger
+      ::  leaf or a forged logical length must not become an ignored root nonce.
+      ?>  ?|  !=(%3 original-version)
+              ?&  =(len.leaf.base-trace-opening expected-base-opening-len)
+                  =(len.leaf.ext-opening expected-ext-opening-len)
+                  =(len.leaf.mega-ext-opening expected-mega-opening-len)
+                  =(len.leaf.comp-opening +.comp-root)
+              ==
+          ==
       =.  proofs
         :*
           :*  (hash-hashable:tip5 (hashable-bpoly:tip5 leaf.base-trace-opening))
@@ -478,7 +546,7 @@
       %+  roll  elems
       |=  [[idx=@ trace-elems=(list belt) comp-elems=(list belt) deep-elem=felt] acc=?]
       ^-  ?
-      =/  deep-eval
+      =/  base-deep-eval=felt
         %-  evaluate-deep
         :*  all-evals
             composition-piece-evaluations
@@ -492,6 +560,18 @@
             idx
             deep-challenge
             extra-comp-eval-point
+        ==
+      =/  deep-eval=felt
+        ?.  =(%3 original-version)
+          base-deep-eval
+        %+  fadd  base-deep-eval
+        %-  evaluate-trace-degree-normalization
+        :*  trace-elems
+            (~(slag fop deep-weights) num-base-deep-weights)
+            heights
+            table-full-widths
+            omega
+            idx
         ==
       ~|  "DEEP codeword doesn't match evaluation"
       ?>  =(deep-eval deep-elem)
@@ -773,6 +853,38 @@
         ==
     ^-  felt
     (do-evaluate-deep +<)
+  ::
+  ++  evaluate-trace-degree-normalization
+    |=  $:  trace-elems=(list belt)
+            weights=fpoly
+            heights=(list @)
+            full-widths=(list @)
+            omega=felt
+            index=@
+        ==
+    ^-  felt
+    =/  max-height=@  (roll heights max)
+    =/  x=felt  (fmul (lift g) (fpow omega index))
+    =/  [acc=felt weight-idx=@ elem-idx=@]
+      %^  zip-roll  (range (lent heights))  heights
+      |=  [[table-idx=@ height=@] acc=_(lift 0) weight-idx=@ elem-idx=@]
+      =/  width=@  (snag table-idx full-widths)
+      =/  degree-factor=felt  (fpow x (sub max-height height))
+      =/  current-elems=(list belt)  (swag [elem-idx width] trace-elems)
+      =/  [table-acc=felt weight-idx=@]
+        %+  roll  current-elems
+        |=  [elem=belt acc=_(lift 0) weight-idx=_weight-idx]
+        :_  +(weight-idx)
+        %+  fadd  acc
+        %+  fmul  (~(snag fop weights) weight-idx)
+        (fmul degree-factor (lift elem))
+      :*  (fadd acc table-acc)
+          weight-idx
+          (add elem-idx width)
+      ==
+    ?>  =(weight-idx len.weights)
+    ?>  =(elem-idx (lent trace-elems))
+    acc
   ::
   ++  do-evaluate-deep
     ~/  %evaluate-deep

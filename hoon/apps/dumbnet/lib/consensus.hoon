@@ -104,11 +104,72 @@
   ~/  %height-to-proof-version
   |=  height=page-number:t
   ^-  proof-version:sp
+  ?:  (gte height proof-version-3-start)
+    %3
   ?:  (gte height proof-version-2-start)
     %2
   ?:  (gte height proof-version-1-start)
     %1
   %0
+::
+::  Proof versions are selected by block height.  Keep this predicate shared
+::  by normal and genesis validation so height zero cannot bypass the schedule.
+++  proof-version-valid
+  ~/  %proof-version-valid
+  |=  [height=page-number:t =proof:sp]
+  ^-  ?
+  =((height-to-proof-version height) version.proof)
+::
+::  Check a block digest against checkpointed history.  Fakenets are
+::  identified by their non-realnet genesis seal and intentionally skip the
+::  realnet checkpoint map.
+++  checkpoint-digest-valid
+  ~/  %checkpoint-digest-valid
+  |=  [height=page-number:t digest=hash:t =genesis-seal:t]
+  ^-  ?
+  ?~  genesis-seal
+    %.n
+  ?|  !=(realnet-genesis-msg:dk msg-hash.u.genesis-seal)
+      ?!((~(has z-by checkpointed-digests) height))
+      =(digest (~(got z-by checkpointed-digests) height))
+  ==
+::
+::  Loading a checkpointed ID is not sufficient for legacy blocks because
+::  their IDs do not bind the proof-version tag.  Audit the stored page too.
+++  checkpoint-page-valid
+  ~/  %checkpoint-page-valid
+  |=  [height=page-number:t expected=hash:t pag=page:t]
+  ^-  ?
+  =/  pow  ~(pow get:page:t pag)
+  ?~  pow
+    %.n
+  ?&  =(height ~(height get:page:t pag))
+      =(expected ~(digest get:page:t pag))
+      (check-digest:page:t pag)
+      (proof-version-valid [height u.pow])
+      =(~ hashes.u.pow)
+      =(0 read-index.u.pow)
+      (canonical-pow-proof:dk [height u.pow])
+  ==
+::
+::  Custom networks may deliberately disable PoW in tests and persist
+::  proofless pages.  Loading may retain those pages only when a proof is not
+::  required; any proof that is present still receives the full version and
+::  canonical-envelope audit.
+++  persisted-page-valid
+  ~/  %persisted-page-valid
+  |=  [require-proof=? height=page-number:t expected=hash:t pag=page:t]
+  ^-  ?
+  =/  pow  ~(pow get:page:t pag)
+  ?~  pow
+    ?&  !require-proof
+        =(height ~(height get:page:t pag))
+        =(expected ~(digest get:page:t pag))
+        (check-digest:page:t pag)
+    ==
+  (checkpoint-page-valid [height expected pag])
+::  What block to start using proof version 3
+++  proof-version-3-start  119.400
 :: What block to start using proof version 2
 ++  proof-version-2-start  12.000
 ::  What block to start using proof version 1
@@ -231,9 +292,25 @@
   ^-  @
   (div max-target-atom:t (mul proofs-per-second asert-ideal-block-time.blockchain-constants))
 :::
+++  first-dynamic-asert-anchor-height  112.500
+:::
 ++  asert-anchor-schedule
   ^-  (list asert-anchor)
-  :~  [112.500 (asert-target-for-rate 3.000.000) ~]
+  ::  Zoe carries the height-112500 anchor target forward across the
+  ::  proof-version cutover rather than restoring the original Aletheia
+  ::  2^291 constant.
+  ::
+  ::  Zoe closes the coefficient-permutation grinding channel, so effective
+  ::  attempt throughput falls sharply at the boundary for anyone who was
+  ::  grinding.  Anchoring to 2^291 would have additionally raised the
+  ::  zero-drift baseline from approximately 450 million to approximately
+  ::  536.9 million full attempts per ideal block, compounding that drop with
+  ::  a difficulty step in the same direction at the same height.  Reusing the
+  ::  established three-million-proofs-per-second anchor keeps the target
+  ::  continuous across the cutover and leaves the throughput change entirely
+  ::  to ASERT, which converges on its usual 12-hour half-life.
+  :~  [proof-version-3-start (asert-target-for-rate 3.000.000) ~]
+      [first-dynamic-asert-anchor-height (asert-target-for-rate 3.000.000) ~]
       [asert-phase.blockchain-constants asert-anchor-target-atom.blockchain-constants `asert-anchor-min-timestamp.blockchain-constants]
   ==
 :::
@@ -255,32 +332,20 @@
     `anchor
   $(anchors t.anchors)
 :::
+::  Dynamic ASERT re-pins resolve only through the O(1), puzzle-keyed branch
+::  cache populated during block acceptance.  A missing entry is incomplete
+::  consensus state, not permission to walk the retained ancestry.
 ++  get-asert-anchor-min-timestamp
   |=  [puzzle-type=@tas anchor-height=@ block-id=block-id:t]
   ^-  @
   =/  timestamps=(unit (h-map block-id:t @))
     (~(get by asert-anchor-min-timestamps.c) puzzle-type)
   ?~  timestamps
-    (find-asert-anchor-min-timestamp anchor-height block-id)
+    ~|  %missing-asert-anchor-timestamp-cache  !!
   =/  timestamp=(unit @)  (~(get h-by u.timestamps) block-id)
   ?~  timestamp
-    (find-asert-anchor-min-timestamp anchor-height block-id)
+    ~|  %missing-asert-anchor-timestamp-cache  !!
   u.timestamp
-:::
-::  The anchor timestamp remains derivable from a validated branch.
-++  find-asert-anchor-min-timestamp
-  |=  [anchor-height=@ block-id=block-id:t]
-  ^-  @
-  =/  local=(unit local-page:t)  (~(get h-by blocks.c) block-id)
-  ?~  local
-    ~|  %missing-asert-anchor-block  !!
-  =/  pag=page:t  (to-page:local-page:t u.local)
-  =/  height=@  ~(height get:page:t pag)
-  ?:  =(height anchor-height)
-    (~(got h-by min-timestamps.c) block-id)
-  ?.  (gth height anchor-height)
-    ~|  %asert-anchor-after-tip  !!
-  $(block-id ~(parent get:page:t pag))
 :::
 ++  delete-asert-anchor-min-timestamps
   |=  [block-id=block-id:t timestamps=(map @tas (h-map block-id:t @))]
@@ -488,13 +553,16 @@
   ~/  %validate-page-without-txs
   |=  [pag=page:t now-secs=@]
   ^-  (reason:dk ~)
-  =/  version  (height-to-proof-version ~(height get:page:t pag))
+  =/  page-pow  ~(pow get:page:t pag)
   =/  version-check=?
-    ?.  check-pow-flag:t
-      %.y
-    =(version version:(need ~(pow get:page:t pag)))
+    ?~  page-pow
+      ?:(check-pow-flag:t %.n %.y)
+    (proof-version-valid [~(height get:page:t pag) u.page-pow])
   ?.  version-check
-    ~&  [%expected-vs-actual version version:(need ~(pow get:page:t pag))]
+    ~&  :*  %expected-vs-actual
+            (height-to-proof-version ~(height get:page:t pag))
+            page-pow
+        ==
     [%.n %proof-version-invalid]
   =/  par=page:t  (to-page:local-page:t (~(got h-by blocks.c) ~(parent get:page:t pag)))
   ::  this is already checked in +heard-block but is done here again
@@ -551,10 +619,8 @@
   ?~  genesis-seal.c
     ~>  %slog.[1 'validate-page-without-txs: Fatal error: Genesis seal not set!']
     [%.n %genesis-seal-not-set]
-  ?.  ?|  !=(realnet-genesis-msg:dk msg-hash.u.genesis-seal.c)
-          ?!((~(has z-by checkpointed-digests) ~(height get:page:t pag)))
-          =(~(digest get:page:t pag) (~(got z-by checkpointed-digests) ~(height get:page:t pag)))
-      ==
+  ?.  %-  checkpoint-digest-valid
+      [~(height get:page:t pag) ~(digest get:page:t pag) genesis-seal.c]
     ~>  %slog.[1 'validate-page-without-txs: Checkpoint match failed']
     [%.n %checkpoint-match-failed]
   ::
@@ -593,6 +659,17 @@
   ~/  %validate-page-with-txs
   |=  pag=page:t
   ^-  (reason:dk tx-acc:t)
+  ::  Pending pages can survive a software upgrade after their header was
+  ::  checked.  Repeat the cheap height/version gate before accepting one so a
+  ::  pre-Zoe %2 page at the %3 activation height cannot become valid merely
+  ::  because its final transaction arrived after restart.
+  =/  page-pow  ~(pow get:page:t pag)
+  =/  version-check=?
+    ?~  page-pow
+      ?:(check-pow-flag:t %.n %.y)
+    (proof-version-valid [~(height get:page:t pag) u.page-pow])
+  ?.  version-check
+    [%.n %proof-version-invalid]
   =/  digest-b58=cord  (to-b58:hash:t ~(digest get:page:t pag))
   ?.  (check-size pag)
     ~>  %slog.[1 (cat 3 'validate-page-with-txs: Block too large: ' digest-b58)]

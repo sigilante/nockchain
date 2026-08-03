@@ -16,6 +16,34 @@
   =/  res  (verify:vrf pf ~ 4)
   (expect !>(res))
 ::
+++  test-v2-proof-relabelled-v3-is-bad
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  res  (verify:vrf v3 ~ 4)
+  (expect !>(!res))
+::
+++  test-v3-pow-is-domain-separated-from-fiat-shamir
+  =/  v2=proof  [%2 objects.pf ~ 0]
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  raw-pow=tip5-hash-atom
+    (digest-to-atom:tip5 (hash-proof (get-pow v2)))
+  %+  expect-eq
+    !>([%.y %.n])
+  !>  :_  =((proof-to-pow v3) raw-pow)
+      =((proof-to-pow v2) raw-pow)
+::
+++  test-v3-version-is-bound-only-in-block-proof-digest
+  =/  v2=proof  [%2 objects.pf ~ 0]
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  v3-hashes=proof  v3(hashes ~[*noun-digest:tip5])
+  =/  v3-index=proof  v3(read-index 1)
+  %+  expect-eq
+    !>([%.y %.n %.n %.n])
+  !>  :*  =((hash-proof v2) (hash-proof v3))
+          =((hash-proof-for-block v2) (hash-proof-for-block v3))
+          =((hash-proof-for-block v3) (hash-proof-for-block v3-hashes))
+          =((hash-proof-for-block v3) (hash-proof-for-block v3-index))
+      ==
+::
 ++  test-bad-proof-empty-proof
   =/  pf  pf(objects *proof-objects)
   =/  res  (verify:vrf pf ~ 4)
@@ -694,6 +722,47 @@
   :*  (canonical-pow-proof:dk [112.499 padded-proof])
       (canonical-pow-proof:dk [canonical-pow-polynomial-height:dk padded-proof])
   ==
+:::
+++  test-proof-array-shape-validation
+  =/  poly
+    =/  m  (grab-proof-entry:bp pf %poly 1)
+    ?>  ?=(%poly -.m)  m
+  =/  malformed=bpoly  p.poly(len +(len.p.poly))
+  =/  malformed-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %poly
+        [%poly malformed]
+        1
+    ==
+  ::  Keep the logical length and payload words fixed but change the ignored
+  ::  terminal marker from 1 to 2.  This used to pass Hoon while native decoding
+  ::  rejected the same proof noun.
+  =/  bad-marker=bpoly
+    p.poly(dat (add dat.p.poly (lsh [6 len.p.poly] 1)))
+  =/  bad-marker-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %poly
+        [%poly bad-marker]
+        1
+    ==
+  =/  m-path
+    =/  m  (grab-proof-entry:bp pf %m-path 1)
+    ?>  ?=(%m-path -.m)  m
+  =/  bad-path-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %m-path
+        m-path(path.p (unbase-noun-digests:bp path.p.m-path))
+        1
+    ==
+  %+  expect-eq  !>([%.y %.n %.n %.n])
+  !>  :*  (proof-arrays-valid pf)
+          (proof-arrays-valid malformed-proof)
+          (proof-arrays-valid bad-marker-proof)
+          (proof-arrays-valid bad-path-proof)
+      ==
 :::
 ++  test-bad-proof-poly-wrong
   =/  poly

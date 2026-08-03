@@ -19,6 +19,7 @@
       kernel-state-8
       kernel-state-9
       kernel-state-10
+      kernel-state-11
   ==
 ::
 +$  kernel-state-0
@@ -178,7 +179,20 @@
       constants=blockchain-constants:v1:dt
   ==
 ::
-+$  kernel-state  kernel-state-10
+::  kernel-state-11 marks adoption of Zoe's proof and ASERT cutover semantics.
+::  Its payload is unchanged; migration re-audits accepted state and rebuilds
+::  mining work before events resume.
++$  kernel-state-11
+  $:  %11
+      c=consensus-state-10
+      a=admin-state-9
+      m=mining-state-9
+    ::
+      d=derived-state-9
+      constants=blockchain-constants:v1:dt
+  ==
+::
++$  kernel-state  kernel-state-11
 ::
 +$  consensus-state-0
   $+  consensus-state-0
@@ -640,6 +654,7 @@
   $%  [%0 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
       [%1 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
       [%2 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
+      [%3 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
   ==
 ::
 +$  seen

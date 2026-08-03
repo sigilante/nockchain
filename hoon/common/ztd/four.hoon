@@ -23,9 +23,16 @@
 ::
 +$  proof-objects  (list proof-data)
 ::
-+$  proof-version  ?(%2 %1 %0)
+::  Keep %2 first so the bunt/default remains backward-compatible.
++$  proof-version  ?(%2 %3 %1 %0)
 +$  proof
   $%  $:  version=%2
+          objects=proof-objects
+          hashes=(list noun-digest:tip5)
+          read-index=@
+      ==
+    ::
+      $:  version=%3
           objects=proof-objects
           hashes=(list noun-digest:tip5)
           read-index=@
@@ -44,6 +51,45 @@
       ==
   ==
 ::
+::  Array payloads carry a logical length and a backing atom.  Fiat-Shamir
+::  hashes both, so accepting a mismatch gives the prover transcript entropy
+::  that later arithmetic may ignore.  Merkle siblings must also be based
+::  before a hash jet sees them; relying on a check inside the Hoon hash arm can
+::  diverge when the arm is replaced by a release jet.  Version 3 validates the
+::  complete representation before any proof object is absorbed.
+++  proof-digest-based
+  |=  [a=belt b=belt c=belt d=belt e=belt]
+  ^-  ?
+  ?&  (based a)
+      (based b)
+      (based c)
+      (based d)
+      (based e)
+  ==
+::
+++  proof-arrays-valid
+  |=  p=proof
+  ^-  ?
+  %+  levy  objects.p
+  |=  pd=proof-data
+  ?+  -.pd  %.y
+    %m-root   (proof-digest-based p.pd)
+    %puzzle   ?&  (proof-digest-based commitment.pd)
+                  (proof-digest-based nonce.pd)
+              ==
+    %codeword  ~(cank fop p.pd)
+    %terms     ~(cank bop p.pd)
+    %m-path    ?&  ~(cank fop leaf.p.pd)
+                   (levy path.p.pd proof-digest-based)
+               ==
+    %m-pathbf  ?&  ~(cank bop leaf.p.pd)
+                   (levy path.p.pd proof-digest-based)
+               ==
+    %comp-m    (proof-digest-based p.pd)
+    %evals     ~(cank fop p.pd)
+    %poly      ~(cank bop p.pd)
+  ==
+::
 +$  tip5-hash-atom  @ux
 ::
 ::  number of items in proof used for pow
@@ -59,7 +105,11 @@
   ~/  %proof-to-pow
   |=  =proof
   ^-  tip5-hash-atom
-  (digest-to-atom:tip5 (hash-proof (get-pow proof)))
+  =/  pow-digest=noun-digest:tip5  (hash-proof (get-pow proof))
+  =?  pow-digest  =(%3 version.proof)
+    %-  hash-hashable:tip5
+    [leaf+%zkpow-v3 hash+pow-digest]
+  (digest-to-atom:tip5 pow-digest)
 ::
 ++  hashable-proof-objects
   ~/  %hashable-proof-objects
@@ -75,6 +125,27 @@
   =^  lis=(list belt)  rng  (belts:rng 5)
   =-  ?>  ?=(noun-digest:tip5 -)  -
   (list-to-tuple:tip5 lis)
+::
+::  Hash a complete proof for inclusion in a block ID.  Historical proof
+::  versions retain their object-only digest.  Version 3 also binds its tag and
+::  proof-stream bookkeeping, so changing any verifier-visible proof field
+::  cannot preserve the block ID.
+++  hash-proof-for-block
+  ~/  %hash-proof-for-block
+  |=  p=proof
+  ^-  noun-digest:tip5
+  =/  proof-digest=noun-digest:tip5  (hash-proof p)
+  ?.  =(%3 version.p)
+    proof-digest
+  %-  hash-hashable:tip5
+  ::  Keep the domain atom within one base-field element.  The Tip5 leaf
+  ::  encoder rejects wider atoms rather than reducing them modulo the field.
+  :*  leaf+%zkblk-v3
+      leaf+version.p
+      hash+proof-digest
+      (hashable-noun-digests:tip5 hashes.p)
+      leaf+read-index.p
+  ==
 ::
 ++  absorb-proof-objects
   ~/  %absorb-proof-objects
