@@ -268,6 +268,7 @@ fn stack_size_default_arg(stack_size: NockStackSize) -> &'static str {
 
 impl NockchainCli {
     pub fn validate(&self) -> Result<(), String> {
+        self.fakenet_asert.clone().into_config()?;
         Ok(())
     }
 }
