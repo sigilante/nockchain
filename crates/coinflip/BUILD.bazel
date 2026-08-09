@@ -1,0 +1,44 @@
+load("@crates//:defs.bzl", "aliases", "all_crate_deps")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library", "rust_test")
+load("//:lints/cargo_lint_sources.bzl", "cargo_lint_sources")
+
+package(default_visibility = ["//visibility:public"])
+
+cargo_lint_sources()
+
+exports_files(["Cargo.toml"])
+
+rust_library(
+    name = "coinflip",
+    srcs = ["src/lib.rs"],
+    aliases = aliases(),
+    edition = "2021",
+    deps = [
+        "//crates/nockchain-math",
+        "//crates/nockchain-types",
+        "//crates/tx-driver",
+    ] + all_crate_deps(),
+)
+
+rust_binary(
+    name = "coinflip-demo",
+    srcs = ["src/main.rs"],
+    aliases = aliases(),
+    edition = "2021",
+    deps = [
+        ":coinflip",
+        "//crates/nockchain-math",
+        "//crates/nockchain-types",
+        "//crates/tx-driver",
+    ] + all_crate_deps(),
+)
+
+rust_test(
+    name = "coinflip_unit_tests",
+    size = "small",
+    crate = ":coinflip",
+    deps = all_crate_deps(
+        normal = True,
+        normal_dev = True,
+    ),
+)
