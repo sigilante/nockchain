@@ -110,6 +110,7 @@
     %1  [%1 ~ ~ 0]
     %2  [%2 ~ ~ 0]
     %3  [%3 ~ ~ 0]
+    %4  ~|(%zk-prover-cannot-generate-v4-ai-proof !!)
   ==
 ::
 ++  prepare-extra-composition-poly
@@ -277,6 +278,7 @@
         %1  [%1 objects ~ 0]
         %2  [%2 objects ~ 0]
         %3  [%3 objects ~ 0]
+        %4  ~|(%zk-prover-cannot-generate-v4-ai-proof !!)
       ==
     ?.  =(digest.ctx (hash-proof proof))  [%| [%invalid-stream ~]]
     [%& proof]
@@ -913,6 +915,7 @@
       %1  [%& %1 objects.proof ~ 0]
       %2  [%& %2 objects.proof ~ 0]
       %3  [%& %3 objects.proof ~ 0]
+      %4  ~|(%zk-prover-cannot-generate-v4-ai-proof !!)
     ==
   ::
   ::

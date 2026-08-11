@@ -13,6 +13,8 @@
 ++  quadruple-ted  ^~((mul target-epoch-duration 4))
 ++  genesis-target  ^~((chunk:bignum genesis-target-atom))
 ++  max-target  ^~((chunk:bignum max-target-atom))
+::  Largest AI target whose shape-scaled jackpot threshold stays representable.
+++  max-ai-target-atom  max-ai-target-atom:v0
 ++  nicks-per-nock  ^~((bex 16))
 ::
 ::  +post-asert-activation / +pre-asert-activation: 1-arg activation
@@ -20,17 +22,17 @@
 ::    boundary semantics also live in the 2-arg
 ::    +post-asert-activation:v1 (used by +new-candidate); the inline
 ::    `gte` here is the canonical definition for callers that read
-::    asert-phase from blockchain-constants. See
+::    phase.zk-asert from blockchain-constants. See
 ::    014-aletheia-emissions-audit.md finding #3.
 ++  post-asert-activation
   |=  height=@
   ^-  ?
-  (gte height asert-phase)
+  (gte height phase.zk-asert)
 ::
 ++  pre-asert-activation
   |=  height=@
   ^-  ?
-  (lth height asert-phase)
+  (lth height phase.zk-asert)
 ::
 ++  bignum  bignum:v0
 ++  block-commitment  block-commitment:v0
@@ -82,15 +84,15 @@
 ++  genesis-seal  genesis-seal:v0
 ++  genesis-template  genesis-template:v0
 ++  hash  hash:v0
-::  $fund-address: lock-script hash receiving the 20% protocol-fund
+::  $protocol-fund-address: lock-script hash receiving the 20% protocol-fund
 ::  share of every post-asert-activation coinbase. See tx-engine-1.hoon.
-++  fund-address  fund-address:v1
+++  protocol-fund-address  protocol-fund-address:v1
 ::  $fund-note-firstname: on-chain first-name of every protocol-fund coinbase
 ::  note; +check:check-context routes it to the multisig recovery. See
 ::  tx-engine-1.hoon.
 ++  fund-note-firstname  fund-note-firstname:v1
 ::  $fund-multisig-lock: the 3-of-4 multisig spend-condition behind
-::  +fund-address; the wallet reveals it to spend fund notes. See
+::  +protocol-fund-address; the wallet reveals it to spend fund notes. See
 ::  tx-engine-1.hoon.
 ++  fund-multisig-lock  fund-multisig-lock:v1
 ++  local-page
@@ -150,6 +152,19 @@
 ++  page-summary  page-summary:v0
 ++  pkh-signature  pkh-signature:v1
 ++  proof  proof:v0
+++  ai-blake  ai-blake:v1
+++  ai-pow-nonce  ai-pow-nonce:v1
+++  ai-ext2   ai-ext2:v1
+++  ai-ext2s  ai-ext2s:v1
+++  ai-ext2-vec  ai-ext2-vec:v1
+++  ai-pow-commitments  ai-pow-commitments:v1
+++  ai-pow-public-inputs  ai-pow-public-inputs:v1
+++  ai-proof-node  ai-proof-node:v1
+++  ai-recursive-certificate  ai-recursive-certificate:v1
+++  ai-pow-certificate  ai-pow-certificate:v1
+++  ai-pow-artifact  ai-pow-artifact:v1
+++  ai-pow-artifact-resource-ok  ai-pow-artifact-resource-ok:v1
+++  pow-artifact  pow-artifact:v1
 ++  reason
   |$  object
   (each object term)
@@ -358,13 +373,94 @@
   ::
   ::  +new-candidate: build candidate page for mining with v1 shares
   ::
-  ::    creates a v1 page with hash-based coinbase-split. `asert-phase`
+  ::    creates a v1 page with hash-based coinbase-split. `zk-asert-phase`
   ::    threads through so post-asert-activation candidates carry the 80/20
   ::    miner/fund split (014-aletheia).
+  ::  +block-work-at: the heaviness a block at `height` produced by `puzzle`
+  ::  with `target-bn` contributes. SINGLE definition -- candidate construction
+  ::  and validation (+block-compute-work) both go through it, so a candidate
+  ::  can never store an accumulated-work that validation then rejects.
+  ::
+  ::  Before AI activation this is the unchanged ZK formula on the block's own
+  ::  target, so every block already on the chain keeps the work it was
+  ::  accepted with. From activation on it is the EXPECTED work at the block's
+  ::  own target for the producing puzzle, priced in ZKPoW-attempt-equivalents:
+  ::
+  ::  - %dumb-zkpow: 2^320/(target+1) attempts -- identical to the
+  ::    pre-activation formula, so ZK weight is continuous across the boundary.
+  ::  - %ai-pow: 2^256/(target+1) MAC-equivalents, converted at
+  ::    +mac-equivalents-per-zk-attempt.
+  ::
+  ::  Heaviness therefore scales inversely with target for both puzzles. A
+  ::  branch whose branch-local ASERT drives its target to the ceiling earns
+  ::  proportionally less fork-choice credit per block and cannot win by
+  ::  count. At the launch anchors both lanes produce the same heaviness per
+  ::  second (each anchor prices ~120 5090 GPUs at its ideal cadence), so
+  ::  steady-state puzzle shares still track block rate, without letting a
+  ::  discounted target subsidize a reorg.
+  ++  block-work-at
+    |=  [height=page-number puzzle=?(%dumb-zkpow %ai-pow) target-bn=bignum:bn]
+    ^-  bignum:bn
+    ?:  (lth height dual-puzzle-phase)
+      (compute-work:page:v0 target-bn)
+    ?-  puzzle
+      %dumb-zkpow  (compute-work:page:v0 target-bn)
+      %ai-pow      (ai-pow-work target-bn)
+    ==
+  ::
+  ::  +ai-pow-work: expected MAC-equivalents of matmul work at `target-bn`
+  ::  (2^256/(target+1)), priced in ZKPoW-attempt-equivalents. Mirrors
+  ::  +compute-work:page:v0's GetBlockProof convention, floored at 1.
+  ++  ai-pow-work
+    |=  target-bn=bignum:bn
+    ^-  bignum:bn
+    =/  target-atom=@  (merge:bignum target-bn)
+    =/  raw=@  (div (bex 256) (mul mac-equivalents-per-zk-attempt +(target-atom)))
+    (chunk:bignum ?:(=(0 raw) 1 raw))
+  ::
+  ::  +mac-equivalents-per-zk-attempt: the cross-puzzle exchange rate, from a
+  ::  2026-07 co-benchmark of the ZK prover and the Pearl mining kernel on one
+  ::  reference consumer GPU (RTX 5090 class): measured MAC-equivalent
+  ::  throughput per measured attempt throughput. The prover-side throughput
+  ::  figure is deliberately not published; the AI side is public via Pearl
+  ::  pool rates. Consensus-critical: every node must use the same value. It
+  ::  need only be stable and roughly track the real hardware ratio; if the
+  ::  ratio drifts, revise it at an upgrade.
+  ++  mac-equivalents-per-zk-attempt
+    ^~  25.750.000.000
+  ::
+  ::  +dual-puzzle-phase: the height at which the dual-puzzle regime begins, and
+  ::  therefore the first height at which heaviness is priced per puzzle.
+  ::
+  ::    ONE constant, not a derived value. The ZK puzzle's re-pin
+  ::    (+zk-asert-post-ai) and the introduction of the AI puzzle's own ASERT
+  ::    (+ai-asert) are the same event -- there is no coherent chain state where
+  ::    one has happened and the other has not -- so `phase.zk-asert-post-ai`
+  ::    must equal `phase.ai-asert`, and +load asserts it.
+  ::
+  ::    +zk-asert's own phase is the ORIGINAL Aletheia pin, made before the dual
+  ::    puzzle existed. It precedes this boundary and is not part of it.
+  ::
+  ::    `ai-pow-activation-height` is when AI blocks become ADMISSIBLE. That is
+  ::    the same height on mainnet but is a separate question: a fakenet may
+  ::    admit AI below the re-pin, and until the re-pin neither puzzle is
+  ::    retargeting under the regime per-puzzle pricing describes.
+  ++  dual-puzzle-phase
+    ^-  page-number
+    phase.ai-asert
+  ::
   ++  new-candidate
     |=  [par=form now=@da target-bn=bignum:bn =shares asert-phase=@]
     ^-  form
-    (new-candidate:page:v1 par now target-bn shares asert-phase)
+    =/  par-height=@  ?^(-.par height.par height.par)
+    %:  new-candidate:page:v1
+      par
+      now
+      target-bn
+      shares
+      asert-phase
+      (block-work-at +(par-height) %dumb-zkpow target-bn)
+    ==
   ::
   ++  get
     |_  =form
@@ -420,7 +516,7 @@
       msg.form
     ::
     ++  pow
-      ^-  (unit proof)
+      ^-  (unit pow-artifact)
       ?^  -.form  pow.form
       pow.form
     --
