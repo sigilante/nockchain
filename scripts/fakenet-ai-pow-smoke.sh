@@ -29,12 +29,13 @@ set -euo pipefail
 PRIV_PORT="${PRIV_PORT:-25557}"
 FAKENET_POW_LEN="${FAKENET_POW_LEN:-2}"
 FAKENET_LOG_DIFF="${FAKENET_LOG_DIFF:-1}"
-# Activate AI-PoW at height 1: genesis (height 0) is auto-injected on fakenet, and
-# the node then emits %mine-ai from height 1 — so the AI miner alone produces the
-# whole chain (no ZK miner needed for pre-activation heights). Heights below
-# zk-asert.phase are pre-asert (AI blocks use the epoch target, like the passing
-# ai_pow_accept_e2e test); the AI ASERT retarget path is unit-tested separately.
+# Both puzzle schedules activate at height 1. Post-ASERT candidate construction
+# applies the AI target to the AI candidate.
 FAKENET_AI_ACTIVATION="${FAKENET_AI_ACTIVATION:-1}"
+# A canonical AI-PoW target must stay below 2^232.
+AI_ASERT_ANCHOR_TARGET_BEX="${AI_ASERT_ANCHOR_TARGET_BEX:-231}"
+# A near-maximum 320-bit ZK target keeps the underlying candidate mineable.
+ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-319}"
 # Candidate refresh interval: must exceed the ~30s canonical prove time.
 CANDIDATE_INTERVAL="${CANDIDATE_INTERVAL:-120}"
 # Generous timeout: covers first-boot verifier-setup generation + one prove.
@@ -52,6 +53,8 @@ SETUP_CACHE_DIR="${AI_POW_VERIFIER_SETUP_CACHE_DIR:-$REPO_ROOT/.fakenet-ai-pow-d
 echo "== fakenet-ai-pow-smoke =="
 echo "  PRIV_PORT             = $PRIV_PORT"
 echo "  FAKENET_AI_ACTIVATION = $FAKENET_AI_ACTIVATION"
+echo "  AI_ASERT_TARGET_BEX  = $AI_ASERT_ANCHOR_TARGET_BEX"
+echo "  ZK_ASERT_TARGET_BEX  = $ZK_ASERT_ANCHOR_TARGET_BEX"
 echo "  CANDIDATE_INTERVAL    = ${CANDIDATE_INTERVAL}s (must exceed the ~30s prove)"
 echo "  SETUP_CACHE_DIR       = $SETUP_CACHE_DIR"
 echo "  MIN_HEIGHT            = $MIN_HEIGHT"
@@ -112,6 +115,12 @@ RUST_LOG="${NODE_RUST_LOG:-info}" \
     --fakenet-pow-len "$FAKENET_POW_LEN" \
     --fakenet-log-difficulty "$FAKENET_LOG_DIFF" \
     --fakenet-ai-pow-activation-height "$FAKENET_AI_ACTIVATION" \
+    --fakenet-asert-phase "$FAKENET_AI_ACTIVATION" \
+    --fakenet-asert-anchor-height "$((FAKENET_AI_ACTIVATION - 1))" \
+    --fakenet-asert-anchor-target-bex "$ZK_ASERT_ANCHOR_TARGET_BEX" \
+    --fakenet-ai-asert-phase "$FAKENET_AI_ACTIVATION" \
+    --fakenet-ai-asert-anchor-height "$((FAKENET_AI_ACTIVATION - 1))" \
+    --fakenet-ai-asert-anchor-target-bex "$AI_ASERT_ANCHOR_TARGET_BEX" \
     --fakenet-update-candidate-interval-secs "$CANDIDATE_INTERVAL" \
     --no-default-peers \
     --bind /ip4/127.0.0.1/udp/0/quic-v1 \

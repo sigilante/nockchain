@@ -47,9 +47,9 @@ pub struct FakenetAsertConfig {
 
 const FAKENET_ASERT_MAX_BEX: u64 = 512;
 
-/// Largest AI ASERT anchor-target exponent that stays minable. See
-/// [`AsertPuzzle::max_anchor_target_bex`].
-const AI_ASERT_MAX_BEX: u64 = 232;
+/// Largest representable AI ASERT anchor target exponent. The CLI maps a bex
+/// value to exactly `2^bex`, while the consensus maximum is `2^232 - 1`.
+const AI_ASERT_MAX_BEX: u64 = 231;
 
 /// Which puzzle a fakenet ASERT override targets. Every puzzle pins to the
 /// final pre-activation block (`anchor_height + 1 == phase`), allowing the
@@ -83,11 +83,12 @@ impl AsertPuzzle {
     ///
     /// The AI ceiling is not cosmetic: an %ai-pow target is scaled by the tile
     /// shape work factor (up to 2^24) before the 256-bit jackpot is compared
-    /// against it, and that product is fail-closed. An anchor above 2^232 is
-    /// therefore UNMINABLE rather than easy — every AI block is rejected, and
-    /// because the AI ASERT only advances on an accepted AI block the fakenet's
-    /// AI puzzle never recovers. Mirrors the Hoon `max-ai-target-atom` and
-    /// `ai_pow::difficulty::AI_POW_MAX_CONSENSUS_TARGET`.
+    /// against it, and that product is fail-closed. The CLI maps `bex` to
+    /// exactly `2^bex`, so bex 232 exceeds the consensus maximum of
+    /// `2^232 - 1`. A larger anchor is UNMINABLE: every AI block is rejected,
+    /// and because the AI ASERT only advances on an accepted AI block the
+    /// fakenet's AI puzzle never recovers. Mirrors the Hoon
+    /// `max-ai-target-atom` and `ai_pow::difficulty::AI_POW_MAX_CONSENSUS_TARGET`.
     fn max_anchor_target_bex(self) -> (u64, &'static str) {
         match self {
             AsertPuzzle::Zk => (FAKENET_ASERT_MAX_BEX, ""),
@@ -785,13 +786,10 @@ mod tests {
         assert!(err.contains("must be <="));
     }
 
-    // The AI anchor ceiling is TIGHTER than the ZK one and for a different
-    // reason: above 2^232 the shape-scaled jackpot threshold leaves the 256-bit
-    // domain, the verifier fail-closes on every AI block, and the AI ASERT --
-    // which only advances on an ACCEPTED AI block -- never retargets back down.
-    // A fakenet configured there would look like "AI mining just never works".
+    // The consensus ceiling is 2^232 - 1, but the CLI maps bex to exactly
+    // 2^bex. Bex 232 is therefore unminable and must be rejected.
     #[test]
-    fn validate_rejects_ai_asert_bex_above_the_minable_domain() {
+    fn validate_rejects_ai_asert_bex_at_the_unrepresentable_consensus_ceiling() {
         let mut cli = base_cli();
         cli.fakenet = true;
         cli.fakenet_ai_asert = ai_asert(Some(10), Some(9), Some(AI_ASERT_MAX_BEX + 1));
@@ -802,7 +800,7 @@ mod tests {
         assert!(err.contains(&format!("must be <= {AI_ASERT_MAX_BEX}")));
     }
 
-    // ...and the boundary itself is accepted, so the bound is not off by one.
+    // The highest representable minable target is accepted.
     #[test]
     fn validate_accepts_ai_asert_bex_at_the_minable_domain_edge() {
         let mut cli = base_cli();

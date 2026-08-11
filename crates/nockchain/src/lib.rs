@@ -451,7 +451,7 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
                 let mut ai_asert = fakenet_constants.ai_asert.clone();
                 ai_asert.phase = AI_POW_FAKENET_ACTIVATION;
                 ai_asert.anchor_height = anchor;
-                ai_asert.anchor_target_atom = ibig::UBig::from(1u64) << 232;
+                ai_asert.anchor_target_atom = (ibig::UBig::from(1u64) << 232) - 1;
                 ai_asert.ideal_block_time = 60;
                 ai_asert.half_life = 600;
                 ai_asert.anchor_min_timestamp = 0;
@@ -543,6 +543,14 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         if let Some(interval_secs) = cli.fakenet_update_candidate_interval_secs {
             fakenet_constants =
                 fakenet_constants.with_update_candidate_timestamp_interval(Seconds(interval_secs));
+        }
+        let max_minable_ai_target = (ibig::UBig::from(1u64) << 232) - 1;
+        if fakenet_constants.ai_asert.anchor_target_atom > max_minable_ai_target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fakenet AI ASERT anchor target exceeds the minable consensus domain",
+            )
+            .into());
         }
         setup::poke(
             &mut nockapp,

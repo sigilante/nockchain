@@ -76,7 +76,8 @@ Four constants encode this and must move together:
 - Hoon `+max-ai-target-atom` (`hoon/common/tx-engine-0.hoon`), the ceiling
   passed to `+compute-target:asert` by `+compute-target-ai-asert`
 - `AI_ASERT_MAX_BEX` (`crates/nockchain/src/config.rs`), the fakenet
-  `--fakenet-ai-asert-anchor-target-bex` bound
+  `--fakenet-ai-asert-anchor-target-bex` bound. The CLI maps a bex to exactly
+  `2^bex`, so it permits 231; `2^232` exceeds the strict consensus maximum.
 - the `%ai-pow` target gate in `+validate-page-without-txs`
 
 ### I4 — fork choice prices expected work per puzzle, at a hardware exchange rate

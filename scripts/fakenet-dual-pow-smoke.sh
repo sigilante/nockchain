@@ -31,18 +31,16 @@ PRIV_PORT="${PRIV_PORT:-25559}"
 FAKENET_POW_LEN="${FAKENET_POW_LEN:-2}"
 FAKENET_LOG_DIFF="${FAKENET_LOG_DIFF:-1}"
 FAKENET_AI_ACTIVATION="${FAKENET_AI_ACTIVATION:-1}"
+# A canonical AI-PoW target must stay below 2^232.
+AI_ASERT_ANCHOR_TARGET_BEX="${AI_ASERT_ANCHOR_TARGET_BEX:-231}"
 CANDIDATE_INTERVAL="${CANDIDATE_INTERVAL:-120}"
 NUM_THREADS="${NUM_THREADS:-1}"
 BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1200}"
 MINE_TIMEOUT_SECS="${MINE_TIMEOUT_SECS:-600}"
 MINING_PKH="${MINING_PKH:-9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV}"
 
-# Optional ZK-difficulty handicap so the AI miner can win some races. When ZK_ASERT
-# is set, apply --fakenet-asert-* (phase 2 / anchor 1 / anchor-target-bex chosen by
-# ZK_ANCHOR_TARGET_BEX) + an optional short half-life.
-ZK_ASERT="${ZK_ASERT:-0}"
-ZK_ANCHOR_TARGET_BEX="${ZK_ANCHOR_TARGET_BEX:-250}"
-ZK_HALF_LIFE="${ZK_HALF_LIFE:-600}"
+# Both puzzle schedules activate together so AI candidates carry AI ASERT targets.
+ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-319}"
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -53,9 +51,10 @@ SETUP_CACHE_DIR="${AI_POW_VERIFIER_SETUP_CACHE_DIR:-$REPO_ROOT/.fakenet-ai-pow-d
 echo "== fakenet-dual-pow-smoke =="
 echo "  PRIV_PORT             = $PRIV_PORT"
 echo "  FAKENET_AI_ACTIVATION = $FAKENET_AI_ACTIVATION"
+echo "  AI_ASERT_TARGET_BEX  = $AI_ASERT_ANCHOR_TARGET_BEX"
 echo "  CANDIDATE_INTERVAL    = ${CANDIDATE_INTERVAL}s (must exceed the ~30s AI prove)"
 echo "  NUM_THREADS (ZK)      = $NUM_THREADS"
-echo "  ZK_ASERT handicap     = $ZK_ASERT (bex=$ZK_ANCHOR_TARGET_BEX, half-life=${ZK_HALF_LIFE}s)"
+echo "  ZK_ASERT_TARGET_BEX  = $ZK_ASERT_ANCHOR_TARGET_BEX"
 echo "  SETUP_CACHE_DIR       = $SETUP_CACHE_DIR"
 
 echo
@@ -106,18 +105,16 @@ NODE_ARGS=(
     --fakenet-pow-len "$FAKENET_POW_LEN"
     --fakenet-log-difficulty "$FAKENET_LOG_DIFF"
     --fakenet-ai-pow-activation-height "$FAKENET_AI_ACTIVATION"
+    --fakenet-asert-phase "$FAKENET_AI_ACTIVATION"
+    --fakenet-asert-anchor-height "$((FAKENET_AI_ACTIVATION - 1))"
+    --fakenet-asert-anchor-target-bex "$ZK_ASERT_ANCHOR_TARGET_BEX"
+    --fakenet-ai-asert-phase "$FAKENET_AI_ACTIVATION"
+    --fakenet-ai-asert-anchor-height "$((FAKENET_AI_ACTIVATION - 1))"
+    --fakenet-ai-asert-anchor-target-bex "$AI_ASERT_ANCHOR_TARGET_BEX"
     --fakenet-update-candidate-interval-secs "$CANDIDATE_INTERVAL"
     --no-default-peers
     --bind /ip4/127.0.0.1/udp/0/quic-v1
 )
-if [[ "$ZK_ASERT" != "0" ]]; then
-    NODE_ARGS+=(
-        --fakenet-asert-phase 2
-        --fakenet-asert-anchor-height 1
-        --fakenet-asert-anchor-target-bex "$ZK_ANCHOR_TARGET_BEX"
-        --fakenet-asert-half-life "$ZK_HALF_LIFE"
-    )
-fi
 
 echo
 echo "[boot ] starting node (AI activation=$FAKENET_AI_ACTIVATION); first boot GENERATES the"
