@@ -20,6 +20,7 @@
       kernel-state-9
       kernel-state-10
       kernel-state-11
+      kernel-state-12
   ==
 ::
 ::  Branch-local per-puzzle ASERT state. Counts provide each puzzle's virtual
@@ -190,19 +191,31 @@
       constants=blockchain-constants:v1:dt
   ==
 ::
-::  Kernel state 11 stores the metadata needed to validate and build
-::  both proof paths without reconstructing branch-local state.
+::  Kernel state 11 marks adoption of Zoe's proof and ASERT cutover semantics.
+::  Its payload is frozen so old persistent states decode independently of later
+::  state changes.
 +$  kernel-state-11
   $:  %11
-      c=consensus-state-11
+      c=consensus-state-10
       a=admin-state-9
       m=mining-state-9
     ::
-      d=derived-state-11
+      d=derived-state-9
       constants=blockchain-constants:v1:dt
   ==
-:::
-+$  kernel-state  kernel-state-11
+::
+::  Kernel state 12 stores proof and branch-local puzzle metadata.
++$  kernel-state-12
+  $:  %12
+      c=consensus-state-12
+      a=admin-state-9
+      m=mining-state-9
+    ::
+      d=derived-state-12
+      constants=blockchain-constants:v1:dt
+  ==
+::
++$  kernel-state  kernel-state-12
 ::
 +$  consensus-state-0
   $+  consensus-state-0
@@ -437,10 +450,10 @@
 
 ::
 ::
-::  consensus-state-11 records proof versions for blocks whose puzzle type is
+::  consensus-state-12 records proof versions for blocks whose puzzle type is
 ::  not derivable from height alone.
-+$  consensus-state-11
-  $+  consensus-state-11
++$  consensus-state-12
+  $+  consensus-state-12
   ::
   ::  indexes and not-fully-validated state
   $:
@@ -472,8 +485,8 @@
         block-versions=(h-map block-id:dt proof-version:sp)
     ==
   ==
-:::
-+$  consensus-state  consensus-state-11
+::
++$  consensus-state  consensus-state-12
 ::
 ::  you will not have lost any chain state if you lost pending state, you'd just have to
 ::  request data again from peers and reset your mining state
@@ -560,14 +573,14 @@
 ::
 ::  Current derived state. `puzzle-asert-states` is complete for every accepted
 ::  post-activation block and follows forks independently.
-+$  derived-state-11
-  $+  derived-state-11
++$  derived-state-12
+  $+  derived-state-12
   $:  highest-block-height=(unit page-number:dt)
       heaviest-chain=(z-map page-number:dt block-id:dt)
       puzzle-asert-states=(h-map block-id:dt puzzle-asert-state)
   ==
 ::
-+$  derived-state  derived-state-11
++$  derived-state  derived-state-12
 ::
 +$  mining-state-0
   $+  mining-state-0

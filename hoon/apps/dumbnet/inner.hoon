@@ -42,8 +42,8 @@
     ::  print unlabelled, are attributable
     ~>  %slog.[0 'load: begin']
     =/  ks=kernel-state:dk
-      ~>  %slog.[0 'load: [1/5] state-n-to-11: migrating state to version 11']
-      ~>  %bout  (state-n-to-11 arg)
+      ~>  %slog.[0 'load: [1/5] state-n-to-12: migrating state to version 12']
+      ~>  %bout  (state-n-to-12 arg)
     =.  ks
       ~>  %slog.[0 'load: [2/5] check-checkpoints: verifying checkpointed digests']
       ~>  %bout  (check-checkpoints ks)
@@ -84,11 +84,12 @@
     ?>  (lte v1-phase.constants.k dual-puzzle-phase:page:t)
     ~>  %slog.[0 'load: complete']
     k
-    ::  this arm should be renamed each state upgrade to state-n-to-[latest] and extended to loop through all upgrades
-    ++  state-n-to-11
+    ::  This arm names the current schema and chains every frozen persisted
+    ::  payload through its next transition.
+    ++  state-n-to-12
       |=  arg=load-kernel-state:dk
       ^-  kernel-state:dk
-      ?.  ?=(%11 -.arg)
+      ?.  ?=(%12 -.arg)
         ~>  %slog.[0 'load: State upgrade required']
         ?-  -.arg
             ::
@@ -103,57 +104,99 @@
           %8  $(arg (state-8-to-9 arg))
           %9  $(arg (state-9-to-10 arg))
           %10  $(arg (state-10-to-11 arg))
+          %11  $(arg (state-11-to-12 arg))
         ==
       arg
     ::
-    ::  State 10 has no per-puzzle branch lineage.  It can migrate only before
-    ::  AI-PoW activation; later state is reset rather than validated with
-    ::  reconstructed metadata.
+    ::  State 11 applies Zoe's proof and ASERT cutover. A version-10 state
+    ::  can be preserved only before that cutover with readable anchor data.
     ++  state-10-to-11
       |=  arg=kernel-state-10:dk
       ^-  kernel-state-11:dk
-      =/  migration-safe=?
-        ?~  highest-block-height.d.arg
-          %.y
-        ?|  =(*page-number:t u.highest-block-height.d.arg)
-            (lth u.highest-block-height.d.arg ai-pow-activation-height.constants.arg)
-        ==
-      =/  new-c=consensus-state-11:dk
-        %*  .  *consensus-state-11:dk
-          blocks-needed-by                blocks-needed-by.c.arg
-          excluded-txs                    excluded-txs.c.arg
-          spent-by                        spent-by.c.arg
-          pending-blocks                  pending-blocks.c.arg
-          balance                         balance.c.arg
-          txs                             txs.c.arg
-          raw-txs                         raw-txs.c.arg
-          blocks                          blocks.c.arg
-          heaviest-block                  heaviest-block.c.arg
-          min-timestamps                  min-timestamps.c.arg
-          asert-anchor-min-timestamps    asert-anchor-min-timestamps.c.arg
-          epoch-start                     epoch-start.c.arg
-          targets                         targets.c.arg
-          btc-data                        btc-data.c.arg
-          genesis-seal                    genesis-seal.c.arg
-          block-versions                  *(h-map block-id:t proof-version:sp)
-        ==
-      =/  new-d=derived-state-11:dk
-        :*  highest-block-height.d.arg
-            heaviest-chain.d.arg
-            puzzle-asert-states=*(h-map block-id:t puzzle-asert-state:dk)
-        ==
+      =/  cleaned-c=consensus-state-10:dk
+        (reject-post-zoe-pending-pages-10 c.arg)
       =/  upgraded=kernel-state-11:dk
         :*  %11
-            c=new-c
+            c=cleaned-c
             a=a.arg
-            m=m.arg
-            d=new-d
+            m=m.arg(candidate-block *page:t, candidate-acc *tx-acc:t)
+            d=d.arg
             constants=constants.arg
         ==
-      ?:  migration-safe
+      =/  accepted-tip-height=(unit page-number:t)
+        ?~  heaviest-block.c.arg  ~
+        =/  tip-local=(unit local-page:t)
+          (~(get h-by blocks.c.arg) u.heaviest-block.c.arg)
+        ?~  tip-local  ~
+        `~(height get:local-page:t u.tip-local)
+      =/  accepted-state-readable=?
+        ?~  heaviest-block.c.arg  %.y
+        ?=(^ accepted-tip-height)
+      =/  crossed-zoe=?
+        ?~  accepted-tip-height  %.n
+        (gte u.accepted-tip-height proof-version-3-start:con)
+      =/  min-timestamp-ready=?
+        ?~  heaviest-block.c.arg  %.y
+        (~(has h-by min-timestamps.c.arg) u.heaviest-block.c.arg)
+      =/  dynamic-cache-ready=?
+        ?~  accepted-tip-height  %.y
+        ?:  (lth u.accepted-tip-height phase.zk-asert.constants.arg)
+          %.y
+        =/  timestamps=(unit (h-map block-id:t @))
+          (~(get by asert-anchor-min-timestamps.c.arg) %zk)
+        ?~  timestamps  %.n
+        (~(has h-by u.timestamps) (need heaviest-block.c.arg))
+      =/  before-ai=?
+        ?~  accepted-tip-height  %.y
+        (lth u.accepted-tip-height ai-pow-activation-height.constants.arg)
+      ?:  ?&  accepted-state-readable
+              !crossed-zoe
+              min-timestamp-ready
+              dynamic-cache-ready
+              before-ai
+          ==
         upgraded
-      ~>  %slog.[1 'load: State after AI-PoW activation requires reset']
-      (reset-consensus-state upgraded)
+      ~>  %slog.[1 'load: State requires reset before version-11 migration']
+      (reset-consensus-state-11 upgraded)
+    ::
+    ::  State 12 records proof and per-puzzle metadata. Valid state 11 is
+    ::  represented by the version-12 schema without reapplying Zoe's boundary.
+    ++  state-11-to-12
+      |=  zoe=kernel-state-11:dk
+      ^-  kernel-state-12:dk
+      =/  new-c=consensus-state-12:dk
+        %*  .  *consensus-state-12:dk
+          blocks-needed-by                blocks-needed-by.c.zoe
+          excluded-txs                    excluded-txs.c.zoe
+          spent-by                        spent-by.c.zoe
+          pending-blocks                  pending-blocks.c.zoe
+          balance                         balance.c.zoe
+          txs                             txs.c.zoe
+          raw-txs                         raw-txs.c.zoe
+          blocks                          blocks.c.zoe
+          heaviest-block                  heaviest-block.c.zoe
+          min-timestamps                  min-timestamps.c.zoe
+          asert-anchor-min-timestamps    asert-anchor-min-timestamps.c.zoe
+          epoch-start                     epoch-start.c.zoe
+          targets                         targets.c.zoe
+          btc-data                        btc-data.c.zoe
+          genesis-seal                    genesis-seal.c.zoe
+          block-versions                  *(h-map block-id:t proof-version:sp)
+        ==
+      =/  new-d=derived-state-12:dk
+        :*  highest-block-height.d.zoe
+            heaviest-chain.d.zoe
+            puzzle-asert-states=*(h-map block-id:t puzzle-asert-state:dk)
+        ==
+      =/  upgraded=kernel-state-12:dk
+        :*  %12
+            c=new-c
+            a=a.zoe
+            m=m.zoe(candidate-block *page:t, candidate-acc *tx-acc:t)
+            d=new-d
+            constants=constants.zoe
+        ==
+      upgraded(m (rebuild-mining-candidate c.upgraded d.upgraded m.upgraded constants.zoe))
     ::
     ::  upgrade kernel state 9 to kernel state 10 with typed dynamic anchor timestamps
     ++  state-9-to-10
@@ -495,6 +538,66 @@
       =.  constants.nk  constants.arg
       nk
     ::
+    ++  reset-consensus-state-11
+      |=  arg=kernel-state-11:dk
+      ^-  kernel-state-11:dk
+      =|  nk=kernel-state-11:dk
+      =.  mining.m.nk  mining.m.arg
+      =.  shares.m.nk  shares.m.arg
+      =.  v0-shares.m.nk  v0-shares.m.arg
+      =.  init.a.nk  init.a.arg
+      =.  btc-data.c.nk  btc-data.c.arg
+      =.  genesis-seal.c.nk  genesis-seal.c.arg
+      =.  constants.nk  constants.arg
+      nk
+    ::
+    ::  Candidate construction on load has no wall clock. The accepted parent
+    ::  median timestamp supplies the seed that the next event refreshes.
+    ++  rebuild-mining-candidate
+      |=  $:  con-state=consensus-state:dk
+              der-state=derived-state:dk
+              cleared-mining=mining-state:dk
+              bc=blockchain-constants:t
+          ==
+      ^-  mining-state:dk
+      ?.  mining.cleared-mining  cleared-mining
+      ?~  heaviest-block.con-state  cleared-mining
+      =/  seed-seconds=(unit @)
+        (~(get h-by min-timestamps.con-state) u.heaviest-block.con-state)
+      ?~  seed-seconds  cleared-mining
+      (~(heard-new-block dumb-miner cleared-mining der-state bc) con-state (lsh 6 u.seed-seconds))
+    ::
+    ::  Pending Zoe pages use the target regime that state 10 cannot retain.
+    ++  reject-post-zoe-pending-pages-10
+      |=  c=consensus-state-10:dk
+      ^-  consensus-state-10:dk
+      =/  stale=(list block-id:t)
+        %-  ~(rep h-by pending-blocks.c)
+        |=  [[block-id=block-id:t pag=page:t heard-at=@] ids=(list block-id:t)]
+        ?:  (gte ~(height get:page:t pag) proof-version-3-start:con)
+          [block-id ids]
+        ids
+      %+  roll  stale
+      |=  [block-id=block-id:t current=_c]
+      (reject-pending-block-10 current block-id)
+    ::
+    ++  reject-pending-block-10
+      |=  [c=consensus-state-10:dk block-id=block-id:t]
+      ^-  consensus-state-10:dk
+      ?<  (~(has h-by blocks.c) block-id)
+      =/  pag  page:(~(got h-by pending-blocks.c) block-id)
+      =.  c
+        %-  ~(rep z-in ~(tx-ids get:page:t pag))
+        |=  [tx-id=tx-id:t c=_c]
+        =.  blocks-needed-by.c  (~(del h-ju blocks-needed-by.c) tx-id ~(digest get:page:t pag))
+        =?  excluded-txs.c
+            ?&  ?!((~(has h-by blocks-needed-by.c) tx-id))
+                (~(has h-by raw-txs.c) tx-id)
+            ==
+          (~(put h-in excluded-txs.c) tx-id)
+        c
+      =.  pending-blocks.c  (~(del h-by pending-blocks.c) ~(digest get:page:t pag))
+      c
     ++  stored-postactivation-pages-valid
       |=  [arg=kernel-state:dk only-noncanonical=?]
       ^-  ?

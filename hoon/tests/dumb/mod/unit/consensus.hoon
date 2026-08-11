@@ -2,6 +2,7 @@
 /=  dcon  /apps/dumbnet/lib/consensus
 /=  dmin  /apps/dumbnet/lib/miner
 /=  dder  /apps/dumbnet/lib/derived
+/=  dumb  /apps/dumbnet/inner
 /=  helpers  /tests/dumb/helpers
 /=  tx-engine  /common/tx-engine
 /=  *  /apps/dumbnet/lib/types
@@ -86,4 +87,14 @@
   %+  expect-eq
     !>  [%.y %.y %.y]
   !>  [len-check height-check id-check]
+:::
+++  test-state-12-loads-frozen-zoe-state
+  =/  legacy=kernel-state-11  *kernel-state-11
+  =/  loaded=kernel-state  (load:inner:dumb legacy)
+  %+  expect-eq
+    !>  [%12 %.y 0]
+    !>  :*  -.loaded
+            ?=(~ heaviest-block.c.loaded)
+            ~(wyt h-by blocks.c.loaded)
+        ==
 --
