@@ -17,7 +17,7 @@
 #   FAKENET_LOG_DIFF  — log target difficulty (2^N)          (default: 1)
 #   NUM_THREADS       — miner pool size                      (default: 1)
 #   TIMEOUT_SECS      — post-boot mining wait                (default: 180)
-#   BOOT_TIMEOUT_SECS — verifier setup / born wait           (default: 1200)
+#   BOOT_TIMEOUT_SECS — verifier setup / born wait           (default: 1800)
 #   MINING_PKH        — payout pkh (defaults to a valid stub)
 
 set -euo pipefail
@@ -27,7 +27,7 @@ FAKENET_POW_LEN="${FAKENET_POW_LEN:-2}"
 FAKENET_LOG_DIFF="${FAKENET_LOG_DIFF:-1}"
 NUM_THREADS="${NUM_THREADS:-1}"
 TIMEOUT_SECS="${TIMEOUT_SECS:-180}"
-BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1200}"
+BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1800}"
 MINING_PKH="${MINING_PKH:-9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV}"
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"

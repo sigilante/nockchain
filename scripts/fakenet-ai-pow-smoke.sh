@@ -38,8 +38,8 @@ AI_ASERT_ANCHOR_TARGET_BEX="${AI_ASERT_ANCHOR_TARGET_BEX:-231}"
 ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-319}"
 # Candidate refresh interval: must exceed the ~30s canonical prove time.
 CANDIDATE_INTERVAL="${CANDIDATE_INTERVAL:-120}"
-# Generous timeout: covers first-boot verifier-setup generation + one prove.
-BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1200}"
+# First boot may build verifier setup for many minutes before %born.
+BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1800}"
 MINE_TIMEOUT_SECS="${MINE_TIMEOUT_SECS:-600}"
 MIN_HEIGHT="${MIN_HEIGHT:-1}"
 MINING_PKH="${MINING_PKH:-9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV}"
