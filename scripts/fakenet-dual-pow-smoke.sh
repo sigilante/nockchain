@@ -39,8 +39,9 @@ BOOT_TIMEOUT_SECS="${BOOT_TIMEOUT_SECS:-1800}"
 MINE_TIMEOUT_SECS="${MINE_TIMEOUT_SECS:-600}"
 MINING_PKH="${MINING_PKH:-9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV}"
 
-# Both puzzle schedules activate together so AI candidates carry AI ASERT targets.
-ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-319}"
+# The ZK target leaves time for a canonical AI proof to complete before a
+# concurrent ZK block replaces its candidate.
+ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-314}"
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"

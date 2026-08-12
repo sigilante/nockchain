@@ -36,6 +36,8 @@ use nockvm::noun::{D, T, YES};
 use nockvm_macros::tas;
 use tracing::{debug, info, instrument};
 
+const FAKENET_AI_POW_ZK_ASERT_ANCHOR_TARGET_BEX: usize = 314;
+
 /// Module for handling driver initialization signals
 pub mod driver_init {
     use nockapp::driver::{make_driver, IODriverFn, PokeResult};
@@ -464,7 +466,8 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
                 let mut zk_post = fakenet_constants.zk_asert_post_ai.clone();
                 zk_post.phase = AI_POW_FAKENET_ACTIVATION;
                 zk_post.anchor_height = anchor;
-                zk_post.anchor_target_atom = ibig::UBig::from(1u64) << 320;
+                zk_post.anchor_target_atom =
+                    ibig::UBig::from(1u64) << FAKENET_AI_POW_ZK_ASERT_ANCHOR_TARGET_BEX;
                 zk_post.ideal_block_time = 60;
                 zk_post.half_life = 600;
                 zk_post.anchor_min_timestamp = 0;

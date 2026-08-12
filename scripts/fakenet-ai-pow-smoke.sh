@@ -34,8 +34,9 @@ FAKENET_LOG_DIFF="${FAKENET_LOG_DIFF:-1}"
 FAKENET_AI_ACTIVATION="${FAKENET_AI_ACTIVATION:-1}"
 # A canonical AI-PoW target must stay below 2^232.
 AI_ASERT_ANCHOR_TARGET_BEX="${AI_ASERT_ANCHOR_TARGET_BEX:-231}"
-# A near-maximum 320-bit ZK target keeps the underlying candidate mineable.
-ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-319}"
+# A lower ZK target leaves time for a canonical AI proof to complete before a
+# concurrent ZK block replaces its candidate.
+ZK_ASERT_ANCHOR_TARGET_BEX="${ZK_ASERT_ANCHOR_TARGET_BEX:-314}"
 # Candidate refresh interval: must exceed the ~30s canonical prove time.
 CANDIDATE_INTERVAL="${CANDIDATE_INTERVAL:-120}"
 # First boot may build verifier setup for many minutes before %born.
