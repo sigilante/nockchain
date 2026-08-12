@@ -21,7 +21,10 @@
 //! gap explicitly.
 
 use ai_pow::commit::{matrix_commitment, pad_to_chunk_boundary, padded_chunk_len};
-use ai_pow::fiat_shamir::{commitment_key, noise_seed_a, noise_seed_b};
+use ai_pow::fiat_shamir::{
+    canonical_noise_seeds_from_matrix_commitments, canonical_noise_seeds_moe_from_public_routing,
+    commitment_key,
+};
 use ai_pow::matmul::{compute_tile_from_slices, BlockNoise, TileState};
 use ai_pow::params::MatmulParams;
 use ai_pow::prng;
@@ -30,7 +33,6 @@ use ai_pow::tile_hash::{difficulty_target, hash_le_target};
 #[path = "fixtures/pearl.rs"]
 mod fix;
 
-// ============================================================================
 // Protocol constants we share with Pearl
 // ============================================================================
 
@@ -233,29 +235,55 @@ fn s6_jackpot_hash_matches_pearl() {
 // ============================================================================
 
 #[test]
-fn s7_commitment_chain_matches_pearl() {
-    // Our seed-derivation chain follows Pearl's unkeyed
-    // BLAKE3 formulas. The fixture supplies (job_key, hash_a, hash_b) so
-    // the chain is tested independently of the matrix commitment.
-    let s_b = noise_seed_b(&fix::FIX7_JOB_KEY, &fix::FIX7_HASH_B);
-    assert_eq!(s_b, fix::FIX7_S_B);
-    let s_a = noise_seed_a(&s_b, &fix::FIX7_HASH_A);
-    assert_eq!(s_a, fix::FIX7_S_A);
+fn s7_v3_commitment_chain_matches_pearl() {
+    assert_eq!(
+        *blake3::hash(b"pearl/cert-v3/noise-seed/A").as_bytes(),
+        fix::PEARL_V3_SEED_SALT_A
+    );
+    assert_eq!(
+        *blake3::hash(b"pearl/cert-v3/noise-seed/B").as_bytes(),
+        fix::PEARL_V3_SEED_SALT_B
+    );
 
-    // Also confirm `commitment_key` matches Pearl's `compute_job_key` shape:
-    // feeding `(block_commitment, params_tag)` should produce a 32-byte
-    // BLAKE3 of their flat concatenation. We can't byte-match the fixture's
-    // FIX7_JOB_KEY (which was hand-picked; the flat-concat preimage isn't
-    // recoverable), but we can verify the function is the same algorithm
-    // by feeding two known parts and checking it equals raw BLAKE3.
+    let kappa = [0x11u8; 32];
+    let h_a = [0xaau8; 32];
+    let h_b = [0xbbu8; 32];
+    let (dense_s_a, dense_s_b) =
+        canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, 192, 320);
+    assert_eq!(dense_s_b, fix::PEARL_V3_DENSE_S_B);
+    assert_eq!(dense_s_a, fix::PEARL_V3_DENSE_S_A);
+
+    let routing_offsets_le: Vec<u8> = [3u32, 5, 9, 12]
+        .into_iter()
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let routing_root = [0xccu8; 32];
+    let (moe_s_a, moe_s_b) = canonical_noise_seeds_moe_from_public_routing(
+        &kappa, &h_a, &h_b, 192, 320, &routing_root, &routing_offsets_le,
+    );
+    assert_eq!(moe_s_b, fix::PEARL_V3_MOE_S_B);
+    assert_eq!(moe_s_a, fix::PEARL_V3_MOE_S_A);
+
+    let (logos_s_a, logos_s_b) = canonical_noise_seeds_moe_from_public_routing(
+        &kappa, &h_a, &h_b, 512, 64, &routing_root, &routing_offsets_le,
+    );
+    assert_eq!(logos_s_b, fix::PEARL_V3_LOGOS_MOE_S_B);
+    assert_eq!(logos_s_a, fix::PEARL_V3_LOGOS_MOE_S_A);
+    let (stacked_width_s_a, stacked_width_s_b) = canonical_noise_seeds_moe_from_public_routing(
+        &kappa, &h_a, &h_b, 512, 512, &routing_root, &routing_offsets_le,
+    );
+    assert_ne!(
+        (logos_s_a, logos_s_b),
+        (stacked_width_s_a, stacked_width_s_b)
+    );
+
     let block = b"some-block-commitment";
     let tag = [0xA5u8; 32];
     let ours = commitment_key(block, &tag);
     let mut hasher = blake3::Hasher::new();
     hasher.update(block);
     hasher.update(&tag);
-    let expected = *hasher.finalize().as_bytes();
-    assert_eq!(ours, expected);
+    assert_eq!(ours, *hasher.finalize().as_bytes());
 }
 
 // ============================================================================

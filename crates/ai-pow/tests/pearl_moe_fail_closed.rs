@@ -261,8 +261,8 @@ fn dense_sanity_check_still_rejects_moe() {
     }
 }
 
-/// `sanity_check_allowing_moe` ACCEPTS a valid, in-envelope MoE config (this is
-/// the gate the node MoE verify branch runs before `derive_pearl_work_commitments`).
+/// `sanity_check_allowing_moe` accepts valid in-envelope MoE configuration before
+/// V3 MoE work-commitment derivation.
 #[test]
 fn moe_envelope_accepts_valid_in_range_moe() {
     for (e, top_k) in [(2u16, 1u16), (8, 2), (256, 4), (1024, 8)] {

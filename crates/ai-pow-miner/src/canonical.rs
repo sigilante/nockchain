@@ -20,7 +20,7 @@ use ai_pow::matmul::{
 };
 use ai_pow::params::MatmulParams;
 use ai_pow::pearl_compat::{
-    compute_pearl_moe_ticket, derive_pearl_work_commitments, moe_expert_b_cols_from_local,
+    compute_pearl_moe_ticket, derive_pearl_moe_work_commitments, moe_expert_b_cols_from_local,
     pearl_bitcoin_double_sha256_raw, pearl_jackpot_hash, pearl_kappa, pearl_matrix_commitments,
     PearlAuxInclusionProof, PearlIncompleteBlockHeader, PearlMiningConfig, PearlMoeParams,
     PearlNockchainAux, PearlPeriodicPattern, PearlPublicProofParams, PearlWorkCommitments,
@@ -333,7 +333,8 @@ impl PreparedCanonicalMoeTemplate {
         let kappa = pearl_kappa(&header.to_bytes(), &self.mu);
         let (h_a, h_b) = pearl_matrix_commitments(&self.a, &self.b, &kappa);
         let (s_a, s_b, _) = canonical_noise_seeds_moe(
-            &kappa, &h_a, &h_b, &self.routing_data, &self.routing_offsets,
+            &kappa, &h_a, &h_b, self.params.m, self.n_e as u32, &self.routing_data,
+            &self.routing_offsets,
         );
         scratch.noise.refill(&s_a, &s_b, &self.params);
 
@@ -469,7 +470,17 @@ fn canonical_moe_inputs(
     let aux_commitment = aux.commitment().map_err(err("aux commitment"))?;
     let (header, aux_inclusion) = setup_aux_inclusion(&aux_commitment, extranonce);
     let mu = config.to_bytes().map_err(err("config bytes"))?;
-    let commitments = derive_pearl_work_commitments(&header.to_bytes(), &mu, &a, &b);
+    let n_e_u32 = u32::try_from(n_e).map_err(err("n_e"))?;
+    let commitments = derive_pearl_moe_work_commitments(
+        &header.to_bytes(),
+        &mu,
+        &a,
+        &b,
+        params.m,
+        n_e_u32,
+        &routing.routing_data_le_bytes(),
+        &routing.routing_offsets_le_bytes(),
+    );
 
     Ok(CanonicalMoeInputs {
         a,
@@ -517,12 +528,13 @@ pub fn evaluate_canonical_moe_ticket(
         inner,
         local_b,
         n_e,
+        m,
         ..
     } = canonical_moe_inputs(params, hw, e, top_k, nock_commit, extranonce)?;
     // Mirror the prover's ticket call exactly (expert 0, dot_product_len == k).
     compute_pearl_moe_ticket(
         &commitments.kappa, &commitments.h_a, &commitments.h_b, &a, &b, &routing, 0, &inner,
-        &local_b, n_e, params.k as usize, params.noise_rank as usize, params.k as usize,
+        &local_b, n_e, m as u32, params.k as usize, params.noise_rank as usize, params.k as usize,
     )
     .map_err(err("moe ticket"))
 }
@@ -893,11 +905,11 @@ mod tests {
 
         assert_eq!(
             hex::encode(ticket.s_a),
-            "f15e4d42af662ab77b891f4df9de391bcb64a3d646a7052773380006eb33ed02"
+            "02b9580688ca4e7f6ba6ff2c1db5ca44ed07f5702e762ae3616046e81547e741"
         );
         assert_eq!(
             hex::encode(ticket.s_b),
-            "0e38fcf89c5a0e738503fc2f6afa4808400bcad6ec1cb8c98d7cc6c6eb067286"
+            "fdd75fc5ae96f72705f953adf145980386572e32add83e1f043d9cf9171f3fa6"
         );
         assert_eq!(
             hex::encode(ticket.commitment.routing_root),
@@ -913,13 +925,13 @@ mod tests {
         );
         assert_eq!(
             hex::encode(ticket.commitment.hash_activations),
-            "0851b574ee80a88b79cfae0023db92dd7d7920d695aaffbdbe2d3b747db8b0dd"
+            "71f9a0f3e1680acfd1c8175cb0f503f66f15a7939fcc807a12affd0f01f1936b"
         );
         assert_eq!(ticket.outer_indices, vec![0, 2, 4, 6, 8, 10, 12, 14]);
         assert_eq!(ticket.b_cols_global, vec![0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(
             hex::encode(ticket.jackpot_hash),
-            "c12f50465e3153e5c01d7ffcc25ed0c2495566af7e46fe5036c44ea4ea9f9f6e"
+            "2d4fb8ab46f60e365ac9889e99ae2124e558fa912c74f5b8f712b3921c7b96f0"
         );
     }
 
@@ -971,7 +983,7 @@ mod tests {
         let ticket = compute_pearl_moe_ticket(
             &inputs.commitments.kappa, &inputs.commitments.h_a, &inputs.commitments.h_b, &inputs.a,
             &inputs.b, &inputs.routing, 0, &inputs.inner, &inputs.local_b, inputs.n_e,
-            params.k as usize, params.noise_rank as usize, params.k as usize,
+            inputs.m as u32, params.k as usize, params.noise_rank as usize, params.k as usize,
         )
         .expect("canonical ticket");
         let noise = BlockNoise::expand(&ticket.s_a, &ticket.s_b, &params);
@@ -1035,48 +1047,47 @@ mod tests {
         );
         assert_eq!(
             hex::encode(ticket.s_a),
-            "f15e4d42af662ab77b891f4df9de391bcb64a3d646a7052773380006eb33ed02"
+            "02b9580688ca4e7f6ba6ff2c1db5ca44ed07f5702e762ae3616046e81547e741"
         );
         assert_eq!(
             hex::encode(ticket.s_b),
-            "0e38fcf89c5a0e738503fc2f6afa4808400bcad6ec1cb8c98d7cc6c6eb067286"
+            "fdd75fc5ae96f72705f953adf145980386572e32add83e1f043d9cf9171f3fa6"
         );
         assert_eq!(ticket.outer_indices, [0, 2, 4, 6, 8, 10, 12, 14]);
         assert_eq!(ticket.b_cols_global, [0, 1, 2, 3, 4, 5, 6, 7]);
-        // These digest every byte of the selected noised strips in their ticket order.
         assert_eq!(
             hex::encode(
                 blake3::hash(&a_prime.iter().map(|&value| value as u8).collect::<Vec<_>>())
                     .as_bytes()
             ),
-            "33595ec0d3c36471c2620fc418b9b7b7793a535c70d020a8f4994d14c35b1916"
+            "a747529f3ed5735a58768b3d10497bc18783964aa209e49d86b0cc6b10b7f9e1"
         );
         assert_eq!(
             hex::encode(
                 blake3::hash(&b_prime.iter().map(|&value| value as u8).collect::<Vec<_>>())
                     .as_bytes()
             ),
-            "cb9e2145932f256544049528d2bd32aa4e6a25d9396d0ce9bdf57e2a26850eab"
+            "47361b7f13944b8f97cf815eb5c239c6da8d217460f1218a561e4c98e3ebdea7"
         );
         assert_eq!(
             trace.x_steps,
             [
-                -23_840, -49_433, -125_158, 130_123, 114_330, -56_923, 24_887, -91_155, 193_098,
-                -175_334, 34_005, -76_577, 40_365, 196_283, -242_181, -224_530,
+                -28_929, 7_783, 94_310, 129_510, -114_585, 13_084, -18_021, -111_673, 243_592,
+                21_367, 68_887, -165_211, -35_760, 4_711, 229_935, 57_423,
             ]
         );
         assert_eq!(
             trace.state,
             ai_pow::matmul::TileState([
-                -23_840, -49_433, -125_158, 130_123, 114_330, -56_923, 24_887, -91_155, 193_098,
-                -175_334, 34_005, -76_577, 40_365, 196_283, -242_181, -224_530,
+                -28_929, 7_783, 94_310, 129_510, -114_585, 13_084, -18_021, -111_673, 243_592,
+                21_367, 68_887, -165_211, -35_760, 4_711, 229_935, 57_423,
             ])
         );
-        assert_eq!(trace.state, ticket.tile_state);
         assert_eq!(
             hex::encode(ticket.jackpot_hash),
-            "c12f50465e3153e5c01d7ffcc25ed0c2495566af7e46fe5036c44ea4ea9f9f6e"
+            "2d4fb8ab46f60e365ac9889e99ae2124e558fa912c74f5b8f712b3921c7b96f0"
         );
+        assert_eq!(trace.state, ticket.tile_state);
         assert_eq!(
             hex::encode(public.pearl_adjusted_target().expect("Pearl target")),
             "00000000000000000000000000000000000000000000000000000000ffff7f00"

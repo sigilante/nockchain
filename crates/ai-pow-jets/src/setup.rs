@@ -13,7 +13,7 @@ use std::io::Write;
 
 use ai_pow::params::MatmulParams;
 use ai_pow::pearl_compat::{
-    derive_pearl_work_commitments, pearl_bitcoin_double_sha256_raw, PearlAuxInclusionProof,
+    derive_pearl_moe_work_commitments, pearl_bitcoin_double_sha256_raw, PearlAuxInclusionProof,
     PearlIncompleteBlockHeader, PearlMiningConfig, PearlMoeParams, PearlNockchainAux,
     PearlPeriodicPattern, PearlPublicProofParams, PEARL_MMA_INT7XINT7_TO_INT32,
     PEARL_NOCKCHAIN_AUX_COMMITMENT_TAG,
@@ -245,7 +245,17 @@ fn canonical_moe_inputs(
     let aux_commitment = aux.commitment().map_err(err("aux commitment"))?;
     let (header, aux_inclusion) = setup_aux_inclusion(&aux_commitment);
     let mu = config.to_bytes().map_err(err("config bytes"))?;
-    let commitments = derive_pearl_work_commitments(&header.to_bytes(), &mu, &a, &b);
+    let n_e_u32 = u32::try_from(n_e).map_err(err("n_e"))?;
+    let commitments = derive_pearl_moe_work_commitments(
+        &header.to_bytes(),
+        &mu,
+        &a,
+        &b,
+        params.m,
+        n_e_u32,
+        &routing.routing_data_le_bytes(),
+        &routing.routing_offsets_le_bytes(),
+    );
 
     Ok(CanonicalMoeInputs {
         a,

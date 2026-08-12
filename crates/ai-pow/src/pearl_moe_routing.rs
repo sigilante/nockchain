@@ -15,7 +15,7 @@
 //!
 //! The committed routing array is `routing_data` (the token indices), serialized
 //! as little-endian `u32`. `routing_offsets` is likewise little-endian `u32`.
-//! Both feed the MoE commitment splice (see `fiat_shamir::moe_hash_activations`).
+//! Both feed the V3 MoE routing splice.
 //!
 //! This is a consensus-load-bearing canonicalization: a different tie-break would
 //! change `routing_root` and every downstream hash. The stable sort here matches

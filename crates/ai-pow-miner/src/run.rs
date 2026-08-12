@@ -101,6 +101,7 @@ use crate::{DifficultyTarget, MiningCancel};
 // target, and JSON-RPC envelope while still bounding untrusted Gateway input.
 const PEARL_GATEWAY_MAX_RESPONSE_LINE_BYTES: usize = 160 * 1024;
 const MAX_CHAIN_TARGET_U32_LIMBS: usize = 10;
+const PEARL_GATEWAY_CERTIFICATE_VERSION_V3: u32 = 3;
 const AI_POW_MINE_CANDIDATE_VERSION: u64 = 4;
 const NODE_POKE_ACK_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -923,11 +924,6 @@ async fn cancel_and_await_canonical_worker(
     Ok(())
 }
 
-/// Proof-of-work grind for the gateway-free canonical miner. Batches consecutive
-/// extranonces through a prepared template and returns only after a scalar-oracle
-/// recheck has matched the backend winner. Cancellation is observed before and
-/// after every bounded batch. Runs on a blocking thread.
-
 /// MAC-equivalents one canonical grind attempt costs — the shape work factor
 /// `F` consensus prices this miner's attempts at. The node's `target` prices
 /// ONE MAC-equivalent, so the jackpot clears when
@@ -973,6 +969,10 @@ fn grind_canonical_block(
     grind_canonical_block_with_backend(commit, target, cancel, &backend)
 }
 
+// Proof-of-work grind for the gateway-free canonical miner. Batches consecutive
+// extranonces through a prepared template and returns only after a scalar-oracle
+// recheck has matched the backend winner. Cancellation is observed before and
+// after every bounded batch. Runs on a blocking thread.
 fn grind_canonical_block_with_backend(
     commit: [u8; 32],
     target: DifficultyTarget,
@@ -1462,10 +1462,21 @@ enum PearlMergeWorkerOutput {
     },
     NockchainPrepared(PearlMergePreparedSubmission),
 }
+/// A Gateway job whose wire certificate version was validated as V3.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PearlCertificateV3;
+
+impl PearlCertificateV3 {
+    const fn wire_version(self) -> u32 {
+        PEARL_GATEWAY_CERTIFICATE_VERSION_V3
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PearlGatewayResolvedMiningJob {
     header: PearlIncompleteBlockHeader,
     target: serde_json::Value,
+    certificate: PearlCertificateV3,
     aux_inclusion: Option<PearlAuxInclusionProof>,
 }
 
@@ -1543,6 +1554,15 @@ enum PearlGatewayError {
     Base64(#[from] base64::DecodeError),
     #[error("Pearl gateway returned error: {0}")]
     Rpc(String),
+    #[error("Pearl gateway mining job omitted certificate version")]
+    MissingCertificateVersion,
+    #[error("Pearl gateway requires certificate version {expected}, got {actual}")]
+    UnsupportedCertificateVersion { expected: u32, actual: u32 },
+    #[error(
+        "Pearl Gateway mining job header does not match the aux-bearing mined header; \
+         skipping submitPlainProof because Gateway acknowledges before its async stale-header check"
+    )]
+    MiningJobHeaderMismatch,
     #[error("Pearl gateway response id mismatch: expected {expected}, got {actual}")]
     ResponseIdMismatch { expected: u64, actual: String },
     #[error("Pearl gateway mining job target is outside uint256")]
@@ -1584,6 +1604,8 @@ struct PearlGatewayMiningJob {
     incomplete_header_bytes: String,
     target: serde_json::Value,
     #[serde(default)]
+    cert_version: Option<u32>,
+    #[serde(default)]
     aux_inclusion: Option<PearlGatewayAuxInclusion>,
 }
 
@@ -1599,6 +1621,19 @@ struct PearlGatewaySubmitRpcResponse {
     id: serde_json::Value,
     result: Option<serde_json::Value>,
     error: Option<PearlGatewayRpcError>,
+}
+
+fn parse_pearl_gateway_certificate_v3(
+    cert_version: Option<u32>,
+) -> Result<PearlCertificateV3, PearlGatewayError> {
+    let actual = cert_version.ok_or(PearlGatewayError::MissingCertificateVersion)?;
+    if actual != PEARL_GATEWAY_CERTIFICATE_VERSION_V3 {
+        return Err(PearlGatewayError::UnsupportedCertificateVersion {
+            expected: PEARL_GATEWAY_CERTIFICATE_VERSION_V3,
+            actual,
+        });
+    }
+    Ok(PearlCertificateV3)
 }
 
 fn fetch_pearl_gateway_mining_job(
@@ -1650,6 +1685,7 @@ fn fetch_pearl_gateway_mining_job(
     let job = response
         .result
         .ok_or_else(|| PearlGatewayError::Rpc("missing result".to_string()))?;
+    let certificate = parse_pearl_gateway_certificate_v3(job.cert_version)?;
     validate_pearl_gateway_target_uint256(&job.target)?;
 
     let header_bytes = {
@@ -1661,6 +1697,7 @@ fn fetch_pearl_gateway_mining_job(
     Ok(PearlGatewayResolvedMiningJob {
         header,
         target: job.target,
+        certificate,
         aux_inclusion: job
             .aux_inclusion
             .map(decode_pearl_gateway_aux_inclusion)
@@ -1703,14 +1740,17 @@ fn decode_pearl_gateway_aux_inclusion(
 fn submit_pearl_gateway_plain_proof(
     config: &PearlGatewayMinerRpcConfig,
     plain_proof_base64: &str,
-    header: &PearlIncompleteBlockHeader,
-    target: serde_json::Value,
+    mined_header: &PearlIncompleteBlockHeader,
+    job: &PearlGatewayResolvedMiningJob,
 ) -> Result<(), PearlGatewayError> {
-    validate_pearl_gateway_target_uint256(&target)?;
+    if job.header != *mined_header {
+        return Err(PearlGatewayError::MiningJobHeaderMismatch);
+    }
+    validate_pearl_gateway_target_uint256(&job.target)?;
     let request_id = 2u64;
     let incomplete_header_bytes = {
         use base64::Engine as _;
-        base64::engine::general_purpose::STANDARD.encode(header.to_bytes())
+        base64::engine::general_purpose::STANDARD.encode(job.header.to_bytes())
     };
     let request = json!({
         "jsonrpc": "2.0",
@@ -1719,7 +1759,8 @@ fn submit_pearl_gateway_plain_proof(
             "plain_proof": plain_proof_base64,
             "mining_job": {
                 "incomplete_header_bytes": incomplete_header_bytes,
-                "target": target,
+                "target": &job.target,
+                "cert_version": job.certificate.wire_version(),
             },
         },
         "id": request_id,
@@ -2123,13 +2164,6 @@ fn submit_pearl_solution_to_gateway(
     let gateway = &pearl_cfg.gateway;
     let mined_header = mined.ticket.attempt.public_params.block_header;
     let gateway_job = &mined.gateway_mining_job;
-    if gateway_job.header != mined_header {
-        return Err(
-            "Pearl Gateway mining job header does not match the aux-bearing mined header; \
-             skipping submitPlainProof because Gateway acknowledges before its async stale-header check"
-                .to_string(),
-        );
-    }
     let plain = PearlPlainProof::from_attempt(
         &cfg.puzzle.params, &mined.ticket.attempt, &cfg.puzzle.a, &cfg.puzzle.b,
     )
@@ -2137,10 +2171,7 @@ fn submit_pearl_solution_to_gateway(
     let plain_proof_base64 = plain
         .to_base64_bincode1()
         .map_err(|e| format!("serialize Pearl plain proof: {e}"))?;
-    let target = gateway_job.target.clone();
-    validate_pearl_gateway_target_uint256(&target)
-        .map_err(|e| format!("Gateway mining job target became invalid before submit: {e}"))?;
-    submit_pearl_gateway_plain_proof(gateway, &plain_proof_base64, &mined_header, target)
+    submit_pearl_gateway_plain_proof(gateway, &plain_proof_base64, &mined_header, gateway_job)
         .map_err(|e| e.to_string())
 }
 
@@ -2858,7 +2889,7 @@ mod tests {
     }
 
     #[test]
-    fn pearl_gateway_fetches_tcp_mining_info() {
+    fn pearl_gateway_fetches_v3_tcp_mining_info() {
         let header = pearl_test_header();
         let header_bytes = header.to_bytes();
         let target = pearl_target_decimal_for_header(&header);
@@ -2881,7 +2912,7 @@ mod tests {
                 serde_json::from_str(&request_line).expect("parse gateway request");
             assert_eq!(request["method"], "getMiningInfo");
             let response = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{}}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3}}}}\n",
                 encoded_header, target
             );
             std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -2902,6 +2933,29 @@ mod tests {
         gateway.join().expect("gateway fixture exited");
 
         assert_eq!(fetched, header);
+    }
+
+    #[test]
+    fn pearl_gateway_rejects_non_v3_certificate_versions() {
+        assert_eq!(
+            parse_pearl_gateway_certificate_v3(Some(3))
+                .expect("certificate V3 Gateway job must be accepted"),
+            PearlCertificateV3
+        );
+        assert_eq!(std::mem::size_of::<PearlCertificateV3>(), 0);
+        for actual in [1, 2, 4] {
+            assert!(matches!(
+                parse_pearl_gateway_certificate_v3(Some(actual)),
+                Err(PearlGatewayError::UnsupportedCertificateVersion {
+                    expected: 3,
+                    actual: rejected,
+                }) if rejected == actual
+            ));
+        }
+        assert!(matches!(
+            parse_pearl_gateway_certificate_v3(None),
+            Err(PearlGatewayError::MissingCertificateVersion)
+        ));
     }
 
     #[test]
@@ -2935,6 +2989,10 @@ mod tests {
                 expected_header
             );
             assert_eq!(request["params"]["mining_job"]["target"], 123_456);
+            assert_eq!(
+                request["params"]["mining_job"]["cert_version"],
+                PEARL_GATEWAY_CERTIFICATE_VERSION_V3
+            );
             let response = "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":\"submitted\"}\n";
             std::io::Write::write_all(&mut stream, response.as_bytes())
                 .expect("write gateway response");
@@ -2948,7 +3006,13 @@ mod tests {
             request_timeout: Duration::from_secs(2),
             refresh_interval: Duration::from_secs(1),
         };
-        submit_pearl_gateway_plain_proof(&cfg, proof_base64, &header, target)
+        let job = PearlGatewayResolvedMiningJob {
+            header,
+            target,
+            certificate: PearlCertificateV3,
+            aux_inclusion: None,
+        };
+        submit_pearl_gateway_plain_proof(&cfg, proof_base64, &header, &job)
             .expect("submit Pearl plain proof");
         gateway.join().expect("gateway fixture exited");
     }
@@ -3124,7 +3188,7 @@ mod tests {
                 serde_json::from_str(&request_line).expect("parse gateway request");
             assert_eq!(request["method"], "getMiningInfo");
             let response = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":\"123456\"}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":\"123456\",\"cert_version\":3}}}}\n",
                 encoded_header
             );
             std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -3193,6 +3257,7 @@ mod tests {
             gateway_mining_job: PearlGatewayResolvedMiningJob {
                 header: header_template,
                 target: serde_json::Value::from(123_456u64),
+                certificate: PearlCertificateV3,
                 aux_inclusion: None,
             },
             aux_inclusion,
@@ -3315,7 +3380,7 @@ mod tests {
                         };
                         let target = pearl_target_decimal_for_header(&header);
                         let response = format!(
-                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                             encoded_header, target, encoded_coinbase
                         );
                         std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -3583,7 +3648,7 @@ mod tests {
             );
             assert_eq!(request["params"]["return_aux_inclusion"], true);
             let response = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                 encoded_header, gateway_target, encoded_coinbase
             );
             std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -3631,7 +3696,7 @@ mod tests {
             assert_eq!(request["method"], "getMiningInfo");
             assert_eq!(request["params"]["return_aux_inclusion"], true);
             let response = format!(
-                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{}}}}}\n",
+                "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3}}}}\n",
                 encoded_header, target
             );
             std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -4622,7 +4687,7 @@ mod tests {
                 };
                 let target = pearl_target_decimal_for_header(&header);
                 let response = format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                     encoded_header, target, encoded_coinbase
                 );
                 std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -4735,7 +4800,7 @@ mod tests {
                 };
                 let target = pearl_target_decimal_for_header(&header);
                 let response = format!(
-                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                    "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                     encoded_header, target, encoded_coinbase
                 );
                 std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -4800,7 +4865,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn run_loop_pearl_only_hit_keeps_nockchain_candidate_for_new_pearl_work() {
+    async fn run_loop_v3_gateway_accepts_pearl_only_plain_proof() {
         let commitment_seed = 705;
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind Pearl gateway fixture");
         listener
@@ -4815,10 +4880,20 @@ mod tests {
         let stop_gateway_for_thread = stop_gateway.clone();
         let gateway_thread = std::thread::spawn(move || {
             let headers = [
-                pearl_test_header(),
-                pearl_test_header(),
                 PearlIncompleteBlockHeader {
-                    timestamp: pearl_test_header().timestamp + 1,
+                    timestamp: 0x6677_889b,
+                    ..pearl_test_header()
+                },
+                PearlIncompleteBlockHeader {
+                    timestamp: 0x6677_889b,
+                    ..pearl_test_header()
+                },
+                PearlIncompleteBlockHeader {
+                    timestamp: 0x6677_889c,
+                    ..pearl_test_header()
+                },
+                PearlIncompleteBlockHeader {
+                    timestamp: 0x6677_889f,
                     ..pearl_test_header()
                 },
             ];
@@ -4857,7 +4932,7 @@ mod tests {
                         };
                         let target = pearl_target_decimal_for_header(&header);
                         let response = format!(
-                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                             encoded_header, target, encoded_coinbase
                         );
                         std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -4884,6 +4959,10 @@ mod tests {
                         )
                         .expect("parse expected Pearl target");
                         assert_eq!(request["params"]["mining_job"]["target"], expected_target);
+                        assert_eq!(
+                            request["params"]["mining_job"]["cert_version"],
+                            PEARL_GATEWAY_CERTIFICATE_VERSION_V3
+                        );
                         let response = format!(
                             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"submitted\"}}\n",
                             request["id"]
@@ -4947,6 +5026,62 @@ mod tests {
         node.shutdown().await;
     }
 
+    fn v3_gateway_winning_timestamps(commitment_seed: u64) -> Vec<u32> {
+        let params = pearl_test_params();
+        let config = pearl_test_config();
+        let (a, b) = synth_matrices(b"pearl-node-run-submit", &params);
+        let nock_block_commitment =
+            *blake3::hash(&synth_block_commitment_slab(commitment_seed).jam()).as_bytes();
+        let mut aux = pearl_test_aux();
+        aux.nock_block_commitment = nock_block_commitment;
+        let (mut header, _) = pearl_test_aux_inclusion(&aux.commitment().expect("aux commitment"));
+        let start = header.timestamp;
+        (start..start + 16)
+            .filter(|&timestamp| {
+                header.timestamp = timestamp;
+                evaluate_pearl_merge_ticket_attempt(
+                    &header,
+                    &config,
+                    &params,
+                    0,
+                    0,
+                    &a,
+                    &b,
+                    &[0; 32],
+                    16,
+                    aux.clone(),
+                )
+                .expect("evaluate V3 Pearl ticket")
+                .public_params
+                .check_pearl_jackpot_difficulty()
+                .is_ok()
+            })
+            .collect()
+    }
+
+    /// Pearl V3 selects these Pearl-only headers for the fixed Gateway job.
+    #[test]
+    fn v3_gateway_header_fixture_has_pinned_pearl_only_hits() {
+        assert_eq!(
+            v3_gateway_winning_timestamps(705),
+            [
+                0x6677_889c, 0x6677_889f, 0x6677_88a0, 0x6677_88a1, 0x6677_88a2, 0x6677_88a3,
+                0x6677_88a7, 0x6677_88a8,
+            ]
+        );
+    }
+
+    #[test]
+    fn v3_gateway_retry_header_fixture_has_pinned_pearl_only_hit() {
+        assert_eq!(
+            v3_gateway_winning_timestamps(707),
+            [
+                0x6677_889d, 0x6677_889e, 0x6677_889f, 0x6677_88a0, 0x6677_88a2, 0x6677_88a5,
+                0x6677_88a7, 0x6677_88a8,
+            ]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn run_loop_retries_same_pearl_header_after_submit_rpc_failure() {
         let commitment_seed = 707;
@@ -4986,7 +5121,10 @@ mod tests {
                         let (header, encoded_coinbase) =
                             gateway_aux_header_and_coinbase_from_request(
                                 &request,
-                                pearl_test_header(),
+                                PearlIncompleteBlockHeader {
+                                    timestamp: 0x6677_889d,
+                                    ..pearl_test_header()
+                                },
                             );
                         let encoded_header = {
                             use base64::Engine as _;
@@ -4994,7 +5132,7 @@ mod tests {
                         };
                         let target = pearl_target_decimal_for_header(&header);
                         let response = format!(
-                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                             encoded_header, target, encoded_coinbase
                         );
                         std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -5111,7 +5249,7 @@ mod tests {
                         };
                         let target = pearl_target_decimal_for_header(&header);
                         let response = format!(
-                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
+                            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"incomplete_header_bytes\":\"{}\",\"target\":{},\"cert_version\":3,\"aux_inclusion\":{{\"coinbase_tx\":\"{}\",\"merkle_branch\":[]}}}}}}\n",
                             encoded_header, target, encoded_coinbase
                         );
                         std::io::Write::write_all(&mut stream, response.as_bytes())
@@ -5130,6 +5268,10 @@ mod tests {
                         )
                         .expect("parse expected Pearl target");
                         assert_eq!(request["params"]["mining_job"]["target"], expected_target);
+                        assert_eq!(
+                            request["params"]["mining_job"]["cert_version"],
+                            PEARL_GATEWAY_CERTIFICATE_VERSION_V3
+                        );
                         let response = format!(
                             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":\"submitted\"}}\n",
                             request["id"]

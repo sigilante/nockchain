@@ -1,29 +1,34 @@
 //! Pearl merge-mining compatibility primitives.
 //!
 //! This module is intentionally separate from the native Nockchain AI-PoW
-//! transcript. Pearl-compatible merge mining means sharing the same Pearl work
-//! attempt and jackpot digest, not sharing proof bytes. The canonical attempt
-//! transcript here is:
+//! transcript. Pearl-compatible merge mining shares Pearl's certificate-V3 work
+//! attempt and jackpot digest, not proof bytes. The canonical dense transcript is:
 //!
 //! ```text
-//! kappa = BLAKE3(sigma || mu)
-//! H_A   = BLAKE3(pad(A_row_major), key=kappa)
-//! H_B   = BLAKE3(pad(B_col_major), key=kappa)
-//! s_B   = BLAKE3(kappa || H_B)
-//! s_A   = BLAKE3(s_B || H_A)
-//! hash  = BLAKE3(M_i_j, key=s_A)
+//! κ   = BLAKE3(σ || μ)
+//! H_A = BLAKE3(pad(A_row_major), key=κ)
+//! H_B = BLAKE3(pad(B_col_major), key=κ)
+//! A'  = BLAKE3(H_A || LE(m) || 0^224, key=SEED_SALT_A)
+//! B'  = BLAKE3(H_B || LE(n) || 0^224, key=SEED_SALT_B)
+//! s_B = BLAKE3(κ || B')
+//! s_A = BLAKE3(s_B || A')
+//! hash = BLAKE3(M_i_j, key=s_A)
 //! ```
 //!
-//! Nockchain-native proof systems may prove this statement with their own
-//! recursive certificate format, but they must not change these public work
-//! bytes in Pearl-compatible mode.
+//! MoE uses `LE(n_e)` in `B'` and replaces the dense `s_A` input with the
+//! V3 routing splice. Nockchain-native proof systems may prove this statement
+//! with their own recursive certificate format, but they must not change these
+//! public work bytes in Pearl-compatible mode.
 
 use blake3::Hasher;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::commit::matrix_commitment;
-use crate::fiat_shamir::{moe_hash_activations, moe_hash_routing, noise_seed_a, noise_seed_b};
+use crate::fiat_shamir::{
+    canonical_noise_seeds_from_matrix_commitments, canonical_noise_seeds_moe,
+    canonical_noise_seeds_moe_from_public_routing,
+};
 use crate::matmul::{
     compute_pattern_tile_state_from_slices, compute_pattern_tile_trace_from_slices, compute_tile,
     BlockNoise, Matrices, PatternTileScratch, TileState,
@@ -1508,7 +1513,9 @@ pub fn prepare_pearl_pattern_job(
     validate_attempt_inputs(a_row_major, b_col_major, params)?;
     let sigma = header.to_bytes();
     let mu = config.to_bytes()?;
-    let commitments = derive_pearl_work_commitments(&sigma, &mu, a_row_major, b_col_major);
+    let commitments = derive_pearl_dense_work_commitments(
+        &sigma, &mu, a_row_major, b_col_major, params.m, params.n,
+    );
     let noise = BlockNoise::expand(&commitments.s_a, &commitments.s_b, params);
     let matrices = Matrices::build(a_row_major, b_col_major, &noise, params);
     let (row_indices, row_offsets) =
@@ -1819,14 +1826,18 @@ pub fn compute_pearl_moe_ticket(
     inner_a_rows: &[u32],
     local_b_cols: &[u32],
     n_e: usize,
+    m: u32,
     k: usize,
     r: usize,
     dot_product_len: usize,
 ) -> Result<PearlMoeTicket, PearlCompatError> {
-    let (s_a, s_b, commitment) = crate::fiat_shamir::canonical_noise_seeds_moe(
+    let n_e_u32 = u32::try_from(n_e).map_err(|_| PearlCompatError::PublicParamEnvelope)?;
+    let (s_a, s_b, commitment) = canonical_noise_seeds_moe(
         kappa,
         h_a,
         h_b,
+        m,
+        n_e_u32,
         &routing.routing_data_le_bytes(),
         &routing.routing_offsets_le_bytes(),
     );
@@ -2102,31 +2113,21 @@ pub fn verify_pearl_moe_compatible_work(
         return Err(PearlCompatError::NockchainTargetNotMet);
     }
 
-    // (3) Work commitments from the COMMITTED matrix roots. `H_A`/`H_B` are the miner's
-    // block-committed matrix commitments (authenticated in `public_params`), not
-    // re-derived from a fixed matrix set; `kappa` is from the header/config. The dense
-    // `s_a`/`s_b` here are unused for MoE (the routing splice below replaces them).
+    // (3) The raw matrix roots and κ are authenticated public inputs. The MoE
+    // routing fold derives the only seeds carried in the returned commitments.
     let sigma = public_params.block_header.to_bytes();
     let mu = public_params.mining_config.to_bytes()?;
     let kappa = pearl_kappa(&sigma, &mu);
     let h_a = public_params.hash_a;
     let h_b = public_params.hash_b;
-    let (dense_s_a, dense_s_b) = pearl_noise_seeds(&kappa, &h_a, &h_b);
-    let commitments = PearlWorkCommitments {
-        kappa,
-        h_a,
-        h_b,
-        s_a: dense_s_a,
-        s_b: dense_s_b,
-    };
 
     // (4) Routing-consistency binding: routing_data commits to moe.hash_routing, the
     // offsets/tokens/spans are well-formed, and the opened rows are the expert's
     // routed tokens. MUST precede the splice — it is what makes moe.hash_routing
     // trustworthy as the routing root.
     verify_pearl_moe_routing_binding(
-        &commitments.kappa, &public_params.mining_config, moe, public_params.m,
-        public_params.t_rows, routing_data, max_pattern_len,
+        &kappa, &public_params.mining_config, moe, public_params.m, public_params.t_rows,
+        routing_data, max_pattern_len,
     )?;
 
     // (5) Recompute the routing-spliced seeds (same formula as the PI-validated
@@ -2137,11 +2138,17 @@ pub fn verify_pearl_moe_compatible_work(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    let hash_offsets = matrix_commitment(&routing_offsets_le, &commitments.kappa);
-    let hash_routing = moe_hash_routing(&moe.hash_routing, &hash_offsets);
-    let hash_activations = moe_hash_activations(&commitments.h_a, &hash_routing);
-    let s_b = noise_seed_b(&commitments.kappa, &commitments.h_b);
-    let s_a = noise_seed_a(&s_b, &hash_activations);
+    let (s_a, s_b) = canonical_noise_seeds_moe_from_public_routing(
+        &kappa, &h_a, &h_b, public_params.m, public_params.n, &moe.hash_routing,
+        &routing_offsets_le,
+    );
+    let commitments = PearlWorkCommitments {
+        kappa,
+        h_a,
+        h_b,
+        s_a,
+        s_b,
+    };
     let b_cols_global = moe_expert_b_cols_global(
         &public_params.mining_config, cfg.e, public_params.n, moe.expert_idx, public_params.t_cols,
         max_pattern_len,
@@ -2702,7 +2709,9 @@ pub fn verify_pearl_compatible_work(
 
     let sigma = public_params.block_header.to_bytes();
     let mu = public_params.mining_config.to_bytes()?;
-    let commitments = derive_pearl_work_commitments(&sigma, &mu, a_row_major, b_col_major);
+    let commitments = derive_pearl_dense_work_commitments(
+        &sigma, &mu, a_row_major, b_col_major, public_params.m, public_params.n,
+    );
     let ticket = verify_pearl_pattern_ticket(
         public_params, a_row_major, b_col_major, &commitments, max_pattern_len,
     )?;
@@ -2753,7 +2762,9 @@ pub fn verify_pearl_compatible_work_committed(
     let kappa = pearl_kappa(&sigma, &mu);
     let h_a = public_params.hash_a;
     let h_b = public_params.hash_b;
-    let (s_a, s_b) = pearl_noise_seeds(&kappa, &h_a, &h_b);
+    let (s_a, s_b) = canonical_noise_seeds_from_matrix_commitments(
+        &kappa, &h_a, &h_b, public_params.m, public_params.n,
+    );
     let commitments = PearlWorkCommitments {
         kappa,
         h_a,
@@ -2999,7 +3010,9 @@ pub fn evaluate_pearl_merge_ticket_attempt(
 
     let sigma = header.to_bytes();
     let mu = config.to_bytes()?;
-    let commitments = derive_pearl_work_commitments(&sigma, &mu, a_row_major, b_col_major);
+    let commitments = derive_pearl_dense_work_commitments(
+        &sigma, &mu, a_row_major, b_col_major, params.m, params.n,
+    );
     let mut public_params = PearlPublicProofParams {
         block_header: *header,
         mining_config: *config,
@@ -3208,12 +3221,6 @@ pub fn pearl_matrix_commitments(
     )
 }
 
-pub fn pearl_noise_seeds(kappa: &[u8; 32], h_a: &[u8; 32], h_b: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
-    let s_b = noise_seed_b(kappa, h_b);
-    let s_a = noise_seed_a(&s_b, h_a);
-    (s_a, s_b)
-}
-
 pub fn pearl_jackpot_hash(tile_state: &TileState, s_a: &[u8; 32]) -> [u8; 32] {
     tile_state.keyed_hash(s_a)
 }
@@ -3245,15 +3252,42 @@ pub fn pearl_nockchain_aux_commitment(
     Ok(*hasher.finalize().as_bytes())
 }
 
-pub fn derive_pearl_work_commitments(
+pub fn derive_pearl_dense_work_commitments(
     sigma: &[u8],
     mu: &[u8],
     a_row_major: &[i8],
     b_col_major: &[i8],
+    m: u32,
+    n: u32,
 ) -> PearlWorkCommitments {
     let kappa = pearl_kappa(sigma, mu);
     let (h_a, h_b) = pearl_matrix_commitments(a_row_major, b_col_major, &kappa);
-    let (s_a, s_b) = pearl_noise_seeds(&kappa, &h_a, &h_b);
+    let (s_a, s_b) = canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, m, n);
+    PearlWorkCommitments {
+        kappa,
+        h_a,
+        h_b,
+        s_a,
+        s_b,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn derive_pearl_moe_work_commitments(
+    sigma: &[u8],
+    mu: &[u8],
+    a_row_major: &[i8],
+    b_col_major: &[i8],
+    m: u32,
+    n_e: u32,
+    routing_data_le: &[u8],
+    routing_offsets_le: &[u8],
+) -> PearlWorkCommitments {
+    let kappa = pearl_kappa(sigma, mu);
+    let (h_a, h_b) = pearl_matrix_commitments(a_row_major, b_col_major, &kappa);
+    let (s_a, s_b, _) = canonical_noise_seeds_moe(
+        &kappa, &h_a, &h_b, m, n_e, routing_data_le, routing_offsets_le,
+    );
     PearlWorkCommitments {
         kappa,
         h_a,
@@ -3300,7 +3334,9 @@ impl PearlAttempt {
         let config = PearlMiningConfig::from_bytes(mu)?;
         validate_config_matches_params(&config, params)?;
         validate_attempt_inputs(a_row_major, b_col_major, params)?;
-        let commitments = derive_pearl_work_commitments(sigma, mu, a_row_major, b_col_major);
+        let commitments = derive_pearl_dense_work_commitments(
+            sigma, mu, a_row_major, b_col_major, params.m, params.n,
+        );
         let noise = BlockNoise::expand(&commitments.s_a, &commitments.s_b, params);
         let matrices = Matrices::build(a_row_major, b_col_major, &noise, params);
         let mut tile_digests = Vec::with_capacity(params.num_tiles() as usize);

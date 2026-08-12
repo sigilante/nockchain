@@ -11,12 +11,13 @@
 #![allow(clippy::unwrap_used)] // integration test: unwrap is acceptable
 use ai_pow::commit::matrix_commitment;
 use ai_pow::fiat_shamir::{
-    canonical_noise_seeds_moe, moe_hash_activations, moe_hash_routing, noise_seed_a, noise_seed_b,
+    canonical_noise_seeds_from_matrix_commitments, canonical_noise_seeds_moe,
+    canonical_noise_seeds_moe_from_public_routing,
 };
 use ai_pow::params::MatmulParams;
 use ai_pow::pearl_compat::{
     compute_moe_tile, compute_pearl_moe_ticket, compute_pearl_pattern_ticket,
-    derive_pearl_work_commitments, PearlIncompleteBlockHeader, PearlMiningConfig,
+    derive_pearl_dense_work_commitments, PearlIncompleteBlockHeader, PearlMiningConfig,
     PearlPeriodicPattern, PearlPublicProofParams, PEARL_MINING_CONFIG_RESERVED_SIZE,
     PEARL_MMA_INT7XINT7_TO_INT32,
 };
@@ -55,8 +56,14 @@ fn compute_moe_tile_matches_dense_ticket_compute() {
         cols_pattern: PearlPeriodicPattern::from_list(&[0, 1, 8, 9, 64, 65, 72, 73]).unwrap(),
         reserved: [0u8; PEARL_MINING_CONFIG_RESERVED_SIZE],
     };
-    let commitments =
-        derive_pearl_work_commitments(&header().to_bytes(), &config.to_bytes().unwrap(), &a, &b);
+    let commitments = derive_pearl_dense_work_commitments(
+        &header().to_bytes(),
+        &config.to_bytes().unwrap(),
+        &a,
+        &b,
+        params.m,
+        params.n,
+    );
     let public = PearlPublicProofParams {
         block_header: header(),
         mining_config: config,
@@ -120,6 +127,8 @@ fn moe_tile_uses_routing_and_splice_end_to_end() {
         &kappa,
         &h_a,
         &h_b,
+        m as u32,
+        n_e as u32,
         &routing.routing_data_le_bytes(),
         &routing.routing_offsets_le_bytes(),
     );
@@ -140,10 +149,8 @@ fn moe_tile_uses_routing_and_splice_end_to_end() {
     let (tile2, jackpot2) = compute_moe_tile(&a, &b, &outer, &b_cols, &s_a, &s_b, k, r, k);
     assert_eq!((tile, jackpot), (tile2, jackpot2));
 
-    // The MoE splice binds: using the *dense* s_a (keyed off h_a, not
-    // hash_activations) yields a different tile/jackpot.
-    let dense_s_b = ai_pow::fiat_shamir::noise_seed_b(&kappa, &h_b);
-    let dense_s_a = ai_pow::fiat_shamir::noise_seed_a(&dense_s_b, &h_a);
+    let (dense_s_a, dense_s_b) =
+        canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, m as u32, n_e as u32);
     let (dense_tile, dense_jackpot) =
         compute_moe_tile(&a, &b, &outer, &b_cols, &dense_s_a, &dense_s_b, k, r, k);
     assert_ne!(
@@ -201,7 +208,7 @@ fn moe_ticket_end_to_end_and_verifier_recomputes_s_a_from_public_data() {
     let inner = [0u32, 1];
     let local_b = [0u32, 2];
     let ticket = compute_pearl_moe_ticket(
-        &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+        &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k, r, k,
     )
     .unwrap();
 
@@ -214,28 +221,23 @@ fn moe_ticket_end_to_end_and_verifier_recomputes_s_a_from_public_data() {
         ticket.b_cols_global,
         vec![(expert_idx * n_e) as u32, 2 + (expert_idx * n_e) as u32]
     );
-    assert_eq!(
-        ticket.s_a,
-        noise_seed_a(&ticket.s_b, &ticket.commitment.hash_activations)
+    let (s_a_pub, s_b_pub) = canonical_noise_seeds_moe_from_public_routing(
+        &kappa,
+        &h_a,
+        &h_b,
+        m as u32,
+        n_e as u32,
+        &ticket.commitment.routing_root,
+        &routing.routing_offsets_le_bytes(),
     );
-
-    // Verifier recomputes s_a from PUBLIC data only (no private routing_data):
-    // routing_root is public (moe.hash_routing); routing_offsets is public.
-    let hash_offsets = matrix_commitment(&routing.routing_offsets_le_bytes(), &kappa);
-    let hash_routing = moe_hash_routing(&ticket.commitment.routing_root, &hash_offsets);
-    let hash_activations = moe_hash_activations(&h_a, &hash_routing);
-    let s_b_pub = noise_seed_b(&kappa, &h_b);
-    let s_a_pub = noise_seed_a(&s_b_pub, &hash_activations);
-    assert_eq!(
-        s_a_pub, ticket.s_a,
-        "verifier recomputes s_a from public MoE params"
-    );
+    assert_eq!(s_a_pub, ticket.s_a);
+    assert_eq!(s_b_pub, ticket.s_b);
 
     // Routing binds the jackpot: a different routing yields a different result.
     let topk2: Vec<u32> = (0..m).map(|t| ((t + 1) % e) as u32).collect();
     let routing2 = build_routing_data(&topk2, m, top_k, e).unwrap();
     let ticket2 = compute_pearl_moe_ticket(
-        &kappa, &h_a, &h_b, &a, &b, &routing2, expert_idx, &inner, &local_b, n_e, k, r, k,
+        &kappa, &h_a, &h_b, &a, &b, &routing2, expert_idx, &inner, &local_b, n_e, m as u32, k, r, k,
     )
     .unwrap();
     assert_ne!(

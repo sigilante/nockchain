@@ -74,8 +74,8 @@ use ai_pow_zk::{
 };
 
 use crate::fiat_shamir::{
-    attempt_tile_index, block_state, canonical_noise_seeds_from_matrix_commitments, commitment_key,
-    pow_key_for_nonce,
+    attempt_tile_index, block_state, canonical_noise_seeds_from_matrix_commitments,
+    canonical_noise_seeds_moe_from_public_routing, commitment_key, pow_key_for_nonce,
 };
 use crate::params::{MatmulParams, ParamError};
 use crate::pearl_compat::{
@@ -878,7 +878,7 @@ fn expected_attempt_found_idx(
     let state = block_state(block_commitment, nonce);
     let kappa = commitment_key(&state, &tag);
     let (s_a, _) = canonical_noise_seeds_from_matrix_commitments(
-        &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+        &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
     );
     let idx = attempt_tile_index(&state, &tag, &s_a, params.num_tiles());
     u32::try_from(idx).map_err(|_| BridgeError::FoundIdxOutOfRange {
@@ -1795,7 +1795,7 @@ fn prove_pearl_moe_l0_and_ticket(
     // dot_product_length == k for the standard Pearl band (rank | k).
     let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
         kappa, h_a, h_b, a_row_major, b_col_major, routing, expert_idx, inner_a_rows, local_b_cols,
-        n_e, k, r, k,
+        n_e, params.m, k, r, k,
     )
     .map_err(BridgeError::PearlMergeStatement)?;
 
@@ -1969,8 +1969,6 @@ pub fn verify_pearl_moe_recursive_certificate(
     routing_data: &[u32],
     max_pattern_len: usize,
 ) -> Result<(), BridgeError> {
-    use crate::fiat_shamir::{moe_hash_activations, moe_hash_routing, noise_seed_a, noise_seed_b};
-
     // (1) Routing-consistency binding: opened rows are the expert's routed tokens.
     crate::pearl_compat::verify_pearl_moe_routing_binding(
         kappa, mining_config, moe, m, t_rows, routing_data, max_pattern_len,
@@ -1995,11 +1993,9 @@ pub fn verify_pearl_moe_recursive_certificate(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    let hash_offsets = crate::commit::matrix_commitment(&routing_offsets_le, kappa);
-    let hash_routing = moe_hash_routing(&moe.hash_routing, &hash_offsets);
-    let hash_activations = moe_hash_activations(h_a, &hash_routing);
-    let s_b = noise_seed_b(kappa, h_b);
-    let s_a = noise_seed_a(&s_b, &hash_activations);
+    let (s_a, s_b) = canonical_noise_seeds_moe_from_public_routing(
+        kappa, h_a, h_b, m, n_e, &moe.hash_routing, &routing_offsets_le,
+    );
     expect_pi_eq(
         &pis.commitment_hash,
         &bytes_to_words_le(&s_a),
@@ -2069,7 +2065,6 @@ pub fn verify_pearl_moe_compact_recursive_certificate(
     routing_data: &[u32],
     max_pattern_len: usize,
 ) -> Result<(), BridgeError> {
-    use crate::fiat_shamir::{moe_hash_activations, moe_hash_routing, noise_seed_a, noise_seed_b};
     if params.difficulty_bits != 0 {
         return Err(BridgeError::PearlMergeStatement(
             crate::pearl_compat::PearlCompatError::UnsupportedRecursivePearlParams(
@@ -2100,11 +2095,9 @@ pub fn verify_pearl_moe_compact_recursive_certificate(
         .iter()
         .flat_map(|v| v.to_le_bytes())
         .collect();
-    let hash_offsets = crate::commit::matrix_commitment(&routing_offsets_le, kappa);
-    let hash_routing = moe_hash_routing(&moe.hash_routing, &hash_offsets);
-    let hash_activations = moe_hash_activations(h_a, &hash_routing);
-    let s_b = noise_seed_b(kappa, h_b);
-    let s_a = noise_seed_a(&s_b, &hash_activations);
+    let (s_a, s_b) = canonical_noise_seeds_moe_from_public_routing(
+        kappa, h_a, h_b, m, n_e, &moe.hash_routing, &routing_offsets_le,
+    );
     expect_pi_eq(
         &pis.commitment_hash,
         &bytes_to_words_le(&s_a),
@@ -2612,7 +2605,7 @@ fn derive_ai_pow_statement(
     }
     let kappa = commitment_key(&state, &tag);
     let (s_a, s_b) = canonical_noise_seeds_from_matrix_commitments(
-        &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+        &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
     );
     let zk_params = zk_params_from(params);
     let strip_schedule =
@@ -4660,7 +4653,8 @@ mod tests {
         let inner: Vec<u32> = (0..8).collect();
         let local_b: Vec<u32> = (0..8).collect();
         let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
-            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k,
+            r, k,
         )
         .expect("MoE ticket");
         // outer_indices are sorted-increasing (valid routing) and 8-wide.
@@ -4789,7 +4783,8 @@ mod tests {
         let inner: Vec<u32> = (0..8).collect();
         let local_b: Vec<u32> = (0..8).collect();
         let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
-            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k,
+            r, k,
         )
         .expect("MoE ticket");
         // Non-contiguous routed rows (NOT tile-local [0..8)).
@@ -4874,7 +4869,8 @@ mod tests {
             (0..8).collect::<Vec<u32>>(),
         );
         let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
-            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k,
+            r, k,
         )
         .expect("MoE ticket");
 
@@ -5025,7 +5021,8 @@ mod tests {
             (0..8).collect::<Vec<u32>>(),
         );
         let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
-            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k,
+            r, k,
         )
         .expect("MoE ticket");
         let mining_config = crate::pearl_compat::PearlMiningConfig {
@@ -5121,7 +5118,8 @@ mod tests {
             (0..8).collect::<Vec<u32>>(),
         );
         let ticket = crate::pearl_compat::compute_pearl_moe_ticket(
-            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, k, r, k,
+            &kappa, &h_a, &h_b, &a, &b, &routing, expert_idx, &inner, &local_b, n_e, m as u32, k,
+            r, k,
         )
         .expect("MoE ticket");
         let zctx = ZkProverContext {
@@ -5465,7 +5463,7 @@ mod tests {
         let state = block_state(block, nonce);
         let kappa = commitment_key(&state, &tag);
         let (s_a, _) = canonical_noise_seeds_from_matrix_commitments(
-            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
         );
         let pow_key = pow_key_for_nonce(&s_a, nonce);
         let mut pis = CompositePublicInputs::zero();
@@ -5550,7 +5548,7 @@ mod tests {
         let state = block_state(block, nonce);
         let kappa = commitment_key(&state, &tag);
         let (s_a, _) = canonical_noise_seeds_from_matrix_commitments(
-            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
         );
         let pow_key = pow_key_for_nonce(&s_a, nonce);
         let mut pis = CompositePublicInputs::zero();
@@ -5610,7 +5608,7 @@ mod tests {
         let state = block_state(block, nonce);
         let kappa = commitment_key(&state, &tag);
         let (s_a, _) = canonical_noise_seeds_from_matrix_commitments(
-            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
         );
         let pow_key = pow_key_for_nonce(&s_a, nonce);
         let mut pis = CompositePublicInputs::zero();
@@ -8394,7 +8392,7 @@ mod tests {
     #[ignore = "real Layer-0 proof; malicious-miner for non-contiguous opening"]
     fn sec_4c10_noncontiguous_sweep_on_row_permuted_matrix_rejects() {
         use crate::commit::matrix_commitment;
-        use crate::fiat_shamir::{noise_seed_a, noise_seed_b};
+        use crate::fiat_shamir::canonical_noise_seeds_from_matrix_commitments;
         use crate::synth::synth_matrices;
 
         let params = MatmulParams {
@@ -8412,8 +8410,8 @@ mod tests {
         let b_bytes: Vec<u8> = b.iter().map(|&v| v as u8).collect();
         let h_a = matrix_commitment(&a_bytes, &kappa);
         let h_b = matrix_commitment(&b_bytes, &kappa);
-        let s_b = noise_seed_b(&kappa, &h_b);
-        let s_a = noise_seed_a(&s_b, &h_a);
+        let (s_a, s_b) =
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, params.m, params.n);
         let zctx = ZkProverContext {
             a: &a,
             b: &b,

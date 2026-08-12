@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used)] // integration test: unwrap is acceptable
 use ai_pow::commit::matrix_commitment;
-use ai_pow::fiat_shamir::{noise_seed_a, noise_seed_b};
+use ai_pow::fiat_shamir::canonical_noise_seeds_from_matrix_commitments;
 use ai_pow::params::MatmulParams;
 use ai_pow::pearl_compat::{
     compute_pearl_pattern_ticket, evaluate_pearl_merge_ticket_attempt,
@@ -983,11 +983,13 @@ fn pearl_pattern_ticket_computes_noncontiguous_pattern_indices() {
         cols_pattern: pearl_compat_test_pattern(),
         reserved: [0u8; PEARL_MINING_CONFIG_RESERVED_SIZE],
     };
-    let commitments = ai_pow::pearl_compat::derive_pearl_work_commitments(
+    let commitments = ai_pow::pearl_compat::derive_pearl_dense_work_commitments(
         &header().to_bytes(),
         &config.to_bytes().unwrap(),
         &a,
         &b,
+        params.m,
+        params.n,
     );
     let mut public = PearlPublicProofParams {
         block_header: header(),
@@ -1035,8 +1037,9 @@ fn pearl_attempt_transcript_matches_reference_formulas() {
     assert_eq!(attempt.commitments.h_a, expected_h_a);
     assert_eq!(attempt.commitments.h_b, expected_h_b);
 
-    let expected_s_b = noise_seed_b(&expected_kappa, &expected_h_b);
-    let expected_s_a = noise_seed_a(&expected_s_b, &expected_h_a);
+    let (expected_s_a, expected_s_b) = canonical_noise_seeds_from_matrix_commitments(
+        &expected_kappa, &expected_h_a, &expected_h_b, params.m, params.n,
+    );
     assert_eq!(attempt.commitments.s_a, expected_s_a);
     assert_eq!(attempt.commitments.s_b, expected_s_b);
 

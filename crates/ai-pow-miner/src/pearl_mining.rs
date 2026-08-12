@@ -606,7 +606,10 @@ mod tests {
     #[test]
     fn pearl_merge_mining_returns_ticket_before_any_proof_artifact() {
         let params = pearl_test_params();
-        let header = pearl_test_header();
+        let header = PearlIncompleteBlockHeader {
+            timestamp: 0x6677_889d,
+            ..pearl_test_header()
+        };
         let config = pearl_test_config();
         let (a, b) = synth_matrices(b"pearl-ticket-loop-success-v2", &params);
         let job = pearl_job(&header, &config, &params, &a, &b, crate::easy_nock_target());
@@ -615,8 +618,8 @@ mod tests {
             .expect("trivial targets should mine first Pearl ticket");
 
         assert_eq!(mined.stats.matmul_attempts_tried, 1);
-        assert!(mined.pearl_target_hit);
         assert!(mined.nockchain_target_hit);
+        assert!(mined.pearl_target_hit);
         assert_eq!(mined.attempt.public_params.t_rows, 0);
         assert_eq!(mined.attempt.public_params.t_cols, 0);
         verify_pearl_merge_public_statement_bytes(
@@ -932,11 +935,11 @@ mod tests {
         );
         assert_eq!(
             hex::encode(attempt.commitments.s_a),
-            "bbe24a10b583c706be7042fb18171f16dcb2a3271f802f463c7b56001aa3f8a9"
+            "0f40e3da544003b73df8c2923859771611247c287294dc616c3b4ee71205009d"
         );
         assert_eq!(
             hex::encode(attempt.commitments.s_b),
-            "4a83ab25d7ced880e64ab9e90aa4c4f1418a8507d711b31de0455067ea725251"
+            "27714ab216358b4ccd3607cef77fbd920f306db4781d29804d1efafa7bbc63ad"
         );
         assert_eq!(ticket.a_rows, [0, 1, 2, 3, 4, 5, 6, 7]);
         assert_eq!(ticket.b_cols, [0, 1, 2, 3, 4, 5, 6, 7]);
@@ -946,33 +949,33 @@ mod tests {
                 blake3::hash(&a_prime.iter().map(|&value| value as u8).collect::<Vec<_>>())
                     .as_bytes()
             ),
-            "052800efb90b7b41c97c3967b5c4d61a5be462e023b7975cf16765b207b415f6"
+            "2e2a371bdce4d04bc55c91231823f276bb779dae67f66eb2c7165bea3211ca29"
         );
         assert_eq!(
             hex::encode(
                 blake3::hash(&b_prime.iter().map(|&value| value as u8).collect::<Vec<_>>())
                     .as_bytes()
             ),
-            "3455e9f5dee9af837ad95b4352de1bedb475599f21f1028cccacb70bf6ae49fb"
+            "cd43767608a59833742b26966261d9d377cc44c34bdcc750cf98e3e50f56156e"
         );
         assert_eq!(
             trace.x_steps,
             [
-                -36_633, -73_153, -88_024, -117_660, 93_727, -7_320, 62_516, -1_131, -4_466,
-                254_109, 85_380, 56_393, -17_856, 254_390, -224_814, 124_669,
+                37_013, 50_655, -56_693, -10_797, -22_899, -95_412, -25_779, -74_388, 197_143,
+                -181_914, -32_590, -231_446, 254_655, -30_056, -234_467, -187_635,
             ]
         );
         assert_eq!(
             trace.state,
             ai_pow::matmul::TileState([
-                -36_633, -73_153, -88_024, -117_660, 93_727, -7_320, 62_516, -1_131, -4_466,
-                254_109, 85_380, 56_393, -17_856, 254_390, -224_814, 124_669,
+                37_013, 50_655, -56_693, -10_797, -22_899, -95_412, -25_779, -74_388, 197_143,
+                -181_914, -32_590, -231_446, 254_655, -30_056, -234_467, -187_635,
             ])
         );
         assert_eq!(trace.state, ticket.tile_state);
         assert_eq!(
             hex::encode(ticket.jackpot_hash),
-            "5ea5a252bb7637b002054493e07d6df54c329b049a485306f71ad913bbb68ec7"
+            "7dde5ffa39ce4d154bdc9407875d59207151bee169c82c587e648e985931cf47"
         );
         assert_eq!(
             hex::encode(attempt.pearl_target),

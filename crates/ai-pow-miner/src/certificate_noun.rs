@@ -4875,7 +4875,7 @@ mod tests {
         commitment_key, pow_key_for_nonce,
     };
     use ai_pow::pearl_compat::{
-        compute_pearl_pattern_ticket, derive_pearl_work_commitments,
+        compute_pearl_pattern_ticket, derive_pearl_dense_work_commitments,
         evaluate_pearl_merge_ticket_attempt, pearl_bitcoin_double_sha256_raw, PearlAttempt,
         PearlAuxInclusionProof, PearlIncompleteBlockHeader, PearlMergePublicStatement,
         PearlMergeTicketAttempt, PearlMiningConfig, PearlNockchainAux, PearlPeriodicPattern,
@@ -4990,7 +4990,7 @@ mod tests {
         let state = block_state(block_commitment, nonce);
         let kappa = commitment_key(&state, &tag);
         let (s_a, _) = canonical_noise_seeds_from_matrix_commitments(
-            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk,
+            &kappa, &commitments.h_a_chunk, &commitments.h_b_chunk, params.m, params.n,
         );
         let found_idx = attempt_tile_index(&state, &tag, &s_a, params.num_tiles()) as u32;
         let pow_key = pow_key_for_nonce(&s_a, nonce);
@@ -5310,7 +5310,8 @@ mod tests {
         let (a, b) = synth_matrices(b"pearl-merge-unsupported-geometry", &params);
         let sigma = header.to_bytes();
         let mu = config.to_bytes().unwrap();
-        let work_commitments = derive_pearl_work_commitments(&sigma, &mu, &a, &b);
+        let work_commitments =
+            derive_pearl_dense_work_commitments(&sigma, &mu, &a, &b, params.m, params.n);
         let mut public = PearlPublicProofParams {
             block_header: header,
             mining_config: config,
@@ -7529,7 +7530,7 @@ mod tests {
     #[test]
     #[ignore = "real MoE compact recursive proof generation is opt-in"]
     fn real_moe_compact_pearl_merge_artifact_verifies_through_node_branch() {
-        use ai_pow::pearl_compat::derive_pearl_work_commitments;
+        use ai_pow::pearl_compat::derive_pearl_moe_work_commitments;
         use ai_pow::pearl_moe_routing::build_routing_data;
         use ai_pow::zk_bridge::prove_pearl_moe_compact_recursive_certificate;
 
@@ -7568,11 +7569,20 @@ mod tests {
         // Node-matching kappa/h_a/h_b: derived from the statement (header + config),
         // exactly as the node re-derives them in verify_pearl_moe_compatible_work.
         let sigma = header.to_bytes();
-        let mu = config.to_bytes().unwrap();
-        let commitments = derive_pearl_work_commitments(&sigma, &mu, &a, &b);
 
+        let mu = config.to_bytes().unwrap();
         let topk: Vec<u32> = (0..m).map(|t| (t % e) as u32).collect();
         let routing = build_routing_data(&topk, m, top_k, e).unwrap();
+        let commitments = derive_pearl_moe_work_commitments(
+            &sigma,
+            &mu,
+            &a,
+            &b,
+            m as u32,
+            n_e as u32,
+            &routing.routing_data_le_bytes(),
+            &routing.routing_offsets_le_bytes(),
+        );
         let inner: Vec<u32> = config
             .rows_pattern
             .indices_with_offset_bounded(0, 4096)
@@ -7801,6 +7811,47 @@ mod tests {
             "dense verify must reject a MoE artifact",
         );
 
+        // Adversarial 4 — a certificate-V2-equivalent MoE seed transcript
+        // cannot cross the V3 public-input pin. The compact certificate and all
+        // non-seed proof data stay valid; the verifier rejects `COMMITMENT_HASH`
+        // before recursion because its V3 routing splice derives another s_A.
+        let hash_pair = |left: &[u8; 32], right: &[u8; 32]| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(left);
+            hasher.update(right);
+            *hasher.finalize().as_bytes()
+        };
+        let legacy_s_b = hash_pair(&commitments.kappa, &commitments.h_b);
+        let routing_offsets = routing.routing_offsets_le_bytes();
+        let hash_offsets = ai_pow::commit::matrix_commitment(&routing_offsets, &commitments.kappa);
+        let hash_routing = hash_pair(&run.ticket.commitment.routing_root, &hash_offsets);
+        let legacy_s_a = hash_pair(&legacy_s_b, &hash_pair(&commitments.h_a, &hash_routing));
+        assert_ne!(legacy_s_a, run.ticket.s_a);
+        let mut legacy_seed_artifact = artifact.clone();
+        legacy_seed_artifact
+            .certificate
+            .public_inputs
+            .commitment_hash = std::array::from_fn(|i| {
+            u32::from_le_bytes(
+                legacy_s_a[i * 4..(i + 1) * 4]
+                    .try_into()
+                    .expect("32-byte seed is eight u32 limbs"),
+            )
+        });
+        let err = verify_decoded_ai_pow_pearl_merge_compact_moe_artifact_with_context_and_limits(
+            &legacy_seed_artifact,
+            ctx(&LOOSE_TARGET),
+            &run.verifier_context,
+            &expected_digest,
+            CertificateNounLimits::default(),
+        )
+        .expect_err("certificate-V2-equivalent seed proof must reject");
+        assert!(matches!(
+            err,
+            CertificateNounError::RecursiveCertificate(message)
+                if message == "ZK public input mismatch: COMMITMENT_HASH"
+        ));
+
         eprintln!(
             "MoE artifact e2e: OK — cert {} bytes, trace_height {}",
             ai_pow_zk::recursion::encode_compact_batch_recursive_certificate(&run.compact_cert)
@@ -7819,7 +7870,7 @@ mod tests {
     fn prove_moe_block_for_setup_test(
         nock_commit: [u8; 32],
     ) -> (ai_pow::zk_bridge::PearlMoeCompactProveRun, Vec<u8>) {
-        use ai_pow::pearl_compat::derive_pearl_work_commitments;
+        use ai_pow::pearl_compat::derive_pearl_moe_work_commitments;
         use ai_pow::pearl_moe_routing::build_routing_data;
         use ai_pow::zk_bridge::prove_pearl_moe_compact_recursive_certificate;
 
@@ -7847,10 +7898,18 @@ mod tests {
             cols_pattern: pearl_test_pattern(8),
             reserved: PearlMiningConfig::moe_trailer(e as u16, top_k as u16),
         };
-        let commitments =
-            derive_pearl_work_commitments(&header.to_bytes(), &config.to_bytes().unwrap(), &a, &b);
         let topk: Vec<u32> = (0..m).map(|t| (t % e) as u32).collect();
         let routing = build_routing_data(&topk, m, top_k, e).unwrap();
+        let commitments = derive_pearl_moe_work_commitments(
+            &header.to_bytes(),
+            &config.to_bytes().unwrap(),
+            &a,
+            &b,
+            m as u32,
+            n_e as u32,
+            &routing.routing_data_le_bytes(),
+            &routing.routing_offsets_le_bytes(),
+        );
         let inner: Vec<u32> = config
             .rows_pattern
             .indices_with_offset_bounded(0, 4096)

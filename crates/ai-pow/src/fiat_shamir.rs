@@ -1,21 +1,24 @@
 //! Fiat-Shamir transcript over BLAKE3 keyed-derive.
 //!
-//! Implements the Pearl §4.3 Algorithm 2-shaped commitment-hash
-//! derivation chain. Nockchain production uses the same hash shape, but the
-//! `H_A` / `H_B` inputs are the nonce-keyed matrix commitments bound by the
-//! recursive ZK proof, not the legacy row/column opening roots:
+//! Implements the Pearl certificate-V3 noise-seed derivation over nonce-keyed
+//! matrix commitments:
 //!
-//!   κ   = derive_key("kappa",        block_state(block, nonce) ‖ params_tag)
-//!   H_A = matrix_commitment(A, κ)    // ZK HASH_A / h_a_chunk
-//!   H_B = matrix_commitment(B, κ)    // ZK HASH_B / h_b_chunk
-//!   s_B = derive_key("s_b",          κ ‖ H_B)
-//!   s_A = derive_key("s_a",          s_B ‖ H_A)
+//!   κ       = BLAKE3(σ ‖ μ)
+//!   H_A/H_B = matrix_commitment(A/B, κ)       // ZK HASH_A / HASH_B
+//!   A'      = BLAKE3(H_A ‖ LE(m)   ‖ 0^224, key=SEED_SALT_A)
+//!   B'      = BLAKE3(H_B ‖ LE(n/n_e) ‖ 0^224, key=SEED_SALT_B)
+//!   s_B     = BLAKE3(κ ‖ B')
+//!   s_A     = BLAKE3(s_B ‖ A')               // dense
+//!
+//! MoE replaces the dense A-side input with
+//! `BLAKE3(A' ‖ BLAKE3(routing_root ‖ hash_offsets))`. The routing root and
+//! offsets are keyed matrix commitments under `κ`. Certificate-V3 binds matrix
+//! dimensions before either seed, so every distinct dense and MoE statement has
+//! a distinct seed domain.
 //!
 //! Noise generation reads s_A (for `E = E_L · E_R`) and s_B (for `F = F_L ·
-//! F_R`). Pearl's asymmetry only permits reuse while `σ` is fixed. For
-//! Nockchain production, each nonce attempt changes `σ`, so the keyed
-//! commitments, seeds, noise, and matmul-derived values must not be reused
-//! across nonces.
+//! F_R`). Each nonce attempt changes `σ`, so the keyed commitments, seeds,
+//! noise, and matmul-derived values must not be reused across nonces.
 //!
 //! The final `pow_key = derive_key("pow-key", s_A ‖ nonce)` is the
 //! keyed-BLAKE3 key for the tile-state hashes. It is domain separation on top
@@ -58,120 +61,132 @@ pub fn commitment_key(attempt_state: &[u8], params_tag: &[u8; 32]) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// `s_B` (Pearl `compute_commitment_hash` line 4,
-/// `Pearl zk-pow ffi/mine.rs:167-170`): unkeyed BLAKE3 of the 64-byte
-/// concatenation `κ ‖ H_B`.
-pub fn noise_seed_b(kappa: &[u8; 32], h_b: &[u8; 32]) -> [u8; 32] {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(kappa);
-    input[32..].copy_from_slice(h_b);
-    *Hasher::new().update(&input).finalize().as_bytes()
+const PEARL_V3_SEED_SALT_A: [u8; 32] = [
+    0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
+    0x92, 0xdb, 0xdb, 0x2a, 0x70, 0x23, 0xb8, 0x52, 0xf0, 0xd4, 0x77, 0x19, 0xc3, 0x90, 0x01, 0x7b,
+];
+const PEARL_V3_SEED_SALT_B: [u8; 32] = [
+    0x11, 0x30, 0x06, 0x32, 0xec, 0x63, 0x01, 0xca, 0x2b, 0xe2, 0xaf, 0x71, 0x8b, 0x3f, 0x4d, 0x4f,
+    0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
+];
+
+fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
 }
 
-/// `s_A` (Pearl `compute_commitment_hash` line 5,
-/// `Pearl zk-pow ffi/mine.rs:172-175`): unkeyed BLAKE3 of the 64-byte
-/// concatenation `s_B ‖ H_A`.
-pub fn noise_seed_a(s_b: &[u8; 32], h_a: &[u8; 32]) -> [u8; 32] {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(s_b);
-    input[32..].copy_from_slice(h_a);
-    *Hasher::new().update(&input).finalize().as_bytes()
+fn bind_root(salt: &[u8; 32], root: &[u8; 32], dimension: u32) -> [u8; 32] {
+    let mut message = [0u8; 64];
+    message[..32].copy_from_slice(root);
+    message[32..36].copy_from_slice(&dimension.to_le_bytes());
+    *Hasher::new_keyed(salt)
+        .update(&message)
+        .finalize()
+        .as_bytes()
 }
 
-/// Canonical production seed derivation for one nonce-bound AI-PoW attempt.
-///
-/// The inputs named `h_a_chunk` / `h_b_chunk` are the keyed full-matrix
-/// commitments that the recursive proof exposes as `HASH_A` / `HASH_B`.
-/// Deriving noise from these values prevents a prover from choosing separate
-/// row/column roots as an unproved seed surface while proving different matrix
-/// commitments in ZK.
+/// Canonical V3 dense seeds for raw authenticated matrix commitments.
 pub fn canonical_noise_seeds_from_matrix_commitments(
     kappa: &[u8; 32],
     h_a_chunk: &[u8; 32],
     h_b_chunk: &[u8; 32],
+    m: u32,
+    n: u32,
 ) -> ([u8; 32], [u8; 32]) {
-    let s_b = noise_seed_b(kappa, h_b_chunk);
-    let s_a = noise_seed_a(&s_b, h_a_chunk);
-    (s_a, s_b)
+    let a_bound = bind_root(&PEARL_V3_SEED_SALT_A, h_a_chunk, m);
+    let b_bound = bind_root(&PEARL_V3_SEED_SALT_B, h_b_chunk, n);
+    let s_b = hash_pair(kappa, &b_bound);
+    (hash_pair(&s_b, &a_bound), s_b)
 }
 
-/// The four MoE routing sub-hashes (Pearl
-/// `zk-pow/src/api/proof_utils.rs::compute_hash_activations`). `routing_root`
-/// and `hash_offsets` are keyed matrix commitments over the little-endian
-/// routing / offsets bytes; `hash_routing` and `hash_activations` are unkeyed
-/// 64-byte BLAKE3 concatenations.
+/// The V3 MoE routing commitment derived from canonical private routing bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeRoutingCommitment {
-    /// `MerkleTree(pad_chunk(routing_data_le), key=κ).root` — public `moe.hash_routing`.
+    /// `MerkleTree(pad_chunk(routing_data_le), key=κ).root`.
     pub routing_root: [u8; 32],
     /// `BLAKE3(pad_chunk(routing_offsets_le), key=κ)`.
     pub hash_offsets: [u8; 32],
     /// `BLAKE3(routing_root ‖ hash_offsets)`.
     pub hash_routing: [u8; 32],
-    /// `BLAKE3(H_A ‖ hash_routing)` — replaces `H_A` in the `s_A` derivation.
+    /// `BLAKE3(A' ‖ hash_routing)`.
     pub hash_activations: [u8; 32],
 }
 
-/// `hash_routing = BLAKE3(routing_root ‖ hash_offsets)` (unkeyed, 64-byte concat).
-pub fn moe_hash_routing(routing_root: &[u8; 32], hash_offsets: &[u8; 32]) -> [u8; 32] {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(routing_root);
-    input[32..].copy_from_slice(hash_offsets);
-    *Hasher::new().update(&input).finalize().as_bytes()
-}
-
-/// `hash_activations = BLAKE3(H_A ‖ hash_routing)` (unkeyed, 64-byte concat).
-///
-/// In the dense (non-MoE) case Pearl uses `hash_activations = H_A` directly — do
-/// **not** call this on a dense attempt; the dense `s_A` derivation must remain
-/// byte-identical to V1 (see [`canonical_noise_seeds_from_matrix_commitments`]).
-pub fn moe_hash_activations(h_a: &[u8; 32], hash_routing: &[u8; 32]) -> [u8; 32] {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(h_a);
-    input[32..].copy_from_slice(hash_routing);
-    *Hasher::new().update(&input).finalize().as_bytes()
-}
-
-/// Compute the full MoE routing commitment from the canonical routing byte
-/// strings (see [`crate::pearl_moe_routing::RoutingData`]) and the job key `κ`.
-///
-/// `routing_data_le` is the committed token-index array (LE `u32`) and
-/// `routing_offsets_le` the per-expert exclusive-end offsets (LE `u32`). The
-/// keyed roots reuse [`crate::commit::matrix_commitment`], which is
-/// byte-equivalent to Pearl's `MatrixMerkleTree.root` / `tensor_hash`.
-pub fn moe_routing_commitment(
+fn routing_commitment_from_public_root(
     kappa: &[u8; 32],
     h_a: &[u8; 32],
-    routing_data_le: &[u8],
+    m: u32,
+    routing_root: &[u8; 32],
     routing_offsets_le: &[u8],
 ) -> MoeRoutingCommitment {
-    let routing_root = crate::commit::matrix_commitment(routing_data_le, kappa);
     let hash_offsets = crate::commit::matrix_commitment(routing_offsets_le, kappa);
-    let hash_routing = moe_hash_routing(&routing_root, &hash_offsets);
-    let hash_activations = moe_hash_activations(h_a, &hash_routing);
+    let hash_routing = hash_pair(routing_root, &hash_offsets);
+    let a_bound = bind_root(&PEARL_V3_SEED_SALT_A, h_a, m);
+    let hash_activations = hash_pair(&a_bound, &hash_routing);
     MoeRoutingCommitment {
-        routing_root,
+        routing_root: *routing_root,
         hash_offsets,
         hash_routing,
         hash_activations,
     }
 }
 
-/// MoE variant of [`canonical_noise_seeds_from_matrix_commitments`]: the A-side
-/// seed keys off `hash_activations` instead of `H_A`, folding the routing
-/// commitment into the noise seed (Pearl `commitment_hash`, MoE arm). `s_B` is
-/// unchanged. Returns `(s_a, s_b, commitment)`.
+/// Compute the V3 MoE routing commitment from canonical private routing bytes.
+pub fn moe_routing_commitment(
+    kappa: &[u8; 32],
+    h_a: &[u8; 32],
+    m: u32,
+    routing_data_le: &[u8],
+    routing_offsets_le: &[u8],
+) -> MoeRoutingCommitment {
+    let routing_root = crate::commit::matrix_commitment(routing_data_le, kappa);
+    routing_commitment_from_public_root(kappa, h_a, m, &routing_root, routing_offsets_le)
+}
+
+fn moe_seeds_from_commitment(
+    kappa: &[u8; 32],
+    h_b: &[u8; 32],
+    n_e: u32,
+    commitment: &MoeRoutingCommitment,
+) -> ([u8; 32], [u8; 32]) {
+    let b_bound = bind_root(&PEARL_V3_SEED_SALT_B, h_b, n_e);
+    let s_b = hash_pair(kappa, &b_bound);
+    (hash_pair(&s_b, &commitment.hash_activations), s_b)
+}
+
+/// Canonical V3 MoE seeds for canonical private routing bytes.
+#[allow(clippy::too_many_arguments)]
 pub fn canonical_noise_seeds_moe(
     kappa: &[u8; 32],
     h_a_chunk: &[u8; 32],
     h_b_chunk: &[u8; 32],
+    m: u32,
+    n_e: u32,
     routing_data_le: &[u8],
     routing_offsets_le: &[u8],
 ) -> ([u8; 32], [u8; 32], MoeRoutingCommitment) {
-    let commitment = moe_routing_commitment(kappa, h_a_chunk, routing_data_le, routing_offsets_le);
-    let s_b = noise_seed_b(kappa, h_b_chunk);
-    let s_a = noise_seed_a(&s_b, &commitment.hash_activations);
+    let commitment =
+        moe_routing_commitment(kappa, h_a_chunk, m, routing_data_le, routing_offsets_le);
+    let (s_a, s_b) = moe_seeds_from_commitment(kappa, h_b_chunk, n_e, &commitment);
     (s_a, s_b, commitment)
+}
+
+/// Canonical V3 MoE seeds for a verified public routing root.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_noise_seeds_moe_from_public_routing(
+    kappa: &[u8; 32],
+    h_a: &[u8; 32],
+    h_b: &[u8; 32],
+    m: u32,
+    n_e: u32,
+    routing_root: &[u8; 32],
+    routing_offsets_le: &[u8],
+) -> ([u8; 32], [u8; 32]) {
+    let commitment =
+        routing_commitment_from_public_root(kappa, h_a, m, routing_root, routing_offsets_le);
+    moe_seeds_from_commitment(kappa, h_b, n_e, &commitment)
 }
 
 /// Per-attempt `pow_key` used as the BLAKE3 key for
@@ -268,262 +283,104 @@ pub fn challenge_indices(seed: &[u8; 32], count: u32, range: u64) -> Vec<u64> {
 mod tests {
     use super::*;
 
-    // MoE routing-commitment splice.
-
-    /// The composed helpers reproduce the exact Pearl `compute_hash_activations`
-    /// chain, verified against an independent inline recomputation (blake3
-    /// directly), so a wiring bug in the helpers cannot hide.
     #[test]
-    fn moe_routing_commitment_matches_inline_recomputation() {
+    fn dense_v3_seeds_bind_roots_and_dimensions() {
         let kappa = [0x11u8; 32];
-        let h_a = [0x22u8; 32];
-        let routing_data_le: Vec<u8> = (0u32..40).flat_map(|v| v.to_le_bytes()).collect();
-        let routing_offsets_le: Vec<u8> = [10u32, 20, 30, 40]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let h_a = [0xaau8; 32];
+        let h_b = [0xbbu8; 32];
+        let base = canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, 192, 320);
 
-        let c = moe_routing_commitment(&kappa, &h_a, &routing_data_le, &routing_offsets_le);
-
-        // Independent recomputation of the Pearl chain.
-        let routing_root = crate::commit::matrix_commitment(&routing_data_le, &kappa);
-        let hash_offsets = crate::commit::matrix_commitment(&routing_offsets_le, &kappa);
-        let hash_routing = {
-            let mut i = Vec::new();
-            i.extend_from_slice(&routing_root);
-            i.extend_from_slice(&hash_offsets);
-            *Hasher::new().update(&i).finalize().as_bytes()
-        };
-        let hash_activations = {
-            let mut i = Vec::new();
-            i.extend_from_slice(&h_a);
-            i.extend_from_slice(&hash_routing);
-            *Hasher::new().update(&i).finalize().as_bytes()
-        };
-        assert_eq!(c.routing_root, routing_root);
-        assert_eq!(c.hash_offsets, hash_offsets);
-        assert_eq!(c.hash_routing, hash_routing);
-        assert_eq!(c.hash_activations, hash_activations);
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, 193, 320)
+        );
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, 192, 321)
+        );
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &[0xabu8; 32], &h_b, 192, 320)
+        );
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &[0xbcu8; 32], 192, 320)
+        );
     }
 
-    /// `routing_root` and `hash_offsets` are exactly `matrix_commitment` (Pearl
-    /// `MatrixMerkleTree.root` / `tensor_hash`).
     #[test]
-    fn moe_roots_are_matrix_commitments() {
-        let kappa = [7u8; 32];
-        let h_a = [9u8; 32];
-        let rd: Vec<u8> = (0u32..16).flat_map(|v| v.to_le_bytes()).collect();
-        let ro: Vec<u8> = [16u32].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let c = moe_routing_commitment(&kappa, &h_a, &rd, &ro);
+    fn moe_v3_seeds_bind_dimensions_and_routing() {
+        let kappa = [0x11u8; 32];
+        let h_a = [0xaau8; 32];
+        let h_b = [0xbbu8; 32];
+        let routing_data: Vec<u8> = (0u32..40).flat_map(u32::to_le_bytes).collect();
+        let routing_offsets: Vec<u8> = [10u32, 20, 30, 40]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+        let (s_a, s_b, commitment) =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 192, 64, &routing_data, &routing_offsets);
         assert_eq!(
-            c.routing_root,
-            crate::commit::matrix_commitment(&rd, &kappa)
+            (s_a, s_b),
+            canonical_noise_seeds_moe_from_public_routing(
+                &kappa, &h_a, &h_b, 192, 64, &commitment.routing_root, &routing_offsets,
+            )
         );
-        assert_eq!(
-            c.hash_offsets,
-            crate::commit::matrix_commitment(&ro, &kappa)
+        let changed_m =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 193, 64, &routing_data, &routing_offsets);
+        assert_ne!((s_a, s_b), (changed_m.0, changed_m.1));
+        let changed_n_e =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 192, 65, &routing_data, &routing_offsets);
+        assert_ne!((s_a, s_b), (changed_n_e.0, changed_n_e.1));
+        let stacked_width = canonical_noise_seeds_moe(
+            &kappa, &h_a, &h_b, 192, 512, &routing_data, &routing_offsets,
+        );
+        assert_ne!((s_a, s_b), (stacked_width.0, stacked_width.1));
+        let mut changed_data = routing_data.clone();
+        changed_data[..8].reverse();
+        let reordered =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 192, 64, &changed_data, &routing_offsets);
+        assert_ne!((s_a, s_b), (reordered.0, reordered.1));
+        let mut changed_offsets = routing_offsets.clone();
+        changed_offsets[0] ^= 1;
+        let altered_offsets =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 192, 64, &routing_data, &changed_offsets);
+        assert_ne!((s_a, s_b), (altered_offsets.0, altered_offsets.1));
+        let mut changed_root = commitment.routing_root;
+        changed_root[0] ^= 1;
+        assert_ne!(
+            (s_a, s_b),
+            canonical_noise_seeds_moe_from_public_routing(
+                &kappa, &h_a, &h_b, 192, 64, &changed_root, &routing_offsets,
+            )
         );
     }
 
-    /// **Real Pearl KAT** — our `hash_offsets` (keyed matrix commitment of the
-    /// LE routing offsets) + `hash_routing` + `hash_activations` composition must
-    /// equal Pearl `zk_pow::api::proof_utils::compute_hash_activations` for a
-    /// fixed input. Vector emitted from the Pearl `zk-pow` crate (2026-07-07):
-    /// `hash_a=[0x22;32]`, `routing_root=[0x33;32]`, `routing_offsets=[10,20,30,40]`,
-    /// `job_key=[0x11;32]`. This anchors the splice to Pearl's actual function, not just
-    /// its documented formula.
-    #[test]
-    fn moe_hash_activations_matches_pearl_kat() {
-        let hash_a = [0x22u8; 32];
-        let routing_root = [0x33u8; 32];
-        let job_key = [0x11u8; 32];
-        let routing_offsets_le: Vec<u8> = [10u32, 20, 30, 40]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let hash_offsets = crate::commit::matrix_commitment(&routing_offsets_le, &job_key);
-        let hash_routing = moe_hash_routing(&routing_root, &hash_offsets);
-        let hash_activations = moe_hash_activations(&hash_a, &hash_routing);
-        let pearl: [u8; 32] = [
-            124, 127, 230, 159, 165, 18, 134, 171, 128, 119, 180, 146, 8, 204, 18, 208, 114, 21,
-            147, 95, 107, 11, 231, 120, 157, 77, 25, 124, 22, 30, 51, 102,
-        ];
-        assert_eq!(
-            hash_activations, pearl,
-            "hash_activations must match Pearl compute_hash_activations"
-        );
-    }
-
-    /// **Full-chain byte-compat (adversarial).** Independently
-    /// re-implements Pearl's `compute_commitment_hash_with_offsets`
-    /// (`zk-pow/src/ffi/mine.rs`) + `compute_hash_activations`
-    /// (`proof_utils.rs`) byte-for-byte and asserts our `canonical_noise_seeds_moe`
-    /// produces the identical `s_A` for a concrete routing built by
-    /// `build_routing_data`. This binds the WHOLE splice chain (routing_data →
-    /// routing_root → hash_offsets → hash_routing → hash_activations → s_b → s_a)
-    /// to Pearl's exact formula. The real-Pearl KAT above anchors
-    /// `hash_activations` to Pearl's actual output bytes; together they close the
-    /// merge-mining fork risk for the MoE commitment. Pearl reference (verbatim):
-    ///   hash_routing_data = blake3(pad_to_chunk_boundary(flatten_routing), key=job_key)
-    ///   hash_offsets      = blake3(pad_to_chunk_boundary(offsets_le),      key=job_key)
-    ///   hash_routing      = blake3(hash_routing_data ‖ hash_offsets)        (unkeyed)
-    ///   hash_activations  = blake3(hash_a ‖ hash_routing)                   (unkeyed)
-    ///   b_noise_seed      = blake3(job_key ‖ hash_b)                        (unkeyed)
-    ///   a_noise_seed      = blake3(b_noise_seed ‖ hash_activations)         (unkeyed)
-    #[test]
-    fn full_moe_s_a_chain_matches_pearl_formula() {
-        let kappa = [0x11u8; 32]; // job_key
-        let hash_a = [0x22u8; 32];
-        let hash_b = [0x44u8; 32];
-        // m=5, top_k=2, e=4 — includes an empty expert and a token routed twice
-        // to the same expert (slots 0,1 → expert 3), exercising the grouping.
-        let topk = [3u32, 3, 0, 1, 3, 0, 2, 2, 1, 0];
-        let rd = crate::pearl_moe_routing::build_routing_data(&topk, 5, 2, 4).unwrap();
-        let routing_data_le: Vec<u8> = rd
-            .routing_data
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let routing_offsets_le: Vec<u8> = rd
-            .routing_offsets
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-
-        // ---- Pearl reference, re-implemented from mine.rs + proof_utils.rs ----
-        let unkeyed = |parts: &[&[u8]]| -> [u8; 32] {
-            let mut h = Hasher::new();
-            for p in parts {
-                h.update(p);
-            }
-            *h.finalize().as_bytes()
-        };
-        let keyed_padded = |key: &[u8; 32], data: &[u8]| -> [u8; 32] {
-            let padded = crate::commit::pad_to_chunk_boundary(data);
-            *Hasher::new_keyed(key).update(&padded).finalize().as_bytes()
-        };
-        let routing_root = keyed_padded(&kappa, &routing_data_le);
-        let hash_offsets = keyed_padded(&kappa, &routing_offsets_le);
-        let hash_routing = unkeyed(&[&routing_root, &hash_offsets]);
-        let hash_activations = unkeyed(&[&hash_a, &hash_routing]);
-        let s_b_ref = unkeyed(&[&kappa, &hash_b]);
-        let s_a_ref = unkeyed(&[&s_b_ref, &hash_activations]);
-
-        // ---- Our implementation ----
-        let (s_a, s_b, c) = canonical_noise_seeds_moe(
-            &kappa, &hash_a, &hash_b, &routing_data_le, &routing_offsets_le,
-        );
-        assert_eq!(c.routing_root, routing_root, "routing_root");
-        assert_eq!(c.hash_offsets, hash_offsets, "hash_offsets");
-        assert_eq!(c.hash_activations, hash_activations, "hash_activations");
-        assert_eq!(s_b, s_b_ref, "s_b (b_noise_seed)");
-        assert_eq!(s_a, s_a_ref, "s_a (a_noise_seed) — full Pearl splice chain");
-    }
-
-    /// Cross-crate byte-equivalence: `ai-pow-zk`'s off-circuit MoE reference
-    /// (`moe_ref`, the spec the in-circuit MoE sub-AIR reproduces) equals this crate's MoE
-    /// splice. Transitively Pearl-validated via the KAT above (this crate) and
-    /// the `matrix_commitment` byte-equivalence fixture. `ai-pow-zk` cannot depend on `ai-pow`,
-    /// so the equivalence is asserted here (`--features zk`).
     #[cfg(feature = "zk")]
     #[test]
-    fn moe_ref_byte_equivalent_to_fiat_shamir_splice() {
-        let job_key = [0x11u8; 32];
+    fn moe_ref_matches_complete_v3_transcript() {
+        let kappa = [0x11u8; 32];
         let h_a = [0x22u8; 32];
-        let rd: Vec<u8> = (0u32..40).flat_map(|v| v.to_le_bytes()).collect();
-        let ro: Vec<u8> = [10u32, 20, 30, 40]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
+        let h_b = [0x33u8; 32];
+        let routing_data: Vec<u8> = (0u32..40).flat_map(u32::to_le_bytes).collect();
+        let routing_offsets: Vec<u8> = [10u32, 20, 30, 40]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
             .collect();
-        let ours = moe_routing_commitment(&job_key, &h_a, &rd, &ro);
-        let zk = ai_pow_zk::moe_ref::moe_commitment(&job_key, &h_a, &rd, &ro);
-        assert_eq!(ours.routing_root, zk.routing_root);
-        assert_eq!(ours.hash_offsets, zk.hash_offsets);
-        assert_eq!(ours.hash_routing, zk.hash_routing);
-        assert_eq!(ours.hash_activations, zk.hash_activations);
-    }
-
-    /// The MoE seed derivation folds routing in: `s_A` differs from the dense
-    /// `s_A` (which keys off `H_A`), while `s_B` is unchanged. This is the
-    /// defining effect of the splice.
-    #[test]
-    fn moe_seed_folds_routing_and_leaves_s_b_unchanged() {
-        let kappa = [1u8; 32];
-        let h_a = [2u8; 32];
-        let h_b = [3u8; 32];
-        let rd: Vec<u8> = (0u32..32).flat_map(|v| v.to_le_bytes()).collect();
-        let ro: Vec<u8> = [8u32, 16, 24, 32]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-
-        let (dense_s_a, dense_s_b) =
-            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b);
-        let (moe_s_a, moe_s_b, c) = canonical_noise_seeds_moe(&kappa, &h_a, &h_b, &rd, &ro);
-
-        assert_eq!(moe_s_b, dense_s_b, "s_B must be unchanged by MoE");
-        assert_ne!(
-            moe_s_a, dense_s_a,
-            "s_A must fold in the routing commitment"
+        let (s_a, s_b, commitment) =
+            canonical_noise_seeds_moe(&kappa, &h_a, &h_b, 192, 64, &routing_data, &routing_offsets);
+        let reference = ai_pow_zk::moe_ref::moe_v3_reference(
+            &kappa, &h_a, &h_b, 192, 64, &routing_data, &routing_offsets,
         );
-        // s_A is exactly noise_seed_a(s_B, hash_activations).
-        assert_eq!(moe_s_a, noise_seed_a(&moe_s_b, &c.hash_activations));
-    }
-
-    /// Dense-path guardrail: the existing dense seed derivation is untouched by
-    /// the splice (no routing enters), so dense byte-parity is preserved.
-    #[test]
-    fn dense_seed_derivation_is_unaffected() {
-        let kappa = [0x5au8; 32];
-        let h_a = [0xa5u8; 32];
-        let h_b = [0x3cu8; 32];
-        // Recompute the dense chain by hand and compare.
-        let s_b = noise_seed_b(&kappa, &h_b);
-        let s_a = noise_seed_a(&s_b, &h_a);
+        assert_eq!(commitment.routing_root, reference.commitment.routing_root);
+        assert_eq!(commitment.hash_offsets, reference.commitment.hash_offsets);
+        assert_eq!(commitment.hash_routing, reference.commitment.hash_routing);
         assert_eq!(
-            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b),
-            (s_a, s_b)
+            commitment.hash_activations,
+            reference.commitment.hash_activations
         );
-    }
-
-    /// Every routing input perturbation changes `hash_activations` (and thus
-    /// `s_A`): routing data, offsets, and the job key each bind.
-    #[test]
-    fn every_routing_input_binds() {
-        let kappa = [1u8; 32];
-        let h_a = [2u8; 32];
-        let rd: Vec<u8> = (0u32..24).flat_map(|v| v.to_le_bytes()).collect();
-        let ro: Vec<u8> = [12u32, 24].iter().flat_map(|v| v.to_le_bytes()).collect();
-        let base = moe_routing_commitment(&kappa, &h_a, &rd, &ro).hash_activations;
-
-        let mut rd2 = rd.clone();
-        rd2[0] ^= 1;
-        assert_ne!(
-            base,
-            moe_routing_commitment(&kappa, &h_a, &rd2, &ro).hash_activations,
-            "routing data must bind"
-        );
-        let mut ro2 = ro.clone();
-        ro2[0] ^= 1;
-        assert_ne!(
-            base,
-            moe_routing_commitment(&kappa, &h_a, &rd, &ro2).hash_activations,
-            "routing offsets must bind"
-        );
-        let mut kappa2 = kappa;
-        kappa2[0] ^= 1;
-        assert_ne!(
-            base,
-            moe_routing_commitment(&kappa2, &h_a, &rd, &ro).hash_activations,
-            "job key must bind"
-        );
-        let mut h_a2 = h_a;
-        h_a2[0] ^= 1;
-        assert_ne!(
-            base,
-            moe_routing_commitment(&kappa, &h_a2, &rd, &ro).hash_activations,
-            "H_A must bind"
-        );
+        assert_eq!(s_a, reference.s_a);
+        assert_eq!(s_b, reference.s_b);
     }
 
     #[test]
@@ -546,24 +403,25 @@ mod tests {
     }
 
     #[test]
-    fn pearl_derivation_chain_binds_all_inputs() {
-        // s_A must differ when *any* of (attempt state, params, h_a, h_b) differs.
+    fn pearl_v3_derivation_chain_binds_all_inputs() {
         let kappa = commitment_key(b"hdr", &[1u8; 32]);
         let h_a = [2u8; 32];
         let h_b = [3u8; 32];
-        let s_b = noise_seed_b(&kappa, &h_b);
-        let s_a = noise_seed_a(&s_b, &h_a);
+        let base = canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &h_b, 192, 320);
 
         let kappa2 = commitment_key(b"hdr-other", &[1u8; 32]);
-        let s_b2 = noise_seed_b(&kappa2, &h_b);
-        let s_a2 = noise_seed_a(&s_b2, &h_a);
-        assert_ne!(s_a, s_a2, "changing attempt state must change s_A");
-
-        let s_a3 = noise_seed_a(&noise_seed_b(&kappa, &[7u8; 32]), &h_a);
-        assert_ne!(s_a, s_a3, "changing h_b must change s_A");
-
-        let s_a4 = noise_seed_a(&s_b, &[8u8; 32]);
-        assert_ne!(s_a, s_a4, "changing h_a must change s_A");
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa2, &h_a, &h_b, 192, 320)
+        );
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a, &[7u8; 32], 192, 320)
+        );
+        assert_ne!(
+            base,
+            canonical_noise_seeds_from_matrix_commitments(&kappa, &[8u8; 32], &h_b, 192, 320)
+        );
     }
 
     #[test]
@@ -582,10 +440,11 @@ mod tests {
         // it's derived from.
         let s_a = [4u8; 32];
         assert_ne!(pow_key_for_nonce(&s_a, b""), s_a);
-        assert_ne!(
-            pow_key_for_nonce(&s_a, b"nce"),
-            noise_seed_a(&[1u8; 32], &[2u8; 32])
-        );
+        let seed = canonical_noise_seeds_from_matrix_commitments(
+            &[1u8; 32], &[2u8; 32], &[3u8; 32], 192, 320,
+        )
+        .0;
+        assert_ne!(pow_key_for_nonce(&s_a, b"nce"), seed);
     }
 
     #[test]

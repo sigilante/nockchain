@@ -3,14 +3,13 @@
 //! Implements the Pearl Whitepaper PoUW puzzle for caller-chosen INT8
 //! matrices `A` and `B`:
 //!
-//! 1. **Commitments** (Pearl §4.3, Alg. 2): `κ` derived from the
-//!    nonce-bound attempt state `(block_commitment, nonce, params_tag)`;
-//!    `h_a` and `h_b` are legacy row/column Merkle roots for plain
-//!    spot-opening diagnostics; `h_a_chunk` and `h_b_chunk` are nonce-keyed
-//!    matrix commitments bound by the recursive ZK proof as `HASH_A` /
-//!    `HASH_B`. Seeds `s_B = derive_key("s_b", κ ‖ h_b_chunk)` and
-//!    `s_A = derive_key("s_a", s_B ‖ h_a_chunk)` bind the noise to the
-//!    proof-bound matrices.
+//! 1. **Commitments** (Pearl certificate V3): `κ = BLAKE3(σ ‖ μ)` and
+//!    `H_A` / `H_B` are nonce-keyed matrix commitments bound by the recursive
+//!    ZK proof as `HASH_A` / `HASH_B`. V3 derives `A'` and `B'` with keyed
+//!    BLAKE3 over each root, its little-endian dimension, and zero padding,
+//!    using separate fixed salts. It derives `s_B = BLAKE3(κ ‖ B')` and dense
+//!    `s_A = BLAKE3(s_B ‖ A')`. MoE binds `s_A` to `A'` and its canonical
+//!    routing splice instead.
 //! 2. **Low-rank noise** (Pearl §4.4, Alg. 3): `E = E_L · E_R` and
 //!    `F = F_L · F_R` of rank `r`; `E_L, F_R` are int6, `E_R, F_L` are
 //!    choice matrices (one `+1` and one `-1` per col/row).
@@ -19,8 +18,8 @@
 //!    `M[ℓ mod 16] ← (M[ℓ mod 16] ≪ 13) ⊕ X_ℓ`.
 //! 4. **Shape-aware hardness**: `BLAKE3(M, key = pow_key) ≤ 2^(256-b) · r · t^2`,
 //!    with `pow_key = derive_key("pow-key", s_A ‖ nonce)`. Since `s_A` is
-//!    already nonce-bound through `κ`, changing the nonce requires fresh
-//!    commitments, noise, and matmul-derived tile states before the hash check.
+//!    nonce-bound through `κ`, changing the nonce requires fresh commitments,
+//!    noise, and matmul-derived tile states before the hash check.
 //!
 //! The proof contains `H_A`, `H_B`, and per-opening row/column strips of
 //! `A`/`B` with BLAKE3 Merkle authentication paths up to those roots, so

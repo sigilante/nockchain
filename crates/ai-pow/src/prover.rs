@@ -4,15 +4,17 @@
 //! `2^(256 - b) · r · t^2` (Pearl §4.5).
 //!
 //! The miner supplies the input matrices `A` and `B`. Each nonce attempt
-//! commits to them via a Pearl §4.3 Alg. 2-shaped chain:
-//!  1. `κ = derive_key("kappa", block_state(block, nonce) ‖ params_tag)`
-//!  2. `h_a_chunk` / `h_b_chunk` are nonce-keyed matrix commitments bound by
-//!     the recursive ZK proof as `HASH_A` / `HASH_B`.
-//!  3. `s_B = derive_key("s_b", κ ‖ h_b_chunk)`
-//!  4. `s_A = derive_key("s_a", s_B ‖ h_a_chunk)`
+//! derives a Pearl certificate-V3 work statement:
 //!
-//! Plain `MatmulProof` diagnostics still compute `h_a` / `h_b` for their
-//! own row/column spot openings, but those roots are not production recursive
+//!  1. `κ = BLAKE3(σ ‖ μ)` and `H_A` / `H_B` are nonce-keyed matrix
+//!     commitments bound by the recursive ZK proof as `HASH_A` / `HASH_B`.
+//!  2. `A'` and `B'` bind each matrix root and its little-endian dimension
+//!     under distinct fixed V3 salts.
+//!  3. `s_B = BLAKE3(κ ‖ B')`; dense `s_A = BLAKE3(s_B ‖ A')`.
+//!  4. MoE derives `s_A` from `A'` and its canonical routing splice.
+//!
+//! Plain `MatmulProof` diagnostics still compute `h_a` / `h_b` for their own
+//! row/column spot openings, but those roots are not production recursive
 //! commitments and are not part of the nonce/noise seed surface.
 //!
 //! The nonce is part of the per-attempt `sigma` before `κ`, `H_A`, `H_B`,
@@ -270,8 +272,9 @@ impl<'a> BlockContext<'a> {
         let h_a_chunk = crate::commit::matrix_commitment(a_bytes, &kappa);
         let h_b_chunk = crate::commit::matrix_commitment(b_bytes, &kappa);
 
-        let (s_a, s_b) =
-            canonical_noise_seeds_from_matrix_commitments(&kappa, &h_a_chunk, &h_b_chunk);
+        let (s_a, s_b) = canonical_noise_seeds_from_matrix_commitments(
+            &kappa, &h_a_chunk, &h_b_chunk, params.m, params.n,
+        );
 
         let noise = BlockNoise::expand(&s_a, &s_b, params);
         let matrices = Matrices::build(a, b, &noise, params);

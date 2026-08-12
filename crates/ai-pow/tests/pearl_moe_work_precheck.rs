@@ -20,7 +20,7 @@
 
 #![allow(clippy::unwrap_used)] // integration test: unwrap is acceptable
 use ai_pow::pearl_compat::{
-    compute_pearl_moe_ticket, derive_pearl_work_commitments, verify_pearl_moe_compatible_work,
+    compute_pearl_moe_ticket, derive_pearl_moe_work_commitments, verify_pearl_moe_compatible_work,
     PearlCompatError, PearlIncompleteBlockHeader, PearlMiningConfig, PearlMoeParams,
     PearlPeriodicPattern, PearlPublicProofParams, PEARL_MINING_CONFIG_RESERVED_SIZE,
     PEARL_MMA_INT7XINT7_TO_INT32,
@@ -101,7 +101,16 @@ fn build_fixture() -> Fixture {
     let config = moe_config();
     let sigma = header().to_bytes();
     let mu = config.to_bytes().unwrap();
-    let commitments = derive_pearl_work_commitments(&sigma, &mu, &a, &b);
+    let commitments = derive_pearl_moe_work_commitments(
+        &sigma,
+        &mu,
+        &a,
+        &b,
+        M as u32,
+        N_E as u32,
+        &routing.routing_data_le_bytes(),
+        &routing.routing_offsets_le_bytes(),
+    );
 
     // The opened schedule the PUBLIC patterns select (t_rows = t_cols = 0).
     let inner: Vec<u32> = config
@@ -115,7 +124,7 @@ fn build_fixture() -> Fixture {
 
     let ticket = compute_pearl_moe_ticket(
         &commitments.kappa, &commitments.h_a, &commitments.h_b, &a, &b, &routing, EXPERT_IDX,
-        &inner, &local_b, N_E, K, R, K, // dot_product_length == common_dim here (rank | k)
+        &inner, &local_b, N_E, M as u32, K, R, K,
     )
     .expect("compute MoE ticket");
 

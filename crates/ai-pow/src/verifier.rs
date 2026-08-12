@@ -124,8 +124,9 @@ pub fn verify_at_target(
     let chal = challenge_seed(&state, &proof.comm_m, &tag);
     let num_tiles = params.num_tiles();
     let kappa = commitment_key(&state, &tag);
-    let (s_a, s_b) =
-        canonical_noise_seeds_from_matrix_commitments(&kappa, &proof.h_a_chunk, &proof.h_b_chunk);
+    let (s_a, s_b) = canonical_noise_seeds_from_matrix_commitments(
+        &kappa, &proof.h_a_chunk, &proof.h_b_chunk, params.m, params.n,
+    );
     let expected_found = attempt_tile_index(&state, &tag, &s_a, num_tiles);
 
     if (proof.spot.len() as u32) != params.spot_checks {

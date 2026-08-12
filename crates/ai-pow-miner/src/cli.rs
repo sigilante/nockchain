@@ -57,8 +57,10 @@ pub struct CommonArgs {
     #[arg(long, value_parser = clap::value_parser!(MiningPkhConfig), num_args = 1..)]
     pub mining_pkh_adv: Option<Vec<MiningPkhConfig>>,
 
-    /// Pearl Gateway miner RPC endpoint. Accepts `unix:/path/to.sock`, `/path/to.sock`,
-    /// `tcp:host:port`, `tcp://host:port`, or `host:port`. Ignored in --canonical mode.
+    /// Pearl Gateway miner RPC endpoint. Requires Gateway `getMiningInfo` jobs
+    /// with `cert_version = 3`; submissions carry the same version. Accepts
+    /// `unix:/path/to.sock`, `/path/to.sock`, `tcp:host:port`, `tcp://host:port`,
+    /// or `host:port`. Ignored in --canonical mode.
     #[arg(long, value_name = "ENDPOINT", default_value = DEFAULT_PEARL_GATEWAY_ENDPOINT)]
     pub pearl_gateway: String,
 

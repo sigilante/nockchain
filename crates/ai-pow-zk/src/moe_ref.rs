@@ -1,55 +1,45 @@
-//! Off-circuit MoE routing-commitment reference.
+//! Independent Pearl V3 MoE transcript reference.
 //!
-//! The canonical reference reproduced by the in-circuit MoE sub-AIR:
-//! Pearl `zk-pow/src/api/proof_utils.rs::compute_hash_activations`, which folds
-//! the routing commitment into A's noise seed:
-//!
-//! ```text
-//! routing_root     = BLAKE3(pad_chunk(routing_data_le),    key = job_key)   // = MatrixMerkleTree.root
-//! hash_offsets     = BLAKE3(pad_chunk(routing_offsets_le), key = job_key)   // = tensor_hash
-//! hash_routing     = BLAKE3(routing_root ‖ hash_offsets)
-//! hash_activations = BLAKE3(H_A ‖ hash_routing)                              // replaces H_A in s_A
-//! ```
-//!
-//! Bit-for-bit mirror of `ai-pow::fiat_shamir`'s MoE splice
-//! (`moe_routing_commitment`). `ai-pow-zk` must not depend on `ai-pow` (dep
-//! cycle), so this re-derives from the `blake3` primitive and
-//! [`crate::blake3_tree`]; the decisive cross-crate byte-equivalence KAT
-//! (`moe_ref` == `ai-pow` MoE splice) lives on the `ai-pow` side (it may depend
-//! on `ai-pow-zk`, `--features zk`). This remains an independent parity oracle.
+//! The reference receives raw authenticated roots and dimensions. It binds A
+//! before the routing fold and binds B with the per-expert width before the
+//! seed chain. `ai-pow-zk` has no dependency on `ai-pow`, so cross-crate tests
+//! compare the complete reference result with the production implementation.
 
 use blake3::Hasher;
 
 use crate::blake3_tree::pad_to_chunk_boundary;
 
-/// Keyed matrix commitment `BLAKE3(pad_to_chunk(bytes), key)` — Pearl
-/// `MatrixMerkleTree.root` / `tensor_hash`, byte-equivalent to
-/// `ai-pow::commit::matrix_commitment` (fixture S8).
-pub fn keyed_matrix_commitment(bytes: &[u8], key: &[u8; 32]) -> [u8; 32] {
+const SEED_SALT_A: [u8; 32] = [
+    0x82, 0x49, 0x40, 0x6c, 0xa0, 0xed, 0x15, 0x16, 0x96, 0x16, 0xf6, 0x92, 0xfc, 0xf0, 0x76, 0xf8,
+    0x92, 0xdb, 0xdb, 0x2a, 0x70, 0x23, 0xb8, 0x52, 0xf0, 0xd4, 0x77, 0x19, 0xc3, 0x90, 0x01, 0x7b,
+];
+const SEED_SALT_B: [u8; 32] = [
+    0x11, 0x30, 0x06, 0x32, 0xec, 0x63, 0x01, 0xca, 0x2b, 0xe2, 0xaf, 0x71, 0x8b, 0x3f, 0x4d, 0x4f,
+    0x1a, 0xe9, 0xc6, 0x39, 0x88, 0xe8, 0xcc, 0x04, 0x48, 0x44, 0x30, 0x1d, 0x71, 0xb8, 0x9a, 0xa9,
+];
+
+fn keyed_matrix_commitment(bytes: &[u8], key: &[u8; 32]) -> [u8; 32] {
     let padded = pad_to_chunk_boundary(bytes);
     *Hasher::new_keyed(key).update(&padded).finalize().as_bytes()
 }
 
-/// Unkeyed BLAKE3 of two concatenated 32-byte digests.
-fn blake3_concat(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    let mut input = [0u8; 64];
-    input[..32].copy_from_slice(a);
-    input[32..].copy_from_slice(b);
-    *Hasher::new().update(&input).finalize().as_bytes()
+fn hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Hasher::new();
+    hasher.update(left);
+    hasher.update(right);
+    *hasher.finalize().as_bytes()
 }
 
-/// `hash_routing = BLAKE3(routing_root ‖ hash_offsets)`.
-pub fn combine_routing(routing_root: &[u8; 32], hash_offsets: &[u8; 32]) -> [u8; 32] {
-    blake3_concat(routing_root, hash_offsets)
+fn bind_root(salt: &[u8; 32], root: &[u8; 32], dimension: u32) -> [u8; 32] {
+    let mut message = [0u8; 64];
+    message[..32].copy_from_slice(root);
+    message[32..36].copy_from_slice(&dimension.to_le_bytes());
+    *Hasher::new_keyed(salt)
+        .update(&message)
+        .finalize()
+        .as_bytes()
 }
 
-/// `hash_activations = BLAKE3(H_A ‖ hash_routing)`.
-pub fn combine_activations(h_a: &[u8; 32], hash_routing: &[u8; 32]) -> [u8; 32] {
-    blake3_concat(h_a, hash_routing)
-}
-
-/// The four MoE routing sub-hashes (mirrors
-/// `ai-pow::fiat_shamir::MoeRoutingCommitment`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeCommitment {
     pub routing_root: [u8; 32],
@@ -58,24 +48,40 @@ pub struct MoeCommitment {
     pub hash_activations: [u8; 32],
 }
 
-/// Full MoE routing commitment from the canonical routing byte strings (LE `u32`
-/// `routing_data` / `routing_offsets`; see
-/// `ai-pow::pearl_moe_routing::RoutingData`) and the job key.
-pub fn moe_commitment(
-    job_key: &[u8; 32],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeV3Reference {
+    pub commitment: MoeCommitment,
+    pub s_a: [u8; 32],
+    pub s_b: [u8; 32],
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn moe_v3_reference(
+    kappa: &[u8; 32],
     h_a: &[u8; 32],
+    h_b: &[u8; 32],
+    m: u32,
+    n_e: u32,
     routing_data_le: &[u8],
     routing_offsets_le: &[u8],
-) -> MoeCommitment {
-    let routing_root = keyed_matrix_commitment(routing_data_le, job_key);
-    let hash_offsets = keyed_matrix_commitment(routing_offsets_le, job_key);
-    let hash_routing = combine_routing(&routing_root, &hash_offsets);
-    let hash_activations = combine_activations(h_a, &hash_routing);
-    MoeCommitment {
-        routing_root,
-        hash_offsets,
-        hash_routing,
-        hash_activations,
+) -> MoeV3Reference {
+    let routing_root = keyed_matrix_commitment(routing_data_le, kappa);
+    let hash_offsets = keyed_matrix_commitment(routing_offsets_le, kappa);
+    let hash_routing = hash_pair(&routing_root, &hash_offsets);
+    let a_bound = bind_root(&SEED_SALT_A, h_a, m);
+    let hash_activations = hash_pair(&a_bound, &hash_routing);
+    let b_bound = bind_root(&SEED_SALT_B, h_b, n_e);
+    let s_b = hash_pair(kappa, &b_bound);
+    let s_a = hash_pair(&s_b, &hash_activations);
+    MoeV3Reference {
+        commitment: MoeCommitment {
+            routing_root,
+            hash_offsets,
+            hash_routing,
+            hash_activations,
+        },
+        s_a,
+        s_b,
     }
 }
 
@@ -83,52 +89,39 @@ pub fn moe_commitment(
 mod tests {
     use super::*;
 
-    /// Self-consistency: the composed helper matches an inline recomputation, and
-    /// each input binds. (The cross-crate byte-equivalence to `ai-pow` lives in
-    /// `ai-pow`'s `fiat_shamir` tests under `--features zk`.)
     #[test]
-    fn moe_commitment_composes_and_binds() {
-        let job_key = [0x11u8; 32];
+    fn moe_v3_reference_binds_roots_dimensions_and_routing() {
+        let kappa = [0x11u8; 32];
         let h_a = [0x22u8; 32];
-        let rd: Vec<u8> = (0u32..40).flat_map(|v| v.to_le_bytes()).collect();
-        let ro: Vec<u8> = [10u32, 20, 30, 40]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
+        let h_b = [0x33u8; 32];
+        let routing_data: Vec<u8> = (0u32..40).flat_map(u32::to_le_bytes).collect();
+        let routing_offsets: Vec<u8> = [10u32, 20, 30, 40]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
             .collect();
-        let c = moe_commitment(&job_key, &h_a, &rd, &ro);
-
-        let rr = keyed_matrix_commitment(&rd, &job_key);
-        let ho = keyed_matrix_commitment(&ro, &job_key);
-        assert_eq!(c.routing_root, rr);
-        assert_eq!(c.hash_offsets, ho);
-        assert_eq!(c.hash_routing, combine_routing(&rr, &ho));
-        assert_eq!(
-            c.hash_activations,
-            combine_activations(&h_a, &c.hash_routing)
+        let base = moe_v3_reference(
+            &kappa, &h_a, &h_b, 192, 320, &routing_data, &routing_offsets,
         );
 
-        // Each input binds hash_activations.
-        let base = c.hash_activations;
-        let mut rd2 = rd.clone();
-        rd2[0] ^= 1;
         assert_ne!(
             base,
-            moe_commitment(&job_key, &h_a, &rd2, &ro).hash_activations
+            moe_v3_reference(&kappa, &h_a, &h_b, 193, 320, &routing_data, &routing_offsets)
         );
-        let mut ro2 = ro.clone();
-        ro2[0] ^= 1;
         assert_ne!(
             base,
-            moe_commitment(&job_key, &h_a, &rd, &ro2).hash_activations
+            moe_v3_reference(&kappa, &h_a, &h_b, 192, 321, &routing_data, &routing_offsets)
         );
-        let mut jk2 = job_key;
-        jk2[0] ^= 1;
-        assert_ne!(base, moe_commitment(&jk2, &h_a, &rd, &ro).hash_activations);
-        let mut ha2 = h_a;
-        ha2[0] ^= 1;
+        let mut reordered = routing_data.clone();
+        reordered[..8].reverse();
         assert_ne!(
             base,
-            moe_commitment(&job_key, &ha2, &rd, &ro).hash_activations
+            moe_v3_reference(&kappa, &h_a, &h_b, 192, 320, &reordered, &routing_offsets)
+        );
+        let mut changed_offsets = routing_offsets.clone();
+        changed_offsets[0] ^= 1;
+        assert_ne!(
+            base,
+            moe_v3_reference(&kappa, &h_a, &h_b, 192, 320, &routing_data, &changed_offsets)
         );
     }
 }

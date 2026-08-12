@@ -198,12 +198,13 @@ which would make every block at such a target unminable rather than easy.
 AI-PoW is the Pearl proof-of-useful-work puzzle (whitepaper §4). Per mining
 attempt, a miner:
 
-1. Derives per-attempt transcript commitments from the block commitment and an
-   extranonce (the header timestamp): `κ = BLAKE3(σ‖μ)`, matrix commitments
-   `H_A`/`H_B = BLAKE3(pad, key=κ)`, and noise seeds
-   `s_B = BLAKE3(κ‖H_B)`, `s_A = BLAKE3(s_B‖H_A)`. The noise is commitment-keyed,
-   so each attempt forces a *fresh* noised matmul — there is no extra nonce that
-   lets a miner skip the inference.
+1. Derives `κ = BLAKE3(σ‖μ)` and nonce-keyed matrix commitments `H_A` and
+   `H_B`. Pearl certificate V3 binds each root and its little-endian dimension
+   under a fixed salt: `A' = BLAKE3(H_A‖LE(m)‖0^224, key=SEED_SALT_A)` and
+   `B' = BLAKE3(H_B‖LE(n)‖0^224, key=SEED_SALT_B)`. Dense derives
+   `s_B = BLAKE3(κ‖B')`, `s_A = BLAKE3(s_B‖A')`; MoE replaces the dense
+   A-side input with the canonical routing splice. Every extranonce binds fresh
+   noised-matmul work.
 2. Runs the noised INT8 tiled matmul over its own (miner-chosen, Pearl-parity)
    `A`/`B` matrices and computes each tile's keyed-hash *jackpot*
    `= keyed_hash(tile_state, s_A)`.
@@ -508,11 +509,11 @@ structurally valid across the boundary.
   enforces exactly one `NOCKCHAIN-AI-POW-AUX` tag in the Pearl coinbase, and the
   aux commitment must equal the consensus block commitment — so a single Pearl
   PoW binds exactly one Nockchain commitment (no two-forks-from-one-PoW).
-- **Fresh inference per attempt.** The noise is commitment-keyed
-  (`s_A`/`s_B` derived from `κ`/`H_A`/`H_B`), so changing the extranonce forces a
-  fresh noised matmul; there is no separate nonce that lets a miner skip
-  inference. Matrices are miner-chosen (arbitrary model, Pearl parity) but bound
-  in-circuit to the committed `H_A`/`H_B` (dense) or routing/jackpot (MoE).
+- **Fresh inference per attempt.** Pearl certificate V3 derives `s_A` and
+  `s_B` from `κ`, the keyed matrix commitments, their dimensions, and, for MoE,
+  the routing splice. Changing the extranonce forces a fresh noised matmul.
+  Matrices are miner-chosen (arbitrary model, Pearl parity) but bound in-circuit
+  to `H_A`/`H_B` (dense) or routing/jackpot (MoE).
 - **Cache-thrash DoS.** `trace_height` is an attacker-controlled cert field and a
   cache miss triggers a synchronous disk page-in before proof rejection. The default
   LRU cap covers all 13 committed shape keys across seven trace heights, so each
