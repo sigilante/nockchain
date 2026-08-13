@@ -115,13 +115,15 @@
       ^-  kernel-state-11:dk
       =/  cleaned-c=consensus-state-10:dk
         (reject-post-zoe-pending-pages-10 c.arg)
+      =/  current-constants=blockchain-constants:t
+        (upgrade-pre-ai-constants constants.arg)
       =/  upgraded=kernel-state-11:dk
         :*  %11
             c=cleaned-c
             a=a.arg
             m=m.arg(candidate-block *page:t, candidate-acc *tx-acc:t)
             d=d.arg
-            constants=constants.arg
+            constants=current-constants
         ==
       =/  accepted-tip-height=(unit page-number:t)
         ?~  heaviest-block.c.arg  ~
@@ -140,7 +142,7 @@
         (~(has h-by min-timestamps.c.arg) u.heaviest-block.c.arg)
       =/  dynamic-cache-ready=?
         ?~  accepted-tip-height  %.y
-        ?:  (lth u.accepted-tip-height phase.zk-asert.constants.arg)
+        ?:  (lth u.accepted-tip-height asert-phase.constants.arg)
           %.y
         =/  timestamps=(unit (h-map block-id:t @))
           (~(get by asert-anchor-min-timestamps.c.arg) %zk)
@@ -148,7 +150,7 @@
         (~(has h-by u.timestamps) (need heaviest-block.c.arg))
       =/  before-ai=?
         ?~  accepted-tip-height  %.y
-        (lth u.accepted-tip-height ai-pow-activation-height.constants.arg)
+        (lth u.accepted-tip-height ai-pow-activation-height.current-constants)
       ?:  ?&  accepted-state-readable
               !crossed-zoe
               min-timestamp-ready
@@ -159,6 +161,69 @@
       ~>  %slog.[1 'load: State requires reset before version-11 migration']
       (reset-consensus-state-11 upgraded)
     ::
+    ++  upgrade-pre-ai-constants
+      |=  old=blockchain-constants-v1-pre-ai:dk
+      ^-  blockchain-constants:t
+      =/  current=blockchain-constants:t  *blockchain-constants:t
+      :*  v1-phase.old
+          bythos-phase.old
+          data.old
+          base-fee.old
+          input-fee-divisor.old
+          :*  max-block-size.old
+              blocks-per-epoch.old
+              target-epoch-duration.old
+              update-candidate-interval.old
+              max-future-timestamp.old
+              min-past-blocks.old
+              genesis-target-atom.old
+              max-target-atom.old
+              check-pow-flag.old
+              coinbase-timelock-min.old
+              pow-len.old
+              max-coinbase-split.old
+              first-month-coinbase-min.old
+          ==
+          :*  asert-phase.old
+              asert-anchor-height.old
+              asert-anchor-target-atom.old
+              asert-ideal-block-time.old
+              asert-half-life.old
+              asert-anchor-min-timestamp.old
+          ==
+          zk-asert-post-ai.current
+          ai-pow-activation-height.current
+          ai-asert.current
+      ==
+    ++  freeze-pre-ai-constants
+      |=  current=blockchain-constants:t
+      ^-  blockchain-constants-v1-pre-ai:dk
+      :*  v1-phase.current
+          bythos-phase.current
+          data.current
+          base-fee.current
+          input-fee-divisor.current
+          :*  max-block-size.current
+              blocks-per-epoch.current
+              target-epoch-duration.current
+              update-candidate-interval.current
+              max-future-timestamp.current
+              min-past-blocks.current
+              genesis-target-atom.current
+              max-target-atom.current
+              check-pow-flag.current
+              coinbase-timelock-min.current
+              pow-len.current
+              max-coinbase-split.current
+              first-month-coinbase-min.current
+          ==
+          phase.zk-asert.current
+          anchor-height.zk-asert.current
+          anchor-target-atom.zk-asert.current
+          ideal-block-time.zk-asert.current
+          half-life.zk-asert.current
+          anchor-min-timestamp.zk-asert.current
+      ==
     ::  State 12 records proof and per-puzzle metadata. Valid state 11 is
     ::  represented by the version-12 schema without reapplying Zoe's boundary.
     ++  state-11-to-12
@@ -225,7 +290,7 @@
           a=a.arg
           m=m.arg
           d=d.arg
-          constants=constants.arg
+          constants=(freeze-pre-ai-constants constants.arg)
       ==
 
     ::  upgrade kernel state 8 to kernel state 9

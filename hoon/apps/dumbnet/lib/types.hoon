@@ -137,6 +137,23 @@
       asert-half-life=@
   ==
 ::
+::  Frozen pre-AI snapshot of blockchain-constants:v1. State 10 was serialized
+::  before the per-puzzle schedules replaced these six flat ASERT fields.
++$  blockchain-constants-v1-pre-ai
+  $:  v1-phase=@
+      bythos-phase=@
+      data=[max-size=@ min-fee=@]
+      base-fee=@
+      input-fee-divisor=@
+      blockchain-constants:v0:dt
+      asert-phase=@
+      asert-anchor-height=@
+      asert-anchor-target-atom=@
+      asert-ideal-block-time=@
+      asert-half-life=@
+      asert-anchor-min-timestamp=@
+  ==
+::
 ::  kernel-state-7 originally had the same shape as kernel-state-6 but
 ::  tracked the schema change in blockchain-constants:v1: five ASERT fields
 ::  (asert-phase, anchor-height, anchor-target-atom, ideal-block-time,
@@ -180,7 +197,7 @@
       constants=blockchain-constants:v1:dt
   ==
 :::
-::  kernel-state-10 records scheduled re-anchor median timestamps per accepted branch.
+::  Kernel state 10 carries the pre-AI constants shape.
 +$  kernel-state-10
   $:  %10
       c=consensus-state-10
@@ -188,7 +205,7 @@
       m=mining-state-9
     ::
       d=derived-state-9
-      constants=blockchain-constants:v1:dt
+      constants=blockchain-constants-v1-pre-ai
   ==
 ::
 ::  Kernel state 11 marks adoption of Zoe's proof and ASERT cutover semantics.

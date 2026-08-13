@@ -14,6 +14,37 @@
 |_  constants=_bc-no-timelock:helpers
 +*  t  ~(. tx-engine constants)
     h  ~(. helpers constants)
+    pre-ai-constants  |=(bc=blockchain-constants:t `blockchain-constants-v1-pre-ai`(snip-pre-ai-constants bc))
+::
+++  snip-pre-ai-constants
+  |=  bc=blockchain-constants:t
+  ^-  blockchain-constants-v1-pre-ai
+  :*  v1-phase.bc
+      bythos-phase.bc
+      data.bc
+      base-fee.bc
+      input-fee-divisor.bc
+      :*  max-block-size.bc
+          blocks-per-epoch.bc
+          target-epoch-duration.bc
+          update-candidate-interval.bc
+          max-future-timestamp.bc
+          min-past-blocks.bc
+          genesis-target-atom.bc
+          max-target-atom.bc
+          check-pow-flag.bc
+          coinbase-timelock-min.bc
+          pow-len.bc
+          max-coinbase-split.bc
+          first-month-coinbase-min.bc
+      ==
+      phase.zk-asert.bc
+      anchor-height.zk-asert.bc
+      anchor-target-atom.zk-asert.bc
+      ideal-block-time.zk-asert.bc
+      half-life.zk-asert.bc
+      anchor-min-timestamp.zk-asert.bc
+  ==
 ::
 ++  test-zoe-proof-version-3-activation-boundary
   =/  con  ~(. dcon initial-consensus-state:h constants)
@@ -238,7 +269,7 @@
         a=a.current
         m=m.current
         d=d.current
-        constants=constants.current
+        constants=pre-ai-constants
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   %+  expect-eq
@@ -287,7 +318,7 @@
         a=a.current
         m=m.current
         d=d.current
-        constants=constants.current
+        constants=pre-ai-constants
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   ::  The Zoe anchor carries the height-112500 target forward rather than
@@ -361,7 +392,7 @@
         a=a.current
         m=m.current
         d=d.current
-        constants=constants.current
+        constants=pre-ai-constants
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   %+  expect-eq
@@ -385,7 +416,7 @@
         a=a.current
         m=m.current
         d=d.current
-        constants=constants.current
+        constants=pre-ai-constants
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   %+  expect-eq
@@ -443,7 +474,7 @@
         a=a.current
         m=m.current
         d=d.current
-        constants=constants.current
+        constants=pre-ai-constants
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   %+  expect-eq
@@ -501,7 +532,7 @@
         a=a.mixed
         m=m.mixed
         d=d.mixed
-        constants=constants.mixed
+        constants=(snip-pre-ai-constants constants.mixed)
     ==
   =/  loaded=kernel-state  (load:inner:dumb legacy)
   %+  expect-eq

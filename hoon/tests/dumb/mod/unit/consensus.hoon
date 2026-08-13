@@ -88,6 +88,16 @@
     !>  [%.y %.y %.y]
   !>  [len-check height-check id-check]
 :::
+++  test-state-12-loads-frozen-pre-ai-state
+  =/  legacy=kernel-state-10  *kernel-state-10
+  =/  loaded=kernel-state  (load:inner:dumb legacy)
+  %+  expect-eq
+    !>  [%12 %.y 0]
+    !>  :*  -.loaded
+            ?=(~ heaviest-block.c.loaded)
+            ~(wyt h-by blocks.c.loaded)
+        ==
+::
 ++  test-state-12-loads-frozen-zoe-state
   =/  legacy=kernel-state-11  *kernel-state-11
   =/  loaded=kernel-state  (load:inner:dumb legacy)
