@@ -1425,7 +1425,7 @@ impl CompositeTrace {
     ///
     /// Constraints satisfied by this write (all are existing
     /// per-row chip constraints, no new AIR work in this helper):
-    /// - anchored URange8 on UINT8_DATA[0] when IS_MSG_MAT=1
+    /// - URange8 on every UINT8_DATA byte when IS_MSG_MAT=1
     /// - IRange8 on MAT_UNPACK[0..64] (signed bytes ∈ [-128, 127])
     /// - i8u8 bus: MAT_UNPACK[i] (i8) ↔ UINT8_DATA[i] (u8) when IS_MSG_MAT=1
     /// - Input chip: NOISED_PACKED[i] = polyval(MAT_UNPACK[..]) + polyval(NOISE_UNPACK[..])
@@ -2787,9 +2787,7 @@ impl CompositeTrace {
     /// holds that value.
     ///
     /// The current implementation handles four range buses:
-    ///   * `urange8` — anchored UINT8_DATA[0] query; remaining
-    ///     UINT8_DATA validity is implied by `irange8(MAT_UNPACK)` +
-    ///     `i8u8`.
+    ///   * `urange8` — every UINT8_DATA byte on IS_MSG_MAT rows.
     ///   * `urange13` — MAT_ID_LIMBS[0..2] + AB_ID_LIMBS[0..4]
     ///     unconditionally.
     ///   * `irange7p1` — NOISE_UNPACK[0..64] unconditionally.
@@ -2809,18 +2807,19 @@ impl CompositeTrace {
         let n = self.height();
 
         // ---- URange8 (u8 ∈ [0, 256)) ----
-        // One anchored query on UINT8_DATA[0] when IS_MSG_MAT=1. The
-        // other 63 bytes are checked by IRANGE8(MAT_UNPACK) + I8U8,
-        // so repeating u8 range queries for them only widens the
-        // permutation trace.
+        // Every UINT8_DATA byte on IS_MSG_MAT rows is queried. The i8u8
+        // pack alone cannot pin the pair (kernel move: MAT_UNPACK − t,
+        // UINT8_DATA + 256t), so all 64 bytes need the range check.
         let mut u8_count = [0u64; 256];
         for r in 0..n {
             let base = r * TOTAL_TRACE_WIDTH;
             let is_msg_mat = self.matrix.values[base + IS_MSG_MAT].as_canonical_u64();
             if is_msg_mat == 1 {
-                let v = self.matrix.values[base + UINT8_DATA_START].as_canonical_u64();
-                if (v as usize) < 256 {
-                    u8_count[v as usize] += 1;
+                for i in 0..UINT8_DATA_WIN {
+                    let v = self.matrix.values[base + UINT8_DATA_START + i].as_canonical_u64();
+                    if (v as usize) < 256 {
+                        u8_count[v as usize] += 1;
+                    }
                 }
             }
         }

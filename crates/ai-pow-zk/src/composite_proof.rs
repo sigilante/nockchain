@@ -387,6 +387,16 @@ pub fn composite_prove_pinned_logup_sx_with_common(
     use p3_batch_stark::{prove_batch, ProverData, StarkInstance};
 
     trace.populate_lookup_freq();
+
+    // Test-only adversarial seam: lets a malicious-prover simulation adjust
+    // free witness columns (e.g. lookup frequency cells) after the honest
+    // population, without touching the proving algorithm itself.
+    #[cfg(any(test, feature = "test-support"))]
+    POST_POPULATE_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f(&mut trace);
+        }
+    });
     let program = extract_program(&trace.matrix);
     let air =
         crate::composite_full_air_with_lookups::CompositeFullAirWithLookupsPinned::try_new_with(
@@ -3046,4 +3056,20 @@ mod tests {
             },
         );
     }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    static POST_POPULATE_HOOK: std::cell::RefCell<Option<Box<dyn Fn(&mut CompositeTrace)>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_post_populate_hook(f: Box<dyn Fn(&mut CompositeTrace)>) {
+    POST_POPULATE_HOOK.with(|h| *h.borrow_mut() = Some(f));
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub fn clear_post_populate_hook() {
+    POST_POPULATE_HOOK.with(|h| *h.borrow_mut() = None);
 }

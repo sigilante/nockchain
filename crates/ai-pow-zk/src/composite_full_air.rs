@@ -837,10 +837,12 @@ impl<AB: AirBuilder> Air<AB> for CompositeFullAir {
         // not the C3 binding.
         //   g·(BLAKE3_MSG[w] − Σ_{b<4} UINT8_DATA[4w+b]·256^b)=0,
         //   w ∈ 0..16  (degree 3, matching the original C3 degree).
-        // ZERO-BLAST: g = IS_MSG_MAT·IS_NEW_BLAKE = 0 on every
-        // current trace (nothing co-locates yet) ⇒ all 16 terms
-        // ×g = 0 ⇒ vacuous, byte-identical. Activation flips g=1
-        // on the co-located leaf rows (its own staged landing).
+        // Live binding: on the 16|r co-located leaf rows the trace
+        // writer sets g = IS_MSG_MAT·IS_NEW_BLAKE = 1 (every
+        // production shape has 16|r), so the 16 terms bind the whole
+        // committed block to BLAKE3_MSG. The byte-level pin on each
+        // UINT8_DATA byte comes from the per-byte `urange8` queries;
+        // this constraint alone allows carry-canceling byte pairs.
         let base256 = <AB::F as PrimeCharacteristicRing>::from_i32(256);
         for w in 0..(UINT8_DATA_LEN / 4) {
             // recomposed_w = Σ_{b<4} UINT8_DATA[4w+b]·256^b

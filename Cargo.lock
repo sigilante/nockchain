@@ -64,6 +64,7 @@ dependencies = [
  "blake3",
  "criterion",
  "num-bigint",
+ "p3-field",
  "proptest",
  "rayon",
  "sha2 0.10.9",

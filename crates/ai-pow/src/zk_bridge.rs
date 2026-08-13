@@ -8381,6 +8381,136 @@ mod tests {
         );
     }
 
+    /// **Two-byte kernel-move adversarial test.** On a co-located leaf row
+    /// (IS_MSG_MAT=1 && IS_NEW_BLAKE=1), a two-byte word-local move —
+    /// kernel byte (MAT_UNPACK -= 1, UINT8_DATA += 256, i8u8 pack invariant)
+    /// plus same-word table-hop byte (both views -= 1) — cancels in the
+    /// base-256 BLAKE3 recomposition, keeping HASH_A fixed, while changing
+    /// NOISED_PACKED and therefore the matmul store. Soundness rests on the
+    /// per-byte `urange8` queries: UINT8_DATA[4] = u4 + 256 > 255 has no
+    /// table entry, the bus cannot balance, and the proof MUST be rejected.
+    #[test]
+    fn sec_uint8_data_two_byte_kernel_move_rejected_by_urange8_logup() {
+        use ai_pow_zk::composite_layout::{
+            I8U8_FREQ, IS_MSG_MAT, IS_NEW_BLAKE, MAT_UNPACK_START, NOISED_PACKED_START,
+            TOTAL_TRACE_WIDTH, UINT8_DATA_START,
+        };
+        use ai_pow_zk::composite_proof::{clear_post_populate_hook, set_post_populate_hook};
+        use ai_pow_zk::composite_trace::CompositeTrace as CT;
+        use ai_pow_zk::Val;
+        use p3_field::integers::QuotientMap;
+        use p3_field::PrimeField64;
+
+        use crate::synth::synth_matrices;
+
+        let params = MatmulParams {
+            m: 16,
+            k: 1024,
+            n: 16,
+            noise_rank: 64, // production-envelope-legal: 32 <= 64, 16r=1024 <= k=1024 <= 4r^2
+            tile: 8,
+            spot_checks: 2,
+            difficulty_bits: 0,
+        };
+        params.validate().unwrap();
+        params
+            .validate_prod_envelope()
+            .expect("params must pass the production envelope");
+        let (a, b) = synth_matrices(b"fused-poc-commit", &params);
+        // Kernel byte (col 4) needs headroom in int7; hop byte (col 5) must stay
+        // canonical (value >= 1). Row 0, word 1 (cols 4,5).
+        let a4 = a[4] as i64;
+        let a5 = a[5] as i64;
+        let u4 = a4.rem_euclid(256); // canonical u8 of the committed byte
+        let u5 = a5.rem_euclid(256);
+        assert!(
+            a4 - 1 >= -64 && a5 - 1 >= -64 && u5 >= 1,
+            "seed lacks headroom at cols 4,5: a4={a4} a5={a5}"
+        );
+
+        let ctx = BlockContext::build(b"fused-poc-blk", TEST_NONCE, &a, &b, &params).expect("ctx");
+        let target = [0xffu8; 32]; // difficulty_bits=0 => easy target
+
+        // Honest full mining proof: matmul on committed `a`.
+        clear_post_populate_hook();
+        let honest =
+            prove_and_verify_tiled_full(&ctx, &params, TEST_NONCE, &target, 0, 0, |_| {}, None)
+                .expect("honest full mining proof must verify");
+        let j0 = honest.pis.hash_jackpot;
+
+        // a' = committed a with the two-byte kernel move (cols 4,5 of row 0).
+        let mut a_prime = a.clone();
+        a_prime[4] -= 1;
+        a_prime[5] -= 1;
+
+        // Malicious i8u8 frequency: byte 4's pack = P(sigma=a4) stays a valid
+        // table entry, but the honest helper drops the non-canonical pair.
+        let freq_row = (a4 + 128) as usize;
+        set_post_populate_hook(Box::new(move |t: &mut CT| {
+            let cell = freq_row * TOTAL_TRACE_WIDTH + I8U8_FREQ;
+            let cur = t.matrix.values[cell].as_canonical_u64();
+            t.matrix.values[cell] = <Val as QuotientMap<u64>>::from_int(cur + 1);
+        }));
+
+        // Tamper: make the co-located leaf producer (A block 0) carry a' on the
+        // matmul view + NOISED_PACKED, while UINT8_DATA aliases to hold BLAKE3_MSG.
+        let res = prove_and_verify_tiled_full(
+            &ctx,
+            &params,
+            TEST_NONCE,
+            &target,
+            0,
+            0,
+            move |trace: &mut CT| {
+                let n = trace.height();
+                let row = (0..n)
+                    .find(|&r| {
+                        let base = r * TOTAL_TRACE_WIDTH;
+                        trace.matrix.values[base + IS_MSG_MAT].as_canonical_u64() == 1
+                            && trace.matrix.values[base + IS_NEW_BLAKE].as_canonical_u64() == 1
+                    })
+                    .expect("a live C3 leaf row exists");
+                let base = row * TOTAL_TRACE_WIDTH;
+                // sanity (field-space): first live-C3 leaf carries committed A block 0.
+                assert_eq!(
+                    trace.matrix.values[base + MAT_UNPACK_START + 4],
+                    <Val as QuotientMap<i64>>::from_int(a4),
+                    "first live-C3 leaf must carry committed A[4]"
+                );
+                assert_eq!(
+                    trace.matrix.values[base + MAT_UNPACK_START + 5],
+                    <Val as QuotientMap<i64>>::from_int(a5),
+                    "first live-C3 leaf must carry committed A[5]"
+                );
+                // byte 4 (kernel): MAT_UNPACK -= 1 (== a'), UINT8_DATA += 256 (>255).
+                trace.matrix.values[base + MAT_UNPACK_START + 4] =
+                    <Val as QuotientMap<i64>>::from_int(a4 - 1);
+                trace.matrix.values[base + UINT8_DATA_START + 4] =
+                    <Val as QuotientMap<i64>>::from_int(u4 + 256);
+                // byte 5 (table-hop): MAT_UNPACK -= 1, UINT8_DATA -= 1 (canonical).
+                trace.matrix.values[base + MAT_UNPACK_START + 5] =
+                    <Val as QuotientMap<i64>>::from_int(a5 - 1);
+                trace.matrix.values[base + UINT8_DATA_START + 5] =
+                    <Val as QuotientMap<i64>>::from_int(u5 - 1);
+                // NOISED_PACKED[1] (cell of bytes 4..7) -= 257 in the field == the a' producer value.
+                let cell = base + NOISED_PACKED_START + 1;
+                let old = trace.matrix.values[cell];
+                trace.matrix.values[cell] = old - <Val as QuotientMap<i64>>::from_int(257);
+            },
+            Some((&a_prime, &b)),
+        );
+        clear_post_populate_hook();
+
+        assert!(
+            res.is_err(),
+            "the two-byte kernel move desyncs the matmul view from the \
+             committed bytes (HASH_A unchanged); the per-byte urange8 \
+             queries MUST reject it. If this verifies, the matmul matrix \
+             is not bound to the block commitment."
+        );
+        let _ = j0;
+    }
+
     /// The position-permutation adversarial for the **non-contiguous**
     /// opening (the MoE `outer_indices`
     /// shape). The sweep indexes the opened pattern rows via covering-

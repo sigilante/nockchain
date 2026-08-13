@@ -26,6 +26,7 @@ proptest = { workspace = true }
 num-bigint = { workspace = true }
 ai-pow = { path = ".", features = ["diagnostics"] }
 ai-pow-zk = { path = "../ai-pow-zk", features = ["dev-unsafe", "test-support"] }
+p3-field = { git = "https://github.com/Plonky3/Plonky3.git", rev = "11cc5849a1b57a2f520d6edc608b9e516517d841" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-tracy = { workspace = true }

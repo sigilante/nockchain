@@ -24,10 +24,9 @@
 //!     cells emits the queries.
 //!
 //! For matrix-message rows, `UINT8_DATA` byte validity is enforced
-//! through the paired `i8u8` bus plus `irange8(MAT_UNPACK)`. The
-//! standalone `urange8` bus keeps one byte query as a compatibility
-//! anchor for the recursive verifier's lookup shape, but does not pay
-//! the 63 redundant extra query interactions.
+//! through per-byte `urange8` queries plus the paired `i8u8` bus;
+//! the range check is what pins each byte, since the `i8u8` pack is
+//! invariant under (MAT_UNPACK − t, UINT8_DATA + 256t).
 //!
 //! ## What this gives us
 //!
@@ -209,10 +208,11 @@ mod bus_emit {
     /// `urange8` bus — u8 range check `[0, 256)`.
     ///
     /// Table: (URANGE8_TABLE, −URANGE8_FREQ).
-    /// Queries: `UINT8_DATA[0]` gated by IS_MSG_MAT. The remaining
-    /// bytes' u8 validity is implied by `IRANGE8(MAT_UNPACK)` plus
-    /// the `i8u8` conversion table on `IS_MSG_MAT` rows, so the other
-    /// 63 standalone u8 queries are redundant.
+    /// Queries: `UINT8_DATA[0..UINT8_DATA_WIN]` gated by IS_MSG_MAT.
+    /// Every byte needs its own query: the `i8u8` pack
+    /// `256·MAT_UNPACK + UINT8_DATA` is invariant under the kernel
+    /// move (MAT_UNPACK − t, UINT8_DATA + 256t), so only the u8 range
+    /// check pins each (MAT_UNPACK[i], UINT8_DATA[i]) pair.
     pub fn urange8<AB: AirBuilder + InteractionBuilder>(builder: &mut AB) {
         let main = builder.main();
         let cur = main.current_slice();
@@ -221,11 +221,13 @@ mod bus_emit {
             [<AB::Var as Into<AB::Expr>>::into(cur[URANGE8_TABLE])],
             Count::bounded(-<AB::Var as Into<AB::Expr>>::into(cur[URANGE8_FREQ]), 0),
         );
-        builder.push_interaction(
-            BUS_URANGE8,
-            [<AB::Var as Into<AB::Expr>>::into(cur[UINT8_DATA_START])],
-            Count::bounded(<AB::Var as Into<AB::Expr>>::into(cur[IS_MSG_MAT]), 1),
-        );
+        for i in 0..UINT8_DATA_WIN {
+            builder.push_interaction(
+                BUS_URANGE8,
+                [<AB::Var as Into<AB::Expr>>::into(cur[UINT8_DATA_START + i])],
+                Count::bounded(<AB::Var as Into<AB::Expr>>::into(cur[IS_MSG_MAT]), 1),
+            );
+        }
     }
 
     /// `urange13` bus — u13 range check `[0, 8192)`.
