@@ -1193,6 +1193,68 @@ mod tests {
     }
 
     #[test]
+    fn decode_page_from_peek_accepts_structured_pow() {
+        use nockapp::noun::NounJamExt;
+        use nockchain_math::belt::Belt;
+        use nockchain_types::tx_engine::common::{BigNum, CoinbaseSplit, Hash};
+        use noun_serde::NounEncode;
+
+        let page = Page {
+            digest: Hash([Belt(1), Belt(2), Belt(3), Belt(4), Belt(5)]),
+            pow: None,
+            parent: Hash([Belt(6), Belt(7), Belt(8), Belt(9), Belt(10)]),
+            tx_ids: Vec::new(),
+            coinbase: CoinbaseSplit::V0(Vec::new()),
+            timestamp: 1_717_171,
+            epoch_counter: 42,
+            target: BigNum::from_u64(1_000),
+            accumulated_work: BigNum::from_u64(2_000),
+            height: 77,
+            msg: Vec::new(),
+        };
+
+        let mut slab: NounSlab<NockJammer> = NounSlab::new();
+        let proof_item = nockvm::noun::T(&mut slab, &[nockvm::noun::D(42), nockvm::noun::D(43)]);
+        let proof = nockvm::noun::T(&mut slab, &[proof_item, nockvm::noun::D(0)]);
+        let pow = nockvm::noun::T(&mut slab, &[nockvm::noun::D(0), proof]);
+        let digest = page.digest.to_noun(&mut slab);
+        let parent = page.parent.to_noun(&mut slab);
+        let tx_ids = page.tx_ids.to_noun(&mut slab);
+        let coinbase = page.coinbase.to_noun(&mut slab);
+        let target = page.target.to_noun(&mut slab);
+        let accumulated_work = page.accumulated_work.to_noun(&mut slab);
+        let msg = page.msg.to_noun(&mut slab);
+        let page_noun = nockvm::noun::T(
+            &mut slab,
+            &[
+                nockvm::noun::D(1),
+                digest,
+                pow,
+                parent,
+                tx_ids,
+                coinbase,
+                nockvm::noun::D(page.timestamp),
+                nockvm::noun::D(page.epoch_counter),
+                target,
+                accumulated_work,
+                nockvm::noun::D(page.height),
+                msg,
+            ],
+        );
+        let inner_unit = nockvm::noun::T(&mut slab, &[nockvm::noun::D(0), page_noun]);
+        let peek_noun = nockvm::noun::T(&mut slab, &[nockvm::noun::D(0), inner_unit]);
+        let space = slab.noun_space();
+        let expected_pow = proof.jam_bytes(&space).to_vec();
+
+        let (decoded, _) =
+            decode_page_from_peek(&peek_noun, &space).expect("decode structured proof page");
+
+        assert_eq!(decoded.pow, Some(expected_pow));
+        assert_eq!(decoded.digest, page.digest);
+        assert_eq!(decoded.height, page.height);
+    }
+
+    #[test]
     fn decode_page_from_peek_decodes_tagged_bn_numbers() {
         use nockchain_math::belt::Belt;
         use nockchain_types::tx_engine::common::{CoinbaseSplit, Hash};

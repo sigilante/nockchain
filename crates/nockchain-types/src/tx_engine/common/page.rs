@@ -1,3 +1,4 @@
+use nockapp::noun::NounJamExt;
 use nockvm::ext::AtomExt;
 use nockvm::noun::{Noun, NounAllocator, NounHandle, NounSpace};
 use noun_serde::{NounDecode, NounDecodeError, NounEncode};
@@ -290,8 +291,8 @@ impl NounDecode for Page {
                 (digest, rest_after)
             };
 
-        // POW: (unit proof). The proof payload is opaque to this crate, but
-        // page noun roundtrips must preserve its bytes exactly.
+        // POW: (unit proof). Structured proof payloads are stored as their jam,
+        // matching Hoon's local-page representation.
         let pow_noun = rest_after_digest.head();
         let pow = if pow_noun.is_atom() {
             let atom = pow_noun
@@ -304,8 +305,8 @@ impl NounDecode for Page {
                 Some(atom_payload_bytes(atom))
             }
         } else {
-            // Unit `some`: `[~ proof]`, where this Rust encoder stores
-            // `proof` as a byte list.
+            // Unit `some`: `[~ proof]`. Legacy pages use an atom or byte list;
+            // structured proofs use their canonical jam bytes.
             let cell = pow_noun
                 .as_cell()
                 .map_err(|_| NounDecodeError::Custom("Page.pow: expected cell".into()))?;
@@ -326,11 +327,10 @@ impl NounDecode for Page {
                     .as_atom()
                     .map_err(|_| NounDecodeError::Custom("Page.pow: payload not atom".into()))?;
                 Some(atom_payload_bytes(atom))
+            } else if let Ok(bytes) = Vec::<u8>::from_noun_handle(&payload) {
+                Some(bytes)
             } else {
-                Some(
-                    Vec::<u8>::from_noun_handle(&payload)
-                        .map_err(|e| NounDecodeError::Custom(format!("Page.pow: {}", e)))?,
-                )
+                Some(payload.noun().jam_bytes(space).to_vec())
             }
         };
 
@@ -430,6 +430,7 @@ impl NounDecode for Page {
 #[cfg(test)]
 mod tests {
     use nockapp::noun::slab::NounSlab;
+    use nockapp::noun::NounJamExt;
     use nockchain_math::belt::Belt;
     use nockvm::ext::AtomExt;
     use nockvm::noun::{Atom, NounAllocator};
@@ -468,6 +469,60 @@ mod tests {
         assert_eq!(decoded.digest, page.digest);
         assert_eq!(decoded.parent, page.parent);
         assert_eq!(decoded.msg, page.msg);
+    }
+
+    #[test]
+    fn page_pow_unit_structured_noun_decodes_as_jam_bytes() {
+        let page = Page {
+            digest: test_hash(30),
+            pow: None,
+            parent: test_hash(40),
+            tx_ids: vec![],
+            coinbase: CoinbaseSplit::V0(vec![]),
+            timestamp: 321,
+            epoch_counter: 654,
+            target: BigNum::from_u64(987),
+            accumulated_work: BigNum::from_u64(2_000),
+            height: 43,
+            msg: vec![],
+        };
+
+        let mut slab: NounSlab = NounSlab::new();
+        let proof_item = nockvm::noun::T(&mut slab, &[nockvm::noun::D(42), nockvm::noun::D(43)]);
+        let proof = nockvm::noun::T(&mut slab, &[proof_item, nockvm::noun::D(0)]);
+        let pow = nockvm::noun::T(&mut slab, &[nockvm::noun::D(0), proof]);
+        let digest = page.digest.to_noun(&mut slab);
+        let parent = page.parent.to_noun(&mut slab);
+        let tx_ids = page.tx_ids.to_noun(&mut slab);
+        let coinbase = page.coinbase.to_noun(&mut slab);
+        let timestamp = Atom::new(&mut slab, page.timestamp).as_noun();
+        let epoch_counter = Atom::new(&mut slab, page.epoch_counter).as_noun();
+        let target = page.target.to_noun(&mut slab);
+        let accumulated_work = page.accumulated_work.to_noun(&mut slab);
+        let height = Atom::new(&mut slab, page.height).as_noun();
+        let msg = page.msg.to_noun(&mut slab);
+        let noun = nockvm::noun::T(
+            &mut slab,
+            &[
+                nockvm::noun::D(1),
+                digest,
+                pow,
+                parent,
+                tx_ids,
+                coinbase,
+                timestamp,
+                epoch_counter,
+                target,
+                accumulated_work,
+                height,
+                msg,
+            ],
+        );
+        let space = slab.noun_space();
+        let expected = proof.jam_bytes(&space).to_vec();
+        let decoded = Page::from_noun(&noun, &space).expect("page should decode");
+
+        assert_eq!(decoded.pow, Some(expected));
     }
 
     #[test]
