@@ -22,7 +22,8 @@ static ALLOC: tracy_client::ProfiledAllocator<tikv_jemallocator::Jemalloc> =
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     nockvm::check_endian();
-    let cli = nockchain::NockchainCli::parse_with_default_stack_size(boot::NockStackSize::Large);
+    let mut cli =
+        nockchain::NockchainCli::parse_with_default_stack_size(boot::NockStackSize::Large);
     boot::init_default_tracing(&cli.nockapp_cli);
 
     // Fail fast on invalid CLI config (e.g. a malformed --fakenet-*-asert-* combo)
@@ -51,6 +52,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .data_dir
         .clone()
         .unwrap_or_else(|| nockapp::default_data_dir("nockchain"));
+    cli.nockapp_cli.new_data_dir_allowlist.push("ai-pow".into());
 
     // CLI takes precedence over the environment. Lower caps are an explicit
     // memory-for-latency tradeoff; the default keeps all 13 shape keys resident after
