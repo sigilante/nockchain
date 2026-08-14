@@ -280,6 +280,35 @@ impl PreparedCanonicalMoeTemplate {
         &self.aux_inclusion
     }
 
+    /// Fixed canonical inputs used to derive Pearl V3 commitments on an accelerator.
+    ///
+    /// The returned values are immutable for this template. Attempt-dependent
+    /// values, including `kappa`, matrix commitments, seeds, and noised strips,
+    /// must still be derived for every extranonce.
+    pub fn gpu_inputs(
+        &self,
+    ) -> (
+        &[i8],
+        &[i8],
+        &[u8],
+        &[u8],
+        &[u32],
+        &[u32],
+        [u8; ai_pow::pearl_compat::PEARL_INCOMPLETE_BLOCK_HEADER_SIZE],
+        [u8; ai_pow::pearl_compat::PEARL_MINING_CONFIG_SIZE],
+    ) {
+        (
+            &self.a,
+            &self.b,
+            &self.routing_data,
+            &self.routing_offsets,
+            &self.outer_indices,
+            &self.b_cols_global,
+            self.header.to_bytes(),
+            self.mu,
+        )
+    }
+
     pub fn scratch(&self) -> PreparedCanonicalMoeScratch {
         let k = self.params.k as usize;
         PreparedCanonicalMoeScratch {
@@ -323,12 +352,15 @@ impl PreparedCanonicalMoeTemplate {
         }
     }
 
-    /// Recompute the complete attempt-dependent canonical transcript in reusable storage.
-    pub fn evaluate(
+    /// Recompute attempt-dependent commitments and noised opened strips.
+    ///
+    /// Search backends can upload the resulting strips to an accelerator. The
+    /// storage belongs to `scratch` and is overwritten by the next attempt.
+    pub fn prepare_attempt(
         &self,
         extranonce: u32,
         scratch: &mut PreparedCanonicalMoeScratch,
-    ) -> CanonicalMoeSearchResult {
+    ) -> PearlWorkCommitments {
         let header = self.header_for(extranonce);
         let kappa = pearl_kappa(&header.to_bytes(), &self.mu);
         let (h_a, h_b) = pearl_matrix_commitments(&self.a, &self.b, &kappa);
@@ -355,6 +387,31 @@ impl PreparedCanonicalMoeTemplate {
                 *out = (value as i16 + noise as i16) as i8;
             }
         }
+        PearlWorkCommitments {
+            kappa,
+            h_a,
+            h_b,
+            s_a,
+            s_b,
+        }
+    }
+
+    /// Opened noised strips produced by [`Self::prepare_attempt`].
+    pub fn prepared_strips<'a>(
+        &self,
+        scratch: &'a PreparedCanonicalMoeScratch,
+    ) -> (&'a [i8], &'a [i8]) {
+        (&scratch.a_prime_rows, &scratch.b_prime_cols)
+    }
+
+    /// Recompute the complete attempt-dependent canonical transcript in reusable storage.
+    pub fn evaluate(
+        &self,
+        extranonce: u32,
+        scratch: &mut PreparedCanonicalMoeScratch,
+    ) -> CanonicalMoeSearchResult {
+        let commitments = self.prepare_attempt(extranonce, scratch);
+        let k = self.params.k as usize;
         let tile_state = compute_pattern_tile_state_from_slices(
             &scratch.a_prime_rows,
             &scratch.b_prime_cols,
@@ -365,17 +422,10 @@ impl PreparedCanonicalMoeTemplate {
             k,
             &mut scratch.tile,
         );
-        let commitments = PearlWorkCommitments {
-            kappa,
-            h_a,
-            h_b,
-            s_a,
-            s_b,
-        };
         CanonicalMoeSearchResult {
             commitments,
             tile_state,
-            jackpot_hash: pearl_jackpot_hash(&tile_state, &s_a),
+            jackpot_hash: pearl_jackpot_hash(&tile_state, &commitments.s_a),
         }
     }
 
@@ -676,6 +726,44 @@ pub(crate) fn prove_canonical_moe_block_at_for_miner(
     nock_commit: [u8; 32],
     extranonce: u32,
 ) -> Result<CanonicalBlock, CanonicalProveError> {
+    prove_canonical_moe_block_at_inner(params, hw, e, top_k, nock_commit, extranonce)
+        .map(|(block, _)| block)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prove_canonical_moe_block_at_with_verifier_context(
+    params: &MatmulParams,
+    hw: u32,
+    e: usize,
+    top_k: usize,
+    nock_commit: [u8; 32],
+    extranonce: u32,
+) -> Result<
+    (
+        CanonicalBlock,
+        ai_pow_zk::recursion::AiPowCompactBatchVerifierContext,
+    ),
+    CanonicalProveError,
+> {
+    prove_canonical_moe_block_at_inner(params, hw, e, top_k, nock_commit, extranonce)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prove_canonical_moe_block_at_inner(
+    params: &MatmulParams,
+    hw: u32,
+    e: usize,
+    top_k: usize,
+    nock_commit: [u8; 32],
+    extranonce: u32,
+) -> Result<
+    (
+        CanonicalBlock,
+        ai_pow_zk::recursion::AiPowCompactBatchVerifierContext,
+    ),
+    CanonicalProveError,
+> {
     let CanonicalMoeInputs {
         a,
         b,
@@ -700,7 +788,7 @@ pub(crate) fn prove_canonical_moe_block_at_for_miner(
 
     let PearlMoeCompactProveRun {
         compact_cert,
-        verifier_context: _,
+        verifier_context,
         pis,
         zk_params,
         trace_height,
@@ -748,14 +836,17 @@ pub(crate) fn prove_canonical_moe_block_at_for_miner(
         routing_data: routing.routing_data.clone(),
     };
 
-    Ok(CanonicalBlock {
-        statement,
-        aux_inclusion,
-        moe_art,
-        certificate,
-        commit: nock_commit,
-        jackpot_hash: ticket.jackpot_hash,
-    })
+    Ok((
+        CanonicalBlock {
+            statement,
+            aux_inclusion,
+            moe_art,
+            certificate,
+            commit: nock_commit,
+            jackpot_hash: ticket.jackpot_hash,
+        },
+        verifier_context,
+    ))
 }
 
 #[cfg(test)]
