@@ -5,27 +5,21 @@
 //! effects, searches Pearl-compatible tickets, builds the recursive
 //! certificate only after a Nockchain target hit, and submits
 //! `[%command %pow %ai-pow nonce cert]` on the `AiPowMinerWire::Mined` wire
-//! (`SOURCE = "ai-pow-miner"`, `VERSION = 1`). The production submission path
-//! fails closed for multi-tile configurations until the recursive statement
-//! binds a full-matrix aggregate.
+//! (`SOURCE = "ai-pow-miner"`, `VERSION = 1`).
 //!
-//! Quick start (assuming a fakenet node on `127.0.0.1:5555` and Pearl Gateway
-//! on `/tmp/pearlgw.sock`):
+//! The production CUDA route is `--gpu --canonical`. It searches the fixed
+//! dense Pearl V3 profile across all visible GPUs unless `--cuda-devices`
+//! selects a subset. Scalar Rust recomputes every reported winner before the
+//! host builds the existing compact recursive certificate.
 //!
-//!   ai-pow-mine \
+//!   ai-pow-mine --gpu --canonical \
 //!       --mining-pkh 9yPePjfWAdUnzaQKyxcRXKRa5PpUzKKEwtpECBZsUYt9Jd7egSDEWoV
 //!
-//! The CLI defaults to Pearl-compatible submission with single-tile,
-//! production-envelope smoke parameters for local Layer-0 development. The
-//! Pearl work source is Pearl Gateway miner RPC; the endpoint defaults to the
-//! Unix socket `/tmp/pearlgw.sock`. Use `--pearl-gateway tcp://host:port` for a
-//! TCP gateway or `--pearl-gateway /path/to.sock` for a different Unix socket.
-//! Rewards must be configured with v1 pubkey-hash configs via `--mining-pkh`
-//! or `--mining-pkh-adv`.
-//! The production profile
-//! derives canonical seeds from the nonce-keyed chunk commitments bound by the
-//! recursive proof as `HASH_A` / `HASH_B`; larger production shapes remain
-//! closed until full-matrix aggregation is implemented.
+//! `--canonical` without `--gpu` retains the gateway-free CPU MoE route. Without
+//! `--canonical`, the miner uses the Pearl Gateway route configured by
+//! `--pearl-gateway`.
+//! Rewards use v1 pubkey-hash configs from `--mining-pkh` or
+//! `--mining-pkh-adv`.
 //!
 //! ## AI puzzle inputs (local config)
 //! The chain's `%mine-ai` effect carries the candidate block commitment,
@@ -69,10 +63,10 @@ struct AcceleratorArgs {
     #[arg(long)]
     gpu: bool,
 
-    /// CUDA device ordinal. The current backend supports device 0.
+    /// CUDA device ordinals as a comma-separated list, or `all` for up to eight visible devices.
     #[cfg(feature = "gpu")]
-    #[arg(long, default_value_t = 0)]
-    cuda_device: usize,
+    #[arg(long, default_value = "all")]
+    cuda_devices: String,
 
     /// Attempts dispatched through CUDA before the scheduler checks cancellation.
     #[cfg(feature = "gpu")]
@@ -80,16 +74,43 @@ struct AcceleratorArgs {
     gpu_batch_attempts: u64,
 }
 
+#[cfg(feature = "gpu")]
+fn cuda_device_ordinals(args: &AcceleratorArgs) -> Result<Option<Vec<usize>>, String> {
+    let selection = args.cuda_devices.trim();
+    if selection.eq_ignore_ascii_case("all") {
+        return Ok(None);
+    }
+    let ordinals = selection
+        .split(',')
+        .map(|value| {
+            let value = value.trim();
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid CUDA device ordinal `{value}`"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(ordinals))
+}
+
+#[cfg(feature = "gpu")]
+fn gpu_backend(args: &AcceleratorArgs) -> Result<ai_pow_miner::gpu::MultiGpuSearchBackend, String> {
+    match cuda_device_ordinals(args)? {
+        Some(ordinals) => {
+            ai_pow_miner::gpu::MultiGpuSearchBackend::new(ordinals, args.gpu_batch_attempts)
+        }
+        None => ai_pow_miner::gpu::MultiGpuSearchBackend::all_visible(args.gpu_batch_attempts),
+    }
+    .map_err(|error| error.to_string())
+}
+
 fn search_backend(args: &Args) -> Result<Arc<dyn SearchBackend>, String> {
     #[cfg(feature = "gpu")]
     if args.accelerator.gpu {
-        let backend = ai_pow_miner::gpu::GpuSearchBackend::new(
-            args.accelerator.cuda_device, args.accelerator.gpu_batch_attempts,
-        )
-        .map_err(|error| error.to_string())?;
+        let backend = gpu_backend(&args.accelerator)?;
         info!(
-            cuda_device = backend.device_ordinal(),
-            gpu_batch_attempts = backend.batch_attempts(),
+            cuda_devices = ?backend.device_ordinals(),
+            gpu_batch_attempts_per_device = backend.batch_attempts_per_device(),
+            gpu_batch_attempts_total = backend.batch_attempts(),
             "ai-pow-mine: CUDA search enabled"
         );
         return Ok(MeteredSearchBackend::new("cuda", Arc::new(backend)));
@@ -103,6 +124,42 @@ fn search_backend(args: &Args) -> Result<Arc<dyn SearchBackend>, String> {
             MeteredSearchBackend::new("cpu", Arc::new(backend)) as Arc<dyn SearchBackend>
         })
         .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "gpu")]
+fn run_peak_if_selected(
+    args: &Args,
+    rt: &tokio::runtime::Runtime,
+) -> Result<Option<Result<(), MinerError>>, String> {
+    if !(args.common.canonical && args.accelerator.gpu) {
+        return Ok(None);
+    }
+    let pkh_configs = args
+        .common
+        .mining_pkh_configs()
+        .map_err(|error| format!("{error:#}"))?;
+    let node_addr = args.common.node_addr.clone();
+    let device_ordinals = cuda_device_ordinals(&args.accelerator)?;
+    Ok(Some(rt.block_on(async move {
+        info!(node = %node_addr, "ai-pow-mine: starting peak production miner");
+        let shutdown = CancellationToken::new();
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                info!("ai-pow-mine: SIGINT received; shutting down");
+                shutdown_clone.cancel();
+            }
+        });
+        ai_pow_miner::run::run_peak(node_addr, pkh_configs, shutdown, device_ordinals).await
+    })))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn run_peak_if_selected(
+    _: &Args,
+    _: &tokio::runtime::Runtime,
+) -> Result<Option<Result<(), MinerError>>, String> {
+    Ok(None)
 }
 
 fn main() -> ExitCode {
@@ -120,7 +177,17 @@ fn main() -> ExitCode {
         }
     };
 
-    let result = if args.common.canonical {
+    let peak_result = match run_peak_if_selected(&args, &rt) {
+        Ok(result) => result,
+        Err(error) => {
+            eprintln!("ai-pow-mine: cannot initialize peak miner: {error}");
+            return ExitCode::from(1);
+        }
+    };
+
+    let result = if let Some(result) = peak_result {
+        result
+    } else if args.common.canonical {
         let backend = match search_backend(&args) {
             Ok(backend) => backend,
             Err(error) => {

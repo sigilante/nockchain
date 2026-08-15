@@ -1839,6 +1839,21 @@ fn prove_pearl_moe_l0_and_ticket(
     ))
 }
 
+/// Return the Layer-0 trace height for one dense Pearl tile.
+///
+/// `tile_i` and `tile_j` are zero-based tile indices. The result is the
+/// verifier setup key used by the compact recursive certificate.
+pub fn pearl_dense_canonical_trace_height(
+    params: &MatmulParams,
+    tile_i: u32,
+    tile_j: u32,
+) -> Result<usize, BridgeError> {
+    let zk_params = zk_params_from(params);
+    let schedule = StripIndexSchedule::from_tile(&zk_params, tile_i, tile_j)
+        .map_err(BridgeError::ZkParamsInvalid)?;
+    Ok(expected_layer0_rows_for_strip_schedule(params, &schedule)?.required_trace_len())
+}
+
 /// The Layer-0 trace height a canonical MoE block at this shape WOULD have —
 /// computed WITHOUT proving AND without the (large) synthesized matrices. The
 /// opened schedule (`outer_indices` from routing + `inner_a_rows`; `b_cols_global`
@@ -2995,8 +3010,10 @@ fn prove_ai_pow_scheduled_full_with_context<F: FnOnce(&mut CompositeTrace)>(
     let (a_chunks, a_nc) = indexed_strips_chunk_set(a_indices, kk, a_bytes.len());
     let (_oa, a_sibs) = open_strip_set(a_bytes, &zctx.kappa, &a_chunks);
     let a_strip_bytes = padded_chunk_bytes(a_bytes, &a_chunks);
-    // Producer-key / sweep-lane base = min selected chunk (== the range c0).
+    // First selected chunk and its matrix-row origin for positioned IDs.
     let ca0 = a_chunks[0];
+    let a_lane_base = ai_pow_zk::canonical::covering_id_lane_base("A", ca0, kk)
+        .map_err(BridgeError::ZkParamsInvalid)?;
     // c-exact g=1 co-location: the Pearl `noise_ref`
     // byte parallel to the opened A strip — entry j = noise at the
     // committed matrix position of `a_pad[ca0*1024 + j]` (A is
@@ -3018,15 +3035,15 @@ fn prove_ai_pow_scheduled_full_with_context<F: FnOnce(&mut CompositeTrace)>(
     let b_indices = &strip_schedule.b_indices;
     let (b_chunks, b_nc) = indexed_strips_chunk_set(b_indices, kk, b_bytes.len());
     let cb0 = b_chunks[0];
-    // Bases from the full covering-range lane spans (lane =
-    // index − chunk base), never the tile height — side-disjoint for
-    // scattered openings; identical to the tile-height derivation for
-    // contiguous tiles (span == h_tile).
+    let b_lane_base = ai_pow_zk::canonical::covering_id_lane_base("B", cb0, kk)
+        .map_err(BridgeError::ZkParamsInvalid)?;
+    // Bases cover the selected chunks' matrix-row lanes. The chunk index and
+    // matrix row use different units whenever k != 1024.
     let (a_id_base, b_id_base) = ai_pow_zk::composite_trace::try_noised_id_bases(
-        ai_pow_zk::canonical::covering_id_span("A", a_indices, ca0)
+        ai_pow_zk::canonical::covering_id_span("A", a_indices, ca0, kk)
             .map_err(BridgeError::ZkParamsInvalid)?
             - 1,
-        ai_pow_zk::canonical::covering_id_span("B", b_indices, cb0)
+        ai_pow_zk::canonical::covering_id_span("B", b_indices, cb0, kk)
             .map_err(BridgeError::ZkParamsInvalid)?
             - 1,
         kk,
@@ -3215,19 +3232,17 @@ fn prove_ai_pow_scheduled_full_with_context<F: FnOnce(&mut CompositeTrace)>(
         };
     let real_m = if sx_bound {
         let sweep_start = mh_end + 3;
-        // Opened row/col lanes = covering-range positions (index − chunk
-        // base), matching the strip-opening producer keys and the canonical
-        // program's sweep. Contiguous ⇒ [0,1,…]; non-contiguous carries the
-        // actual opened positions.
+        // Opened row and column lanes are relative to the matrix row at the
+        // selected chunk base. This matches the strip producer's byte origin.
         let a_lanes: Vec<usize> = strip_schedule
             .a_indices
             .iter()
-            .map(|&i| i as usize - ca0)
+            .map(|&i| i as usize - a_lane_base)
             .collect();
         let b_lanes: Vec<usize> = strip_schedule
             .b_indices
             .iter()
-            .map(|&i| i as usize - cb0)
+            .map(|&i| i as usize - b_lane_base)
             .collect();
         let (rows_used, x_steps) = trace.place_useful_work_chain_hw_indexed(
             sweep_start, &a_strips, &b_strips, h_tile, w_tile, r, num_stripes, &a_lanes, &b_lanes,
@@ -3238,25 +3253,20 @@ fn prove_ai_pow_scheduled_full_with_context<F: FnOnce(&mut CompositeTrace)>(
         let xs: Vec<i32> = x_steps[..num_stripes].iter().map(|&u| u as i32).collect();
         trace.place_fold_chain(fold_start, &xs)
     } else {
-        // R-b: stripe-major useful-work chain with the FoldChip row
-        // INTERLEAVED after each stripe's sub-block sweep (one call, no
-        // separate `place_fold_chain`). It returns the FoldChip state M
-        // directly — that IS `real_m`. Uses the EXPLICIT opened lanes
-        // (`index − c_base`, identical to the ≤64 branch), so the
-        // `noised_packed` IDs are correct for ANY opened schedule — non-origin
-        // tiles, Pearl periodic patterns, and MoE `outer_indices` gathers — not
-        // only contiguous-from-origin. Matches the canonical R-b program's
-        // `ids_for`.
+        // The R-b path interleaves one FoldChip row after each stripe's
+        // sub-block sweep. It returns the FoldChip state M directly. Its
+        // explicit lanes use the same matrix-row origins as the bounded stripe
+        // path, so both paths publish identical positioned IDs.
         let sweep_start = mh_end + 3;
         let a_lanes: Vec<usize> = strip_schedule
             .a_indices
             .iter()
-            .map(|&i| i as usize - ca0)
+            .map(|&i| i as usize - a_lane_base)
             .collect();
         let b_lanes: Vec<usize> = strip_schedule
             .b_indices
             .iter()
-            .map(|&i| i as usize - cb0)
+            .map(|&i| i as usize - b_lane_base)
             .collect();
         let (rows_used, m) = trace.place_useful_work_chain_rb_indexed(
             sweep_start, &a_strips, &b_strips, h_tile, w_tile, r, num_stripes, &a_lanes, &b_lanes,
@@ -8595,6 +8605,39 @@ mod tests {
             "non-contiguous: a sweep on a row-permuted committed matrix \
              MUST be rejected by the position-keyed noised_packed bus even for a \
              non-contiguous opened row set."
+        );
+    }
+
+    #[test]
+    fn peak_dense_profile_fits_production_setup_band() {
+        let params = MatmulParams {
+            m: 4096,
+            k: 8192,
+            n: 32768,
+            noise_rank: 512,
+            tile: 16,
+            spot_checks: 1,
+            difficulty_bits: 0,
+        };
+        params
+            .validate_prod_envelope()
+            .expect("peak profile must satisfy the consensus envelope");
+
+        let first = pearl_dense_canonical_trace_height(&params, 0, 0)
+            .expect("first peak tile trace height");
+        let last = pearl_dense_canonical_trace_height(
+            &params,
+            params.row_tiles() - 1,
+            params.col_tiles() - 1,
+        )
+        .expect("last peak tile trace height");
+
+        assert_eq!(first, 1 << 17, "peak profile setup bucket");
+        assert_eq!(last, first, "all peak tiles must select one setup bucket");
+        assert!(first >= ai_pow_zk::composite_layout::MIN_STARK_LEN);
+        assert!(
+            first <= crate::params::AI_POW_MAX_TRACE_HEIGHT,
+            "peak trace height {first} exceeds the production setup cap"
         );
     }
 

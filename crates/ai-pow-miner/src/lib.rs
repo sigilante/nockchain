@@ -38,6 +38,22 @@ pub const DENSE_PRODUCTION_PARAMS: ai_pow::params::MatmulParams = ai_pow::params
     difficulty_bits: 0,
 };
 
+/// Dense Pearl V3 profile for the RTX 5090 production search kernel.
+pub const PEAK_PRODUCTION_PARAMS: ai_pow::params::MatmulParams = ai_pow::params::MatmulParams {
+    m: 4096,
+    k: 8192,
+    n: 32768,
+    noise_rank: 512,
+    tile: 16,
+    spot_checks: 1,
+    difficulty_bits: 0,
+};
+
+/// Return the dense RTX 5090 production profile.
+pub const fn peak_production_params() -> ai_pow::params::MatmulParams {
+    PEAK_PRODUCTION_PARAMS
+}
+
 /// Return the exact dense production fixture parameters.
 pub const fn dense_production_params() -> ai_pow::params::MatmulParams {
     DENSE_PRODUCTION_PARAMS
@@ -86,6 +102,10 @@ pub mod pearl_mining;
 /// Bounded CPU and accelerator ticket-search backend contract.
 pub mod search;
 
+/// RTX 5090 dense ticket-search session and benchmark contract.
+#[cfg(feature = "gpu")]
+pub mod peak;
+
 /// Pearl Gateway `submitPlainProof` artifact construction.
 ///
 /// Internal by design: Hoon and external Nockchain callers submit only the
@@ -124,7 +144,8 @@ pub mod run;
 /// the same work arguments and choose their search implementation explicitly.
 #[cfg(feature = "node")]
 pub mod cli;
-/// CUDA search implementation selected by `ai-pow-mine --gpu`.
+/// CUDA search implementations. `--gpu --canonical` selects the production
+/// dense route. Gateway mode retains the generic CUDA backend.
 #[cfg(all(feature = "node", feature = "gpu"))]
 pub mod gpu;
 
