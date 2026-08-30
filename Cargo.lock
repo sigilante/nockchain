@@ -6642,7 +6642,6 @@ dependencies = [
  "tokio",
  "tonic 0.14.6",
  "tracy-client",
- "zkvm-jetpack",
 ]
 
 [[package]]
@@ -6658,7 +6657,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracy-client",
- "zkvm-jetpack",
 ]
 
 [[package]]
