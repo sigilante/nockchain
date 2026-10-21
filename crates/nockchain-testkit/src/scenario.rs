@@ -15,6 +15,8 @@ pub struct Scenario {
     #[serde(default)]
     pub binaries: BTreeMap<String, PathBuf>,
     #[serde(default)]
+    pub miner_binaries: BTreeMap<String, PathBuf>,
+    #[serde(default)]
     pub nodes: Vec<NodeSpec>,
     #[serde(default)]
     pub steps: Vec<Action>,
@@ -56,6 +58,10 @@ fn default_seed() -> u64 {
     1
 }
 
+fn default_mining_threads() -> u64 {
+    1
+}
+
 fn default_true() -> bool {
     true
 }
@@ -77,6 +83,13 @@ pub struct NodeSpec {
     pub mine: bool,
     #[serde(default)]
     pub mining_pkh: Option<String>,
+    #[serde(default = "default_mining_threads")]
+    pub mining_threads: u64,
+    /// Host executable in process mode, or executable path inside the miner image.
+    #[serde(default)]
+    pub miner_binary: Option<PathBuf>,
+    #[serde(default)]
+    pub miner_image: Option<String>,
     #[serde(default)]
     pub peers: Vec<String>,
     #[serde(default)]
@@ -201,6 +214,10 @@ pub enum Action {
         node: String,
         version: String,
     },
+    UpgradeMiner {
+        node: String,
+        version: String,
+    },
     Tick {
         millis: u64,
     },
@@ -301,7 +318,6 @@ pub enum Assert {
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ReqResGenerationExpectation {
-    Gen1,
     Gen2,
 }
 
@@ -359,7 +375,7 @@ name: "set_node_env"
 steps:
   - action: set_node_env
     node: "node-a"
-    key: "NOCKCHAIN_LIBP2P_REQ_RES_GEN2_SEND_ENABLED"
+    key: "NOCKCHAIN_LIBP2P_REQ_RES_GEN2_BUNDLE_ENABLED"
     value: "true"
 "#,
         )
@@ -368,7 +384,7 @@ steps:
         match &scenario.steps[0] {
             crate::scenario::Action::SetNodeEnv { node, key, value } => {
                 assert_eq!(node, "node-a");
-                assert_eq!(key, "NOCKCHAIN_LIBP2P_REQ_RES_GEN2_SEND_ENABLED");
+                assert_eq!(key, "NOCKCHAIN_LIBP2P_REQ_RES_GEN2_BUNDLE_ENABLED");
                 assert_eq!(value, "true");
             }
             other => panic!("unexpected action variant: {other:?}"),
@@ -491,7 +507,7 @@ asserts:
   - assert: req_res_generation
     node: "node-b"
     peer: "node-a"
-    generation: gen1
+    generation: gen2
     timeout_ms: 30000
 "#,
         )
@@ -508,48 +524,12 @@ asserts:
                 assert_eq!(peer, "node-a");
                 assert_eq!(
                     *generation,
-                    crate::scenario::ReqResGenerationExpectation::Gen1
+                    crate::scenario::ReqResGenerationExpectation::Gen2
                 );
                 assert_eq!(*timeout_ms, Some(30000));
             }
             other => panic!("unexpected assert variant: {other:?}"),
         }
-    }
-
-    #[test]
-    fn nous_testnet_gen2_send_scenario_deserializes() {
-        let scenario: crate::scenario::Scenario = serde_yaml::from_str(include_str!(
-            "../../../tests/e2e/scenarios/nous_testnet_gen2_send.yaml"
-        ))
-        .expect("scenario should deserialize");
-
-        assert_eq!(scenario.name, "nous_testnet_gen2_send");
-        assert_eq!(scenario.seed, 26);
-        assert_eq!(scenario.nodes.len(), 4);
-        assert!(scenario
-            .steps
-            .iter()
-            .any(|step| matches!(step, crate::scenario::Action::Command { .. })));
-        assert!(scenario
-            .steps
-            .iter()
-            .any(|step| matches!(step, crate::scenario::Action::SetNodeEnv { .. })));
-
-        let stuffer_clone_count = scenario
-            .steps
-            .iter()
-            .filter(|step| {
-                matches!(
-                    step,
-                    crate::scenario::Action::CloneWallet { from, to }
-                    if from == "miner-a" && to == "stuffer"
-                )
-            })
-            .count();
-        assert_eq!(
-            stuffer_clone_count, 2,
-            "expected staged-send rehearsal to refresh the stuffer wallet before each load leg"
-        );
     }
 
     #[test]
@@ -573,31 +553,15 @@ asserts:
     }
 
     #[test]
-    fn rollout_matrix_scenarios_include_req_res_generation_asserts() {
+    fn gen2_scenarios_include_req_res_generation_asserts() {
         for (path, contents) in [
-            (
-                "../../../tests/e2e/scenarios/nous_shipped_default.yaml",
-                include_str!("../../../tests/e2e/scenarios/nous_shipped_default.yaml"),
-            ),
             (
                 "../../../tests/e2e/scenarios/nous_gen2_enabled.yaml",
                 include_str!("../../../tests/e2e/scenarios/nous_gen2_enabled.yaml"),
             ),
             (
-                "../../../tests/e2e/scenarios/nous_mixed_generation.yaml",
-                include_str!("../../../tests/e2e/scenarios/nous_mixed_generation.yaml"),
-            ),
-            (
                 "../../../tests/e2e/scenarios/nous_rollback.yaml",
                 include_str!("../../../tests/e2e/scenarios/nous_rollback.yaml"),
-            ),
-            (
-                "../../../tests/e2e/scenarios/nous_old_new_fallback.yaml",
-                include_str!("../../../tests/e2e/scenarios/nous_old_new_fallback.yaml"),
-            ),
-            (
-                "../../../tests/e2e/scenarios/nous_testnet_gen2_send.yaml",
-                include_str!("../../../tests/e2e/scenarios/nous_testnet_gen2_send.yaml"),
             ),
         ] {
             let scenario: crate::scenario::Scenario =

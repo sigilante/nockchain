@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use clap::builder::BoolishValueParser;
 use clap::{ArgAction, Parser, Subcommand};
-use nockchain_e2e::{peer_speedup, runner, sizing};
+use nockchain_e2e::{runner, sizing};
 use nockchain_types::tx_engine::common::Hash;
 
 #[derive(Parser, Debug)]
@@ -20,7 +20,13 @@ enum Command {
         #[arg(long)]
         nockchain_bin: Option<PathBuf>,
         #[arg(long)]
+        miner_bin: Option<PathBuf>,
+        #[arg(long)]
         docker_image: Option<String>,
+        #[arg(long)]
+        docker_miner_image: Option<String>,
+        #[arg(long)]
+        docker_miner_bin: Option<PathBuf>,
         #[arg(long, default_value_t = false)]
         docker: bool,
         #[arg(long)]
@@ -30,7 +36,7 @@ enum Command {
             action = ArgAction::Set,
             value_parser = BoolishValueParser::new(),
             default_value_t = true,
-            help = "Use target/release/nockchain when --nockchain-bin is not provided"
+            help = "Use target/release node and miner binaries when their paths are not provided"
         )]
         release: bool,
         #[arg(long, default_value = "target/nockchain-e2e")]
@@ -63,16 +69,6 @@ enum Command {
         gen2_batch_max_bytes: u64,
         #[arg(long, default_value_t = 131_072)]
         gen2_item_max_bytes: u64,
-    },
-    AssertPeerSpeedup {
-        #[arg(long = "server", required = true)]
-        servers: Vec<String>,
-        #[arg(long, default_value_t = 5_000)]
-        sample_interval_ms: u64,
-        #[arg(long, default_value_t = 1.10)]
-        min_speedup_ratio: f64,
-        #[arg(long)]
-        json_out: Option<PathBuf>,
     },
     WaitForPublicHeight {
         #[arg(long)]
@@ -132,7 +128,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Run {
             scenario,
             nockchain_bin,
+            miner_bin,
             docker_image,
+            docker_miner_image,
+            docker_miner_bin,
             docker,
             wallet_bin,
             release,
@@ -158,6 +157,19 @@ async fn main() -> anyhow::Result<()> {
                     })
                 })
             };
+            let miner_bin = if docker {
+                None
+            } else {
+                Some(miner_bin.unwrap_or_else(|| {
+                    PathBuf::from(if release {
+                        "target/release/zk-pow-mine"
+                    } else {
+                        "target/debug/zk-pow-mine"
+                    })
+                }))
+            };
+            let docker_miner_image =
+                docker_miner_image.or_else(|| std::env::var("NOCKCHAIN_E2E_MINER_IMAGE").ok());
             if !docker {
                 if let Some(path) = &nockchain_bin {
                     if !path.exists() {
@@ -179,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
             let options = runner::RunOptions {
                 scenario_path: scenario,
                 nockchain_bin,
+                miner_bin,
                 wallet_bin,
                 work_dir,
                 base_grpc_port,
@@ -186,6 +199,8 @@ async fn main() -> anyhow::Result<()> {
                 base_p2p_port,
                 docker,
                 docker_image,
+                docker_miner_image,
+                docker_miner_bin,
                 keep_artifacts,
             };
             runner::run_scenario(options).await
@@ -216,21 +231,6 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&summary)?);
-            Ok(())
-        }
-        Command::AssertPeerSpeedup {
-            servers,
-            sample_interval_ms,
-            min_speedup_ratio,
-            json_out,
-        } => {
-            peer_speedup::assert_peer_speedup(peer_speedup::AssertPeerSpeedupOptions {
-                servers,
-                sample_interval: Duration::from_millis(sample_interval_ms),
-                min_speedup_ratio,
-                json_out,
-            })
-            .await?;
             Ok(())
         }
         Command::WaitForPublicHeight {

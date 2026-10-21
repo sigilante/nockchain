@@ -76,6 +76,8 @@
           (lth parent-height ai-pow-activation-height.blockchain-constants)
       ==
   =/  base=puzzle-asert-state:dk
+    ?:  (puzzle-asert-reset-at:page:t block-height)
+      *puzzle-asert-state:dk
     ?^  parent-state  u.parent-state
     :*  zk-count=0
         ai-count=0

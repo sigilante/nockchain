@@ -38,6 +38,12 @@ admission, mempool state, chain inclusion, and finality.
 - Fee and timelock decisions use synchronized chain context. A stale view may
   produce a transaction the node rejects, never authority to spend a different
   note.
+- Multisig planning queries `/fund-spend-policy/<candidate-height-decimal>` at
+  the normalized snapshot tip plus one using checked arithmetic. An absent,
+  malformed, or height-mismatched response is an error, not an inactive policy.
+  Historical fund identity comes from the kernel independently of the configured
+  recovery minimum. Only historical fund notes receive this separate age gate;
+  the revealed multisig, ordinary timelock height, and fee context stay unchanged.
 - The wallet signs the exact canonical transaction noun it displays and saves.
   Changing recipients, fees, note data, locks, or witnesses changes the signed
   digest.
@@ -101,14 +107,18 @@ nockchain-wallet export-keys
 # Import keys from the exported file
 nockchain-wallet import-keys --file keys.export
 
-# Import an extended key string
-nockchain-wallet import-keys --key "zprv..."
+# Import one extended key from a plaintext file (preferred for private keys)
+nockchain-wallet import-keys --key-file /private/retained.key
+
+# An extended key string is also accepted; avoid private secrets in shell history
+nockchain-wallet import-keys --key "zpub..."
 
 # Generate master private key from seed phrase (version required)
 # If you generated your seedphrase before October 2025 then it’s probably version 0
 # If you import with version 0 and find that you cannot spend your notes, try
 # importing the seed phrase again with version 1.
-nockchain-wallet import-keys --seedphrase "your seed phrase here" --version <version | 1 or 0>
+nockchain-wallet import-keys --seedphrase --version <version | 1 or 0>
+# The wallet prompts for the phrase without showing it on screen.
 
 # Import watch-only identifiers
 nockchain-wallet watch address <base58-pkh-or-pubkey>
@@ -128,19 +138,29 @@ nockchain-wallet show-master-prv
 The exported keys file contains all wallet keys as a `jam` file that can be imported on another instance.
 Once imported, watch-only identifiers are kept in sync automatically, so their balances show up in every sync-heavy command without extra flags.
 
+`--key-file` reads a single plaintext extended key, not a jammed `keys.export`
+backup. Invalid encoding, checksum, or key material is rejected with a nonzero
+exit status without changing stored keys or the active master. Importing another
+root into an existing wallet does not automatically switch its active master.
+
+Full `keys.export` backups retain the master/child namespaces, child indices,
+labels, and other stored key entries. They may contain private keys and seed
+phrases in plaintext: do not share them as public-key files. Keep secret inputs,
+exports, and wallet state in private directories (mode `0700`), with secret files
+readable only by their owner (mode `0600`).
+
 Can be used for:
 - Backing up your wallet
 - Migrating to a new device
-- Sharing public keys with other users
 
 ### Connecting to a Nockchain API server
 
-The wallet talks to the gRPC APIs exposed by a running nockchain instance. You can target either the **public** API (default) or the **private** API that is typically bound to `localhost`. You must run a nockchain instance to connect to the private API. The wallet connects to a public Nockchain API server at `23.252.122.18:5556` by default.
+The wallet talks to the gRPC APIs exposed by a running nockchain instance. You can target either the **public** API (default) or the **private** API that is typically bound to `localhost`. You must run a nockchain instance to connect to the private API. The wallet connects to a public Nockchain API server at `216.158.95.10:5556` by default.
 
 #### Public API (default)
 
 ```bash
-# Use the default public endpoint (23.252.122.18:5556)
+# Use the default public endpoint (216.158.95.10:5556)
 nockchain-wallet list-notes
 
 # Or point at a different remote public listener
@@ -189,6 +209,87 @@ nockchain-wallet derive-child 42 --hardened --label "my-key"
 ```
 
 Derives a child public or private key at the given index from the current master key.
+
+### Recover a Child Export
+
+If a retained child extended key lacks usable hierarchy metadata, select its
+original parent and supply an independently known child index and hardening
+choice. Prefer restoring a complete `keys.export` backup when one is available;
+child key material alone cannot reveal a missing parent or index.
+
+Use a separate private working directory and `NOCKAPP_HOME` while recovering.
+The following example explicitly selects a local API endpoint instead of the
+wallet's default external endpoint; replace it with your approved endpoint.
+Set `EXPECTED_PARENT_ADDRESS` and `EXPECTED_CHILD_PUBLIC_KEY` from independently
+known records. The latter is the raw Schnorr public key, not a payee hash or
+extended `zpub`.
+
+```bash
+umask 077
+mkdir -m 700 /private/wallet-recovery
+cd /private/wallet-recovery
+export NOCKAPP_HOME="$PWD/home"
+mkdir -m 700 "$NOCKAPP_HOME"
+
+wallet() {
+  /absolute/path/to/nockchain-wallet \
+    --public-grpc-server-addr 127.0.0.1:6601 "$@"
+}
+
+wallet import-keys --key-file /private/original-parent.key
+wallet list-master-addresses
+wallet set-active-master-address "$EXPECTED_PARENT_ADDRESS"
+wallet recover-child 7 --hardened --key-file /private/retained-child.key
+wallet list-active-addresses
+wallet sign-message -m "identity check" --index 7 --hardened
+wallet verify-message -m "identity check" -s message.sig -p "$EXPECTED_CHILD_PUBLIC_KEY"
+wallet export-keys
+```
+
+Omit `--hardened` for a known nonhardened child. `recover-child` compares the full
+public identity, chain code, protocol version, and any supplied private key
+against the child regenerated from the selected parent before storing it or
+emitting corrected extended exports. Wrong parent, index, hardening choice, or
+key material produces an explicit rejection and exit status `1`, leaves stored
+keys and the active master unchanged, and emits no corrected key exports.
+
+Corrected exports include the derived depth, index, and parent fingerprint while
+preserving the child's actual stored protocol version and address identity. A
+child's stored version can differ from its parent's; recovery does not convert
+either the key or its funds to another protocol. Public-only parents can verify
+only nonhardened public children and do not gain signing authority.
+
+Successful recovery can print private extended keys. Treat terminal output and
+any captured logs as secret material, just like the input files and backups.
+
+#### Standalone Signing or Watch-Only Import
+
+If parent or index information is unavailable, hierarchy recovery is not
+possible from child material alone. A retained private key with root-shaped
+metadata can instead be imported into a **different, empty** private wallet.
+Use a new working directory and `NOCKAPP_HOME`, with the same explicit endpoint
+selection as above; do not reuse the parent wallet.
+
+```bash
+wallet import-keys --key-file /private/retained-child.key
+wallet list-active-addresses
+wallet sign-message -m "identity check"
+wallet verify-message -m "identity check" -s message.sig -p "$EXPECTED_CHILD_PUBLIC_KEY"
+```
+
+This adopts the retained identity as a standalone master. The default master
+signer preserves its signing authority; it does not restore or guess the original
+parent, child index, or hardening choice. Do not rewrite hierarchy metadata to
+make another key fit this workflow.
+
+A public-only extended key can be imported with `--key-file` for watch-only use,
+but cannot sign. Existing signing warnings may return exit status `0`; that
+status is not evidence of signing authority. Require a signature artifact and
+successful verification against the expected public identity for a signing
+check. Key recovery and message-signature verification are not confirmation of
+a funded spend; transactions still follow the normal version-specific ownership
+and canonical-chain confirmation rules.
+
 
 ### Managing Addresses
 
@@ -251,6 +352,11 @@ nockchain-wallet list-notes-by-address-csv <address>
 
 Outputs matching notes in CSV format suitable for analysis or reporting. The output csv has the format: `notes-<public-key>.csv`.
 
+An accepted genesis-only chain provides a successful empty balance snapshot at
+height 0 with the genesis block ID. If the selected address has no notes, the CSV
+contains only its header. A node with no accepted chain cannot provide a balance
+snapshot; an unknown block or a missing non-genesis balance is not an empty balance.
+
 ### Show Wallet Data
 
 ```bash
@@ -273,7 +379,7 @@ Displays the aggregate wallet balance, including the total number of notes and t
 
 We support transactions with any amount of input notes going to any number of recipients.
 
-For the common case — paying one or more single-signer p2pkh addresses — you can skip the JSON entirely and pass paired `--to`/`--amount` flags, where **amounts are in nocks**:
+For the common case—paying one or more single-signer p2pkh addresses—use paired `--to`/`--amount` flags. Amounts are in whole nocks:
 
 ```bash
 # Ergonomic: send 100 nocks to a p2pkh address (amount is in whole NOCKS, not nicks).
@@ -295,29 +401,18 @@ nockchain-wallet create-tx --to <p2pkh-b58> --amount-nicks 6553600 --fee-nicks 6
 nockchain-wallet create-tx --bridge-deposit 100000 --to-evm-address 0x0c8d9cf278d4f3e23b00ea0a16bba2d05c07a7b6
 ```
 
-`--to A --amount 100` is exactly equivalent to `--recipient '{"kind":"p2pkh","address":"A","amount":6553600}'` (100 × 65536 nicks). Amounts are whole nocks only — there is no decimal input. `--to`/`--amount` and `--recipient` may be combined in one command. Use `--amount-nicks` to give a `--to` amount in raw nicks (mutually exclusive with `--amount`), `--fee` for a fee override in nocks, and `--fee-nicks` for a fee override in nicks (mutually exclusive with `--fee`). To move funds onto the Base bridge instead of paying a p2pkh, pass `--bridge-deposit <nocks> --to-evm-address <0x...>` (only one bridge deposit is allowed per transaction).
+Use `--to <p2pkh-b58> --amount <nocks>` for normal payments. Repeat the pair
+to create multiple outputs. `--amount` and `--fee` use whole nocks; use
+`--amount-nicks` or `--fee-nicks` when raw protocol units are required. Each
+nocks flag is mutually exclusive with its nicks counterpart.
 
-The full JSON form is still available for multisig and bridge outputs, and for entering amounts directly in nicks:
+Use `--bridge-deposit <nocks> --to-evm-address <0x...>` for a Base bridge
+deposit. Only one bridge deposit is allowed per transaction.
 
-```bash
-# Auto-select spendable notes and compute fee
-nockchain-wallet create-tx \
-  --recipient '{"kind":"p2pkh","address":"<p2pkh-b58>","amount":10000}'
-
-# Send to a single P2PKH recipient
-nockchain-wallet create-tx \
-  --names "[first1 last1],[first2 last2]" \
-  --recipient '{"kind":"p2pkh","address":"<p2pkh-b58>","amount":10000}' \
-  --fee-nicks 10
-
-# Send to a multisig recipient
-nockchain-wallet create-tx \
-  --names "[first1 last1],[first2 last2]" \
-  --recipient '{"kind":"multisig","threshold":2,"addresses":["<pkh-a>","<pkh-b>","<pkh-c>"],"amount":9000}' \
-  --fee-nicks 10
-```
-
-`--recipient` gifts are denominated in nicks (65536 nicks = 1 nock); the ergonomic `--amount` and `--fee` are denominated in whole nocks, while `--amount-nicks` and `--fee-nicks` are in nicks.
+The existing `--recipient` argument remains available for advanced multisig
+outputs, explicit raw-nick specifications, and compatibility with older
+commands. It can be combined with the simpler flags; see
+[Advanced Recipient Format](#advanced-recipient-format).
 
 #### Common Parameters
 
@@ -325,9 +420,9 @@ nockchain-wallet create-tx \
 - Auto-selection remains v1-only
 - Manual `--names` selection may spend either an all-v1 set or an all-v0 set; mixed-version manual sets are rejected
 - The optional `--fee` argument overrides the planner-computed fee, denominated in whole nocks (65536 nicks = 1 nock); `--fee-nicks` is the same override in nicks (mutually exclusive with `--fee`)
-- Provide multiple `--recipient` flags (or multiple paired `--to`/`--amount` flags) to fan out to several outputs
-- Each `--recipient` is either a JSON object (preferred) or a legacy `<p2pkh>:<amount>` string
-- `--to <p2pkh-b58> --amount <nocks>` is a shorthand for a p2pkh `--recipient`; amounts are whole nocks (use `--amount-nicks` for raw nicks), and each `--to` must be paired with exactly one `--amount`/`--amount-nicks`
+- Repeat paired `--to`/`--amount` flags to fan out to several p2pkh outputs
+- `--to <p2pkh-b58> --amount <nocks>` is the preferred p2pkh form; use `--amount-nicks` for raw nicks, and pair every `--to` with exactly one amount
+- The advanced `--recipient` option remains available as a JSON object or legacy `<p2pkh>:<amount>` string
 - `--bridge-deposit <nocks> --to-evm-address <0x...>` is a shorthand for a Base bridge deposit output (one per transaction); see [Bridge Deposits](#bridge-deposits)
 - `address`/`addresses` fields expect base58-encoded pay-to-pubkey-hash values
 - Provide `--sign-key <index[:hardened]>` multiple times to explicitly choose signing keys. If omitted, the wallet uses the master key or the `--index/--hardened` pair.
@@ -362,7 +457,7 @@ make install-nockchain-wallet
 
 # 3. Import the legacy seed if you have not already done so
 nockchain-wallet import-keys \
-  --seedphrase "your legacy seed phrase here" \
+  --seedphrase \
   --version 0
 
 # 4. Confirm the legacy master address is present
@@ -394,7 +489,8 @@ If you need to pin the exact legacy inputs instead of sweeping every spendable v
 ```bash
 nockchain-wallet create-tx \
   --names "[first1 last1],[first2 last2]" \
-  --recipient '{"kind":"p2pkh","address":"<v1-p2pkh-b58>","amount":10000}' \
+  --to <v1-p2pkh-b58> \
+  --amount-nicks 10000 \
   --refund-pkh <v1-p2pkh-b58>
 ```
 
@@ -406,9 +502,9 @@ Rules for manual legacy spends:
 - Fee may be planner-computed or overridden with `--fee`
 - Omit `--names` if you want normal auto-selection; auto-selection does not pick v0 notes
 
-#### Recipient JSON Format
+#### Advanced Recipient Format
 
-`--recipient` accepts JSON objects in addition to the legacy `<p2pkh>:<amount>` syntax (legacy supports simple 1-of-1 P2PKH locks only). Wrap JSON in single quotes (or escape the quotes) when invoking the CLI. The supported shapes are:
+For advanced output shapes, `--recipient` accepts JSON objects in addition to the legacy `<p2pkh>:<amount>` syntax. Wrap JSON in single quotes (or escape the quotes) when invoking the CLI. The supported shapes are:
 
 ```json
 {"kind":"p2pkh","address":"<base58-pkh>","amount":10000}
@@ -423,9 +519,20 @@ Rules for manual legacy spends:
 
 Provide multiple `--recipient` flags to fan out to several recipients in one transaction.
 
-### Multisig Recipients
+### Multisig Transactions and Recipients
 
-Multisig outputs are expressed via the JSON form. Supply each output as:
+For a normal p2pkh payment from multisig-held funds, use the same simple output
+flags:
+
+```bash
+nockchain-wallet create-multisig-tx \
+  --threshold 2 \
+  --participants <pkh-a>,<pkh-b>,<pkh-c> \
+  --to <p2pkh-b58> \
+  --amount 100
+```
+
+Creating a multisig output still requires the advanced `--recipient` form:
 
 ```json
 {"kind":"multisig","threshold":<M>,"addresses":["<pkh-a>", ...],"amount":<nicks>}
@@ -450,7 +557,7 @@ nockchain-wallet create-tx \
   --to-evm-address 0x0c8d9cf278d4f3e23b00ea0a16bba2d05c07a7b6
 ```
 
-The equivalent explicit JSON form (amount in nicks) also works:
+The equivalent advanced `--recipient` form (amount in nicks) also remains available:
 
 ```bash
 nockchain-wallet create-tx \

@@ -38,6 +38,16 @@ pub enum WorkerError {
     SerfSpawn(String),
     #[error("serf poke failed: {0}")]
     Poke(String),
+    #[error("invalid mining candidate: {0}")]
+    Candidate(String),
+    #[error("CUDA mining failed: {0}")]
+    Cuda(String),
+    #[error("CUDA search result failed CPU validation")]
+    CudaDigestMismatch,
+    #[error("CUDA reported a winner that the miner kernel rejected")]
+    CudaFalsePositive,
+    #[error("mining attempt was cancelled")]
+    Cancelled,
     #[error("decoding mine-result effect: {0}")]
     Decode(&'static str),
     #[error("miner kernel returned no mine-result effect")]
@@ -60,20 +70,18 @@ pub enum MineResult {
         hash_slab: NounSlab,
         poke_slab: NounSlab,
     },
-    /// Proof digest did not clear the target. `next_nonce` is the digest
-    /// returned by the miner kernel — to be used as the nonce on the
-    /// next attempt for the same candidate. This is how the old driver
-    /// stepped through the nonce space; cribbed verbatim.
+    /// Proof digest did not clear the target. `next_nonce` is the next
+    /// nonce selected by the worker. Serf workers use the kernel-returned
+    /// digest; CUDA workers advance past the completed nonce batch.
     Retry { next_nonce: NounSlab },
 }
 
 #[async_trait]
 pub trait Worker: Send + Sync + 'static {
     fn id(&self) -> WorkerId;
-    /// Signal the worker to abort its current `mine_attempt`. The
-    /// attempt's future will resolve with `Err(WorkerError::Poke(...))`
-    /// shortly after (the underlying Nock interpreter polls the
-    /// cancel flag at branch / opcode boundaries).
+    /// Signal the worker to abort its current `mine_attempt`. Serf workers
+    /// poll the cancellation flag at branch and opcode boundaries; CUDA
+    /// workers stop after the current kernel batch or before queued proving.
     fn cancel(&self);
     /// Run one mining attempt. The caller pre-builds the `[version
     /// header nonce target pow-len]` poke slab via [`build_candidate_poke`]
@@ -324,6 +332,7 @@ mod tests {
         target.set_root(D(0xFFFF_FFFF));
         let candidate = MiningCandidate {
             kind: MiningCandidateKind::Zk,
+            candidate_height: None,
             version,
             block_header,
             target,
@@ -417,59 +426,99 @@ mod tests {
         }
     }
 
-    /// Integration test: spawn a real SerfWorker, hand it a trivial-target
-    /// candidate (target = max bignum so any digest passes), assert
-    /// `MineResult::Success` on the first attempt.
+    /// Integration test: a losing version-5 nonce returns after its puzzle
+    /// object misses the target; only a winning nonce triggers full STARK
+    /// construction. The timing ratio catches proof-first or cached-proof
+    /// implementations, while decoding and native verification bind the
+    /// winning nonce to the submitted proof.
     ///
-    /// Marked `#[ignore]` because spawning a Nock VM + running the STARK
-    /// is heavy (~10s+ wall clock). Run with:
-    ///   cargo test -p zk-pow-miner --lib -- --ignored serf_worker
+    /// Marked `#[ignore]` because spawning a Nock VM and constructing the
+    /// winning STARK is heavy. Run with:
+    ///   cargo test -p zk-pow-miner --lib --release -- --ignored serf_worker
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore]
-    async fn serf_worker_mines_trivial_target() {
+    async fn serf_worker_proves_only_after_v5_nonce_meets_target() {
         use ibig::UBig;
+        use nockvm::noun::NounAllocator;
+        use noun_serde::NounDecode;
+        use zkvm_jetpack::form::verify::{verify, VerifyArgs};
+        use zkvm_jetpack::form::{Proof, ProofData, ProofVersion};
         use zkvm_jetpack::hot::produce_prover_hot_state;
+
+        fn nonce(value: u64) -> NounSlab {
+            let mut slab = NounSlab::new();
+            let noun = T(&mut slab, &[D(value), D(0), D(0), D(0), D(0)]);
+            slab.set_root(noun);
+            slab
+        }
+
+        fn submitted_proof(poke_slab: &NounSlab) -> Proof {
+            let space = poke_slab.noun_space();
+            let root = unsafe { *poke_slab.root() };
+            let fields = root
+                .in_space(&space)
+                .uncell::<7>()
+                .expect("submitted poke is a 7-tuple");
+            let proof_noun = fields[3].noun();
+            Proof::from_noun(&proof_noun, &space).expect("submitted proof decodes")
+        }
 
         let hot_state = produce_prover_hot_state();
         let worker = SerfWorker::spawn(0, hot_state).await.expect("spawn worker");
+        let losing_candidate = synth_v5_candidate(UBig::from(0u8), 2);
+        let winning_candidate = synth_v5_candidate(UBig::from(1u8) << 400, 2);
 
-        // Target = 2^400 — comfortably above max-tip5-atom (the merged
-        // 5-belt tip5 hash atom; the chain checks `(lte proof-hash
-        // max-tip5-atom)` first, then `(lte proof-hash target)`). With
-        // target this large, every proof passes.
-        let candidate = synth_trivial_candidate(UBig::from(1u64) << 400, 2);
-        let mut attempts = 0u32;
-        let mut nonce = random_nonce();
-        let started = std::time::Instant::now();
-        // Allow a small handful of attempts as a guardrail — in
-        // practice with target=2^400 the very first attempt should hit.
-        let result = loop {
-            attempts += 1;
-            let poke = build_candidate_poke(&candidate, nonce);
-            let r = worker.mine_attempt(poke).await.expect("mine_attempt");
-            match r {
-                MineResult::Success { .. } => break r,
-                MineResult::Retry { next_nonce } => {
-                    if attempts >= 4 {
-                        panic!(
-                            "trivial-target candidate should succeed within 4 attempts; \
-                             got {attempts} retries"
-                        );
-                    }
-                    nonce = next_nonce;
-                }
+        let losing_started = std::time::Instant::now();
+        match worker
+            .mine_attempt(build_candidate_poke(&losing_candidate, nonce(1)))
+            .await
+            .expect("losing mine_attempt")
+        {
+            MineResult::Retry { next_nonce } => {
+                assert_eq!(
+                    crate::v5::decode_digest_slab(&next_nonce).expect("retry digest"),
+                    crate::v5::v5_pow_digest([0; 5], [1, 0, 0, 0, 0], 2),
+                    "native V5 digest oracle must match the Hoon miner kernel",
+                );
             }
+            MineResult::Success { .. } => panic!("zero target accepted losing nonce"),
+        }
+        let losing_elapsed = losing_started.elapsed();
+
+        let winning_started = std::time::Instant::now();
+        let winning_poke = match worker
+            .mine_attempt(build_candidate_poke(&winning_candidate, nonce(2)))
+            .await
+            .expect("winning mine_attempt")
+        {
+            MineResult::Success { poke_slab, .. } => poke_slab,
+            MineResult::Retry { .. } => panic!("trivial target rejected winning nonce"),
         };
-        let elapsed = started.elapsed();
-        eprintln!("serf_worker_mines_trivial_target: {attempts} attempt(s) in {elapsed:?}");
-        assert!(matches!(result, MineResult::Success { .. }));
+        let winning_elapsed = winning_started.elapsed();
+
+        let proof = submitted_proof(&winning_poke);
+        assert_eq!(proof.version, ProofVersion::V5);
+        match &proof.objects[0] {
+            ProofData::Puzzle { nonce, .. } => assert_eq!(*nonce, [2, 0, 0, 0, 0]),
+            object => panic!("first v5 proof object is not a puzzle: {object:?}"),
+        }
+        verify(VerifyArgs {
+            proof,
+            table_override: None,
+            verifier_eny: 0,
+        })
+        .expect("winning nonce proof must verify natively");
+        assert!(
+            winning_elapsed > losing_elapsed.saturating_mul(2),
+            "losing nonce should skip full proof construction: losing={losing_elapsed:?}, winning={winning_elapsed:?}",
+        );
     }
 
-    /// Helper: synth a trivial-difficulty candidate (max-bignum target).
+    /// Helper: synthesize a version-5 candidate with the requested target.
     #[cfg(test)]
-    fn synth_trivial_candidate(target_value: ibig::UBig, pow_len: u64) -> MiningCandidate {
+    fn synth_v5_candidate(target_value: ibig::UBig, pow_len: u64) -> MiningCandidate {
         let mut version = NounSlab::new();
-        version.set_root(D(0)); // %0
+        version.set_root(D(5)); // %5
         let mut block_header = NounSlab::new();
         let h = T(&mut block_header, &[D(0), D(0), D(0), D(0), D(0)]);
         block_header.set_root(h);
@@ -478,6 +527,7 @@ mod tests {
         target.set_root(t);
         MiningCandidate {
             kind: MiningCandidateKind::Zk,
+            candidate_height: None,
             version,
             block_header,
             target,

@@ -57,9 +57,10 @@ pub const PEARL_NOCKCHAIN_AUX_MAX_SIZE: usize =
     4 + 1 + PEARL_NOCKCHAIN_AUX_CHAIN_ID_MAX + 32 + 8 + 2 + PEARL_NOCKCHAIN_AUX_EXTRA_MAX;
 pub const PEARL_NOCKCHAIN_AUX_COMMITMENT_TAG: &[u8] = b"NOCKCHAIN-AI-POW-AUX";
 pub const PEARL_AUX_INCLUSION_MAX_COINBASE_TX_BYTES: usize = 100_000;
-/// Current production merge-mining profile uses Pearl blocks with only the
-/// coinbase transaction, so the aux inclusion proof must have no merkle branch.
-pub const PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH: usize = 0;
+/// Bound the coinbase's transaction Merkle path to 32 levels (up to 2^32
+/// transaction leaves), while keeping inclusion verification work bounded.
+pub const PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH: usize = 32;
+pub const PEARL_AUX_INCLUSION_LEGACY_MAX_MERKLE_BRANCH: usize = 0;
 pub const PEARL_MERGE_PUBLIC_STATEMENT_MAGIC: [u8; 4] = *b"PMP1";
 pub const PEARL_MERGE_PUBLIC_STATEMENT_FIXED_SIZE: usize =
     4 + PEARL_INCOMPLETE_BLOCK_HEADER_SIZE + PEARL_PUBLIC_PROOF_PARAMS_SIZE + 32 + 2;
@@ -119,6 +120,14 @@ pub enum PearlCompatError {
     MoeExpertSpanExceedsTokens { expert: usize, span: u32, m: u32 },
     #[error("Pearl MoE routing_data must be strictly increasing within every expert span")]
     MoeRoutingNotStrictlyIncreasing,
+    #[error(
+        "Pearl MoE token {token} occurs {actual} times in routing_data; expected top_k={expected}"
+    )]
+    MoeRoutingMultiplicityMismatch {
+        token: u32,
+        expected: u16,
+        actual: u32,
+    },
     #[error("Pearl MoE local column {local} reaches outside expert {expert_idx}'s block (n_e={n_e}); would bleed into a neighbouring expert's weights")]
     MoeColumnOutsideExpert {
         local: u32,
@@ -230,10 +239,12 @@ pub enum PearlCompatError {
     PearlAuxCoinbaseTxEmpty,
     #[error("Pearl aux inclusion coinbase transaction is too large: max 100000 bytes, got {0}")]
     PearlAuxCoinbaseTxTooLarge(usize),
-    #[error("Pearl aux inclusion merkle branch is too deep: max 0 siblings, got {0}")]
+    #[error("Pearl aux inclusion merkle branch exceeds the selected admission limit: got {0}")]
     PearlAuxMerkleBranchTooDeep(usize),
     #[error("Pearl aux inclusion coinbase transaction has malformed Bitcoin encoding")]
     PearlAuxMalformedCoinbaseTx,
+    #[error("Pearl auxiliary evidence must use the canonical transaction-ID serialization")]
+    PearlAuxNoncanonicalCoinbaseEvidence,
     #[error("Pearl aux inclusion proof leaf is not a coinbase transaction")]
     PearlAuxNotCoinbase,
     #[error("Pearl aux commitment tag is not present in the txid-committed coinbase script")]
@@ -740,6 +751,80 @@ pub const PEARL_MOE_MAX_ROUTING_ENTRIES: usize = (PEARL_MOE_NONCE_MAX_ATOM_BYTES
     - PEARL_MOE_NONCE_DENSE_ENVELOPE_MAX_BYTES
     - PEARL_MOE_NONCE_TAIL_FIXED_MAX_BYTES)
     / 4;
+
+/// Historical coinbase-only framing reserved no sibling bytes. Keep its full
+/// routing allowance when replaying blocks below the hardening height.
+pub const PEARL_MOE_LEGACY_MAX_ROUTING_ENTRIES: usize = PEARL_MOE_MAX_ROUTING_ENTRIES
+    + 8 * (PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH - PEARL_AUX_INCLUSION_LEGACY_MAX_MERKLE_BRANCH);
+
+/// Consensus-selected framing and routing limits. These are supplied by the
+/// caller from the block's rules, never from fields inside its certificate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PearlAdmissionLimits {
+    max_merkle_branch: usize,
+    max_routing_entries: usize,
+    canonical_aux_serialization: bool,
+    exact_moe_multiplicity: bool,
+}
+
+impl PearlAdmissionLimits {
+    pub const LEGACY: Self = Self {
+        max_merkle_branch: PEARL_AUX_INCLUSION_LEGACY_MAX_MERKLE_BRANCH,
+        max_routing_entries: PEARL_MOE_LEGACY_MAX_ROUTING_ENTRIES,
+        canonical_aux_serialization: false,
+        exact_moe_multiplicity: false,
+    };
+    pub const HARDENED: Self = Self {
+        max_merkle_branch: PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH,
+        max_routing_entries: PEARL_MOE_MAX_ROUTING_ENTRIES,
+        canonical_aux_serialization: true,
+        exact_moe_multiplicity: false,
+    };
+    pub const CONSENSUS_BATCH: Self = Self {
+        exact_moe_multiplicity: true,
+        ..Self::HARDENED
+    };
+
+    pub const fn max_merkle_branch(self) -> usize {
+        self.max_merkle_branch
+    }
+
+    pub const fn max_routing_entries(self) -> usize {
+        self.max_routing_entries
+    }
+
+    pub const fn dense_nonce_max_bytes(self) -> usize {
+        PEARL_MOE_NONCE_DENSE_ENVELOPE_MAX_BYTES
+            - 32 * (PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH - self.max_merkle_branch)
+    }
+
+    pub const fn moe_nonce_max_bytes(self) -> usize {
+        self.dense_nonce_max_bytes()
+            + PEARL_MOE_NONCE_TAIL_FIXED_MAX_BYTES
+            + 4 * self.max_routing_entries
+    }
+}
+
+#[cfg(feature = "zk")]
+impl From<ai_pow_zk::proof_rules::ProofRules> for PearlAdmissionLimits {
+    fn from(rules: ai_pow_zk::proof_rules::ProofRules) -> Self {
+        match rules {
+            ai_pow_zk::proof_rules::ProofRules::Legacy => Self::LEGACY,
+            ai_pow_zk::proof_rules::ProofRules::Hardened => Self::HARDENED,
+        }
+    }
+}
+
+#[cfg(feature = "zk")]
+impl From<ai_pow_zk::proof_rules::VerificationRules> for PearlAdmissionLimits {
+    fn from(rules: ai_pow_zk::proof_rules::VerificationRules) -> Self {
+        match rules {
+            ai_pow_zk::proof_rules::VerificationRules::Legacy => Self::LEGACY,
+            ai_pow_zk::proof_rules::VerificationRules::Hardened => Self::HARDENED,
+            ai_pow_zk::proof_rules::VerificationRules::ConsensusBatch => Self::CONSENSUS_BATCH,
+        }
+    }
+}
 
 /// The MoE-specific public parameters carried in the `public_data` tail (Pearl
 /// `MoEParams`). `e` and `top_k` live in the mining-config trailer, not here.
@@ -1913,6 +1998,84 @@ pub fn verify_pearl_moe_routing_binding(
     routing_data: &[u32],
     max_pattern_len: usize,
 ) -> Result<(), PearlCompatError> {
+    verify_pearl_moe_routing_binding_with_limits(
+        kappa,
+        mining_config,
+        moe,
+        m,
+        t_rows,
+        routing_data,
+        max_pattern_len,
+        PearlAdmissionLimits::HARDENED,
+    )
+}
+
+/// Require every token to occur exactly `top_k` times globally. In combination
+/// with strict ordering inside each expert, this means `top_k` distinct experts
+/// per token. Consensus-batch admission requires this global routing invariant.
+pub fn verify_pearl_moe_routing_multiplicity(
+    mining_config: &PearlMiningConfig,
+    m: u32,
+    routing_data: &[u32],
+    limits: PearlAdmissionLimits,
+) -> Result<(), PearlCompatError> {
+    let cfg = mining_config
+        .moe()
+        .ok_or(PearlCompatError::MoePublicMissingConfig)?;
+    if cfg.top_k == 0 {
+        return Err(PearlCompatError::MoeTopKZero { e: cfg.e as usize });
+    }
+    if cfg.top_k >= cfg.e {
+        return Err(PearlCompatError::MoeTopKNotLessThanExperts {
+            top_k: cfg.top_k as usize,
+            e: cfg.e as usize,
+        });
+    }
+    let numel = u64::from(m) * u64::from(cfg.top_k);
+    if numel > limits.max_routing_entries() as u64 {
+        return Err(PearlCompatError::MoeRoutingEntriesExceedMax {
+            numel,
+            max: limits.max_routing_entries(),
+        });
+    }
+    if routing_data.len() as u64 != numel {
+        return Err(PearlCompatError::MoeRoutingDataLenMismatch {
+            expected: numel,
+            actual: routing_data.len(),
+        });
+    }
+    // top_k > 0 and m*top_k is capped, so m is also capped before allocation.
+    // u32 counters cannot overflow: even malformed inputs have <=235,626 slots.
+    let mut counts = vec![0u32; m as usize];
+    for (slot, &token) in routing_data.iter().enumerate() {
+        if token >= m {
+            return Err(PearlCompatError::MoeRoutingTokenOutOfRange { slot, token, m });
+        }
+        counts[token as usize] += 1;
+    }
+    for (token, actual) in counts.into_iter().enumerate() {
+        if actual != u32::from(cfg.top_k) {
+            return Err(PearlCompatError::MoeRoutingMultiplicityMismatch {
+                token: token as u32,
+                expected: cfg.top_k,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Verify routing using the same admission limits as the enclosing nonce.
+pub fn verify_pearl_moe_routing_binding_with_limits(
+    kappa: &[u8; 32],
+    mining_config: &PearlMiningConfig,
+    moe: &PearlMoeParams,
+    m: u32,
+    t_rows: u32,
+    routing_data: &[u32],
+    max_pattern_len: usize,
+    limits: PearlAdmissionLimits,
+) -> Result<(), PearlCompatError> {
     let cfg = mining_config
         .moe()
         .ok_or(PearlCompatError::MoePublicMissingConfig)?;
@@ -1942,10 +2105,10 @@ pub fn verify_pearl_moe_routing_binding(
     // oversized routing_data. Mirrors the artifact-codec cap
     // (`PEARL_MOE_MAX_ROUTING_ENTRIES`); a documented narrowing of Pearl's MoE
     // space (Pearl binds routing in-circuit and does not wire routing_data).
-    if numel > PEARL_MOE_MAX_ROUTING_ENTRIES as u64 {
+    if numel > limits.max_routing_entries() as u64 {
         return Err(PearlCompatError::MoeRoutingEntriesExceedMax {
             numel,
-            max: PEARL_MOE_MAX_ROUTING_ENTRIES,
+            max: limits.max_routing_entries(),
         });
     }
     if routing_data.len() as u64 != numel {
@@ -2052,6 +2215,9 @@ pub fn verify_pearl_moe_routing_binding(
             return Err(PearlCompatError::MoeOuterIndicesMismatch);
         }
     }
+    if limits.exact_moe_multiplicity {
+        verify_pearl_moe_routing_multiplicity(mining_config, m, routing_data, limits)?;
+    }
     Ok(())
 }
 
@@ -2114,6 +2280,25 @@ pub fn verify_pearl_moe_compatible_work(
     nockchain_target: &[u8; 32],
     max_pattern_len: usize,
 ) -> Result<PearlMoeWorkPrecheck, PearlCompatError> {
+    verify_pearl_moe_compatible_work_with_limits(
+        public_params,
+        moe,
+        routing_data,
+        nockchain_target,
+        max_pattern_len,
+        PearlAdmissionLimits::HARDENED,
+    )
+}
+
+/// Work precheck retaining the selected historical or activated routing bound.
+pub fn verify_pearl_moe_compatible_work_with_limits(
+    public_params: &PearlPublicProofParams,
+    moe: &PearlMoeParams,
+    routing_data: &[u32],
+    nockchain_target: &[u8; 32],
+    max_pattern_len: usize,
+    limits: PearlAdmissionLimits,
+) -> Result<PearlMoeWorkPrecheck, PearlCompatError> {
     // (1) MoE-aware envelope. Rejects an out-of-envelope base shape or an
     // out-of-range MoE config; accepts a valid MoE config (dense sanity_check would
     // fail-close here).
@@ -2148,9 +2333,9 @@ pub fn verify_pearl_moe_compatible_work(
     // offsets/tokens/spans are well-formed, and the opened rows are the expert's
     // routed tokens. MUST precede the splice — it is what makes moe.hash_routing
     // trustworthy as the routing root.
-    verify_pearl_moe_routing_binding(
+    verify_pearl_moe_routing_binding_with_limits(
         &kappa, &public_params.mining_config, moe, public_params.m, public_params.t_rows,
-        routing_data, max_pattern_len,
+        routing_data, max_pattern_len, limits,
     )?;
 
     // (5) Recompute the routing-spliced seeds (same formula as the PI-validated
@@ -2262,7 +2447,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rb03_moe_routing_cap_fits_single_atom_budget() {
+    fn moe_routing_cap_fits_single_atom_budget() {
         let max_nonce_bytes = PEARL_MOE_NONCE_DENSE_ENVELOPE_MAX_BYTES
             + PEARL_MOE_NONCE_TAIL_FIXED_MAX_BYTES
             + PEARL_MOE_MAX_ROUTING_ENTRIES * 4;
@@ -2274,7 +2459,68 @@ mod tests {
     }
 
     #[test]
-    fn rb05_moe_expert_columns_reject_bleed_and_overflow() {
+    fn historical_and_hardened_framing_preserve_the_atom_budget() {
+        assert_eq!(PearlAdmissionLimits::LEGACY.max_merkle_branch(), 0);
+        assert_eq!(PearlAdmissionLimits::HARDENED.max_merkle_branch(), 32);
+        assert_eq!(PearlAdmissionLimits::LEGACY.max_routing_entries(), 235_626);
+        assert_eq!(
+            PearlAdmissionLimits::HARDENED.max_routing_entries(),
+            235_370
+        );
+        for limits in [PearlAdmissionLimits::LEGACY, PearlAdmissionLimits::HARDENED] {
+            assert!(limits.moe_nonce_max_bytes() <= 1 << 20);
+            assert!(limits.moe_nonce_max_bytes() + 4 > 1 << 20);
+        }
+    }
+
+    #[test]
+    fn historical_routing_binding_retains_the_old_upper_bound() {
+        let m = PearlAdmissionLimits::LEGACY.max_routing_entries();
+        let kappa = [0x11; 32];
+        let config = PearlMiningConfig {
+            common_dim: 1024,
+            rank: 64,
+            mma_type: PEARL_MMA_INT7XINT7_TO_INT32,
+            rows_pattern: PearlPeriodicPattern::from_list(&[0, 1]).unwrap(),
+            cols_pattern: PearlPeriodicPattern::from_list(&[0, 1]).unwrap(),
+            reserved: PearlMiningConfig::moe_trailer(2, 1),
+        };
+        let topk: Vec<u32> = (0..m).map(|t| (t % 2) as u32).collect();
+        let routing = crate::pearl_moe_routing::build_routing_data(&topk, m, 1, 2).unwrap();
+        let moe = PearlMoeParams {
+            expert_idx: 0,
+            routing_offsets: routing.routing_offsets.clone(),
+            hash_routing: matrix_commitment(&routing.routing_data_le_bytes(), &kappa),
+            outer_indices: vec![0, 2],
+        };
+        verify_pearl_moe_routing_binding_with_limits(
+            &kappa,
+            &config,
+            &moe,
+            m as u32,
+            0,
+            &routing.routing_data,
+            4096,
+            PearlAdmissionLimits::LEGACY,
+        )
+        .expect("a well-formed historical routing table at the old cap remains valid");
+        assert!(matches!(
+            verify_pearl_moe_routing_binding_with_limits(
+                &kappa,
+                &config,
+                &moe,
+                m as u32,
+                0,
+                &routing.routing_data,
+                4096,
+                PearlAdmissionLimits::HARDENED,
+            ),
+            Err(PearlCompatError::MoeRoutingEntriesExceedMax { max: 235_370, .. })
+        ));
+    }
+
+    #[test]
+    fn moe_expert_columns_reject_bleed_and_overflow() {
         assert_eq!(
             moe_expert_b_cols_from_local(&[0, 7], 3, 8).unwrap(),
             vec![24, 31]
@@ -2530,13 +2776,11 @@ impl PearlNockchainAux {
 /// Pearl-side evidence that the Nockchain aux digest was committed before the
 /// shared work attempt was mined.
 ///
-/// The proof is intentionally coinbase-rooted. The current Nockchain production
-/// profile uses coinbase-only Pearl block templates, so `merkle_branch` must be
-/// empty and any nonempty branch is rejected. The field remains in the
-/// Rust-owned nonce format so a future milestone can deliberately add ordinary
-/// Pearl transaction merkle tree support without changing the outer `%ai-pow`
-/// noun shape. The header stores the resulting root in display byte order,
-/// matching `IncompleteBlockHeader::merkle_root`.
+/// The proof is coinbase-rooted: `merkle_branch` contains raw SHA256d sibling
+/// hashes from leaf to root, with the coinbase at transaction index zero.
+/// An empty branch represents a coinbase-only block; nonempty branches commit
+/// to the other Pearl transactions. The header stores the resulting root in
+/// display byte order, matching `IncompleteBlockHeader::merkle_root`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PearlAuxInclusionProof {
     pub coinbase_tx: Vec<u8>,
@@ -2544,13 +2788,13 @@ pub struct PearlAuxInclusionProof {
 }
 
 /// Verify that `aux_commitment` is present in the txid-committed coinbase script
-/// and that the coinbase txid is the Pearl header merkle root.
+/// and that its transaction Merkle path reaches the Pearl header merkle root.
 ///
 /// This checks the Pearl block commitment side of merge mining without
 /// requiring Nockchain to parse or verify Pearl's ZKP, or to construct Pearl
-/// transaction trees itself. The current production profile deliberately
-/// supports only coinbase-only Pearl block templates, so the merkle branch must
-/// be empty and the header root is just the coinbase txid in header byte order.
+/// transaction trees itself. Since the coinbase is transaction zero, each
+/// sibling is on the right: hash `current_root || sibling` at every level,
+/// then reverse only the final root into header byte order.
 /// The tagged payload is:
 ///
 /// ```text
@@ -2565,6 +2809,21 @@ pub fn verify_pearl_aux_inclusion(
     aux_commitment: &[u8; 32],
     proof: &PearlAuxInclusionProof,
 ) -> Result<(), PearlCompatError> {
+    verify_pearl_aux_inclusion_with_limits(
+        header,
+        aux_commitment,
+        proof,
+        PearlAdmissionLimits::HARDENED,
+    )
+}
+
+/// Verify inclusion with a branch limit selected by the Nockchain block rules.
+pub fn verify_pearl_aux_inclusion_with_limits(
+    header: &PearlIncompleteBlockHeader,
+    aux_commitment: &[u8; 32],
+    proof: &PearlAuxInclusionProof,
+    limits: PearlAdmissionLimits,
+) -> Result<(), PearlCompatError> {
     if proof.coinbase_tx.is_empty() {
         return Err(PearlCompatError::PearlAuxCoinbaseTxEmpty);
     }
@@ -2573,13 +2832,16 @@ pub fn verify_pearl_aux_inclusion(
             proof.coinbase_tx.len(),
         ));
     }
-    if proof.merkle_branch.len() > PEARL_AUX_INCLUSION_MAX_MERKLE_BRANCH {
+    if proof.merkle_branch.len() > limits.max_merkle_branch() {
         return Err(PearlCompatError::PearlAuxMerkleBranchTooDeep(
             proof.merkle_branch.len(),
         ));
     }
 
     let parsed_tx = pearl_txid_committed_bytes(&proof.coinbase_tx)?;
+    if limits.canonical_aux_serialization && parsed_tx.txid_committed_bytes != proof.coinbase_tx {
+        return Err(PearlCompatError::PearlAuxNoncanonicalCoinbaseEvidence);
+    }
     // Bind EXACTLY ONE Nockchain commitment per Pearl PoW. A plain "tag is
     // present somewhere" check lets a merge-miner embed two `TAG || commit` pairs in
     // one coinbase, so a single Pearl PoW (one coinbase, one merkle root) satisfies
@@ -3475,6 +3737,16 @@ fn validate_attempt_inputs(
 pub fn pearl_bitcoin_double_sha256_raw(bytes: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(bytes);
     Sha256::digest(first).into()
+}
+
+/// Return the canonical auxiliary evidence: exactly the serialization committed
+/// by the Pearl transaction ID. This does not change the Pearl transaction;
+/// producers use this copy only in the Nockchain artifact.
+pub fn canonical_pearl_aux_coinbase(tx: &[u8]) -> Result<Vec<u8>, PearlCompatError> {
+    if tx.len() > PEARL_AUX_INCLUSION_MAX_COINBASE_TX_BYTES {
+        return Err(PearlCompatError::PearlAuxCoinbaseTxTooLarge(tx.len()));
+    }
+    Ok(pearl_txid_committed_bytes(tx)?.txid_committed_bytes)
 }
 
 struct PearlTxidCommittedBytes {

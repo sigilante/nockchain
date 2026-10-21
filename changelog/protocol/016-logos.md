@@ -1,6 +1,6 @@
 +++
 version = "0.1.16"
-status = "draft"
+status = "activated"
 consensus_critical = true
 
 # Activation
@@ -15,7 +15,7 @@ authors = ["Logan Allen (National Compute Co)"]
 reviewers = ["@nockchain-core"]
 
 supersedes = "0.1.15"
-superseded_by = ""
+superseded_by = "0.1.17"
 +++
 
 # Logos
@@ -216,8 +216,8 @@ attempt, a miner:
    `%ai-pow` block. Otherwise it advances the extranonce and repeats.
 
 The proof is a **compact final-layer batch-STARK recursive certificate**
-(Plonky3 over Goldilocks + Tip5 + FRI, recursion via the vendored
-`plonky3-recursion` substrate). It carries only the small final compact body
+(Plonky3 over Goldilocks + Tip5 + FRI, recursion via the exact-commit-pinned
+`nockchain/Plonky3-recursion` fork). It carries only the small final compact body
 plus an explicit verifier-key digest; it binds the opened tile to the
 block-committed `H_A`/`H_B` (dense) or the routing/jackpot commitment (MoE)
 in-circuit, so the matrices are miner-chosen but non-grindable — a proof over any
@@ -229,6 +229,36 @@ The new consensus crates are `ai-pow` (the Pearl-compatible prover/verifier
 glue), `ai-pow-zk` (the Plonky3 AIR + recursion), `ai-pow-jets` (the consensus
 verify jet + verifier-setup residency), and the miner-side `ai-pow-miner` +
 `zk-pow-miner` + shared `nockchain-mining-common`.
+
+#### Pearl transaction commitment
+
+Merge-mined Pearl blocks may contain ordinary transactions as well as the
+coinbase. The Rust-owned `AIP1` (dense) and `AIM1` (MoE) nonces carry the
+coinbase transaction and up to 32 transaction-Merkle siblings. Siblings are
+32-byte raw SHA256d hashes in leaf-to-root order. The coinbase is transaction
+index zero: each level hashes `current_root || sibling`, then only the final
+root is reversed to match the Pearl header's display byte order.
+
+Admission requires that this path reach the exact header root and that the
+txid-committed coinbase input script contain exactly one
+`NOCKCHAIN-AI-POW-AUX` tag followed by the expected Nockchain aux commitment.
+SegWit witness bytes do not contribute to the txid. Empty branches represent
+coinbase-only blocks. Nockchain verifies this inclusion, not the validity of
+the other Pearl transactions.
+
+The nonce wire format is unchanged. These limits follow the candidate block's
+height-selected rules, including on historical replay and reorgs:
+
+| Candidate height | Maximum siblings | Maximum MoE routing entries |
+| --- | ---: | ---: |
+| Below 154,500 | 0 | 235,626 |
+| From 154,500 | 32 | 235,370 |
+
+The branch cap bounds hashing work and adds at most 1,024 sibling bytes. The
+existing 1 MiB MoE nonce budget reserves that space by reducing the routing
+allowance by 256 entries only after activation. The decoder, native routing
+binding, verifier, and miner select the same rules from the Nockchain block
+height.
 
 ### Puzzle-priced heaviness
 
@@ -349,7 +379,7 @@ variant of the candidate: the same block re-targeted to the AI ASERT target
 identical variant from the same candidate + state and runs the verify jet.
 
 The reference miner is `ai-pow-miner` (`ai-pow-mine`), with a self-contained
-gateway-free `--canonical` CPU mode for fakenet. A submitted block is
+gateway-free `--reference` CPU mode for fakenet. A submitted block is
 `[%command %pow %ai-pow nonce cert]`.
 
 ### Pearl merge-mining compatibility
@@ -434,12 +464,16 @@ values are rejected.
 
 ### Data Migration
 
-Kernel state advances to `kernel-state-11`; its `derived-state-11` stores
-branch-local `puzzle-asert-states`. A state-10 load upgrades only before AI
-activation (or at genesis), when that lineage is empty and deterministic; a
-post-activation state-10 load resets consensus state because its missing fork
-lineage cannot be reconstructed. `blockchain-constants` keeps the v1 10-slot
-layout, whose Rust encode/decode round-trip is regression-pinned.
+Kernel state advances to `kernel-state-12`; its `consensus-state-12` adds
+`block-versions`, and its `derived-state-12` stores branch-local
+`puzzle-asert-states`. Valid state-11 loads adopt this schema without reapplying
+Zoe's activation guard. Older states first pass through the
+[Zoe migration checks](./015-zoe.md#data-migration): an accepted state-10 tip must
+precede both Zoe and AI-PoW activation and have the required timestamp caches.
+Unsafe migration aborts load and preserves the checkpoint for explicit operator
+recovery; it does not reset consensus state or automatically resynchronize.
+`blockchain-constants` keeps the v1 10-slot layout, whose Rust encode/decode
+round-trip is regression-pinned.
 
 ### Steps
 
@@ -458,6 +492,40 @@ outright (unknown block variant / no verify jet), so it forks off.
 
 ## Backward Compatibility
 
+### AI-PoW rules at height 154,500
+
+The candidate block's height selects AI-PoW verification rules. Blocks below
+154,500 use the historical verifier, including during replay and reorgs. Blocks
+at or above 154,500 use the updated proof program and verifier setup.
+
+Dense and MoE compact certificates must satisfy the admission rules selected
+by the candidate height. The certificate wire format is unchanged.
+
+Deploy the consensus kernel and Rust verifier jets from the same release.
+The `ai-pow-verify` gate receives a rule tag selected from the block height and
+uses the `%ai-pow-verify-v2` jet binding. A missing binding or unknown rule tag
+halts verification; verification does not retry using another rule version.
+The AI-PoW proof version remains `%4`.
+
+### Pending blocks during upgrade and promotion
+
+Every kernel load discards pending headers, including a same-version `%12`
+load, and refreshes the mining candidate. Pending-header cleanup releases
+transaction dependencies and returns retained raw transactions to the mempool.
+Compatible accepted chain state is preserved. Discarded blocks require fresh
+header validation when received again. Pending-block promotion performs a
+proof-of-work check under the selected rules.
+
+See the [operator guidance](../../docs/AI_POW_CUTOVER.md) for setup initialization,
+matched-component upgrades, and recovery requirements.
+
+### Miner terminology
+
+The gateway-free default miner profile is named the **reference** profile
+(`ai-pow-mine --reference`, previously `--canonical`). Its fixed
+`m=64,k=1024,n=64` shape is one member of the consensus-admissible parameter
+envelope. This CLI rename does not change wire encoding or consensus rules.
+
 ### Breaking Changes
 
 This is a **consensus-critical** upgrade. After activation:
@@ -472,6 +540,10 @@ This is a **consensus-critical** upgrade. After activation:
   reproduce it.
 - The `blockchain-constants` noun gains the AI-PoW fields, causing decode
   failures on pre-0.1.16 software.
+- Pearl transaction-tree admission widens the former zero-sibling restriction
+  at height 154,500. Upgrade validators and miners before that height. Below
+  it, the historical zero-sibling and routing limits remain in force; from it,
+  the MoE routing-entry cap is 256 entries lower to retain the 1 MiB budget.
 
 ### Network Partition Risk
 
@@ -486,6 +558,16 @@ structurally valid across the boundary.
 
 ## Security Considerations
 
+- **Proof-version bookkeeping is acceptance-path invariant.** Both roads into
+  `.blocks` record a `block-versions` entry for a post-activation block: the direct
+  `+accept-block` write and the pending-promotion path
+  (`+accept-pending-block`, reached when a block's transactions arrive after its
+  header). Before this invariant was enforced on the promotion path, a promoted
+  AI-PoW block was persisted with no entry and `+block-id-to-proof-version`
+  answered with the height-derived legacy ZK version (GHSA-g3g3-q33c-6fwh). Fork
+  choice and ASERT never read the map — they price from the verified block
+  artifact — so the defect was a durable misclassification for future consumers,
+  not a live split.
 - **Fail-closed verification.** The Hoon `++ai-pow-verify` arm `!!`s if the jet
   is absent, and the jet returns a deterministic `NO` (not a crash) on any
   malformed/forged input. A stale, forged, or mis-shaped certificate is rejected.
@@ -493,6 +575,14 @@ structurally valid across the boundary.
   in `catch_unwind`; a build guard forbids `panic = "abort"` for the verifier
   crate. Decode is bounded (proof-node depth/count/atom-byte caps), and a
   trace-height above the `2^19` accept-band is rejected before the setup lookup.
+  Invalid Fiat-Shamir tile counts, ranges, and sample counts return typed errors
+  before challenge sampling instead of panicking.
+- **Overflow-safe trace construction.** BLAKE3 trace construction derives a
+  prior chaining-value row only for noninitial blocks, so a row-zero trace
+  cannot underflow with checked arithmetic.
+- **Deterministic virtual-scry failures.** A malformed virtual-scry response
+  becomes a deterministic `%exit` tone with its `%hunk` trace instead of
+  escaping as a `ScryCrashed` interpreter error.
 - **Invalid-proof spam escalation.** A `%failed-pow-check` liar effect blocks
   every peer that supplied the block and records objective cryptographic
   misbehavior against its authenticated connection address; repeated peer-ID
@@ -533,14 +623,16 @@ structurally valid across the boundary.
 ## Operational Impact
 
 - **One-time boot delay.** First boot generates the AI-PoW verifier setup
-  (~15 minutes, logged: "Generating the AI-PoW verifier-setup table…"). Do not
-  kill a node that appears "hung" during this step; subsequent boots load the
-  cache in seconds. Ship the cache to skip it.
+  (~15 minutes, logged: "Generating the AI-PoW verifier-setup table…").
+  Contexts and checksum sidecars are synced to temporary files and atomically
+  renamed into place. An interrupted build leaves no partial final context;
+  restart regenerates it without operator cleanup. Subsequent boots load the
+  cache in seconds. Ship the cache to skip generation.
 - **Verifier-setup RSS.** The DoS-safe default retains all 13 contexts after first
   use, requiring the measured setup-table RSS budget. Lower caps reduce RSS by
   paging contexts in and out. jemalloc is required (not optional).
 - **Dual mining.** Two miner processes can attach: `zk-pow-mine` and
-  `ai-pow-mine` (the latter with a self-contained `--canonical` CPU mode). Each
+  `ai-pow-mine` (the latter with a self-contained `--reference` CPU mode). Each
   receives its own candidate effect (`%mine-zk` / `%mine-ai`) and submits its own
   block; both re-target immediately on a new heaviest block.
 - **Block cadence.** The AI puzzle targets a 500 s per-puzzle ideal and the ZK
@@ -548,7 +640,7 @@ structurally valid across the boundary.
   149.86 s combined cadence that targets 29.97% AI and 70.03% ZK. If only one
   puzzle is active, that puzzle's ASERT converges it toward its own ideal (500 s
   or 214 s).
-- **AI proving cost.** A canonical CPU proof takes ~30 s; the node's
+- **AI proving cost.** A reference CPU proof takes ~30 s; the node's
   candidate-update interval must exceed the prove time (fakenet:
   `--fakenet-update-candidate-interval-secs`). GPU-shaped provers are the
   intended mainnet path.
@@ -597,7 +689,7 @@ structurally valid across the boundary.
 ### Live fakenet
 
 A dual-miner fakenet smoke harness runs a node with both `zk-pow-mine` and
-`ai-pow-mine --canonical`, advancing a single chain with both puzzles winning
+`ai-pow-mine --reference`, advancing a single chain with both puzzles winning
 heights and each block carrying its own per-puzzle ASERT target (zero errors
 over multi-minute runs).
 

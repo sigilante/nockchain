@@ -26,9 +26,10 @@ use crate::chips::blake3::compress::Blake3Tweak;
 use crate::chips::control::NUM_SELECTORS;
 use crate::chips::input::NOISE_PACKING_BASE;
 use crate::composite_layout::{TILE_D, TILE_H};
-use crate::composite_preprocess::{build_preprocessed_columns, RowDescriptor};
+use crate::composite_preprocess::{preprocessed_program_row, RowDescriptor};
 use crate::noise_ref::{e_value, f_value};
 use crate::params::ZkParams;
+use crate::proof_rules::ProofRules;
 use crate::Val;
 
 /// Coarse per-row class — the schedule's granularity (the
@@ -733,39 +734,16 @@ fn blake3_block_descriptor(j: usize, tweak_packed: u64, finalize_extra: &[usize]
     }
 }
 
-/// **The params-pure canonical program.** Builds the
-/// `trace_len × PROGRAM_COLS.len()` preprocessed matrix the
-/// canonical-program pin commits to, from public data **only** (`params` + the
-/// attested/pinned `BlockPublic` + the params-pure `trace_len`) —
-/// *no witness*. Per row: `row_schedule` → [`RowClass`] →
-/// a params-pure [`RowDescriptor`] → the existing
-/// [`build_preprocessed_columns`] packing (the *one* shared
-/// schedule + the *one* packing — no prover/verifier divergence).
-///
-/// Classes in [`is_class_canonical`] are
-/// reconstructed exactly; all others fall back to
-/// [`RowDescriptor::padding`] — a deliberate, KAT-fenced
-/// *placeholder*, NOT a soundness claim. The KAT
-/// (`canonical_program == extract_program(honest_trace)`) asserts
-/// equality **only on `is_class_canonical` rows**. **The verify
-/// path commits to this only once every class is canonical, gated
-/// on the full KAT/Route-A/crit1_*/debug-assertions-ON suite**
-/// (the soundness linchpin). Until then this is dead w.r.t.
-/// prove/verify.
+/// Construct the complete canonical 22-column program from the trusted public
+/// schedule, block inputs, parameters, and trace height. Packing is shared with
+/// witness-derived programs through the same preprocessing row packer.
 pub fn canonical_program(
     params: &ZkParams,
     bp: &BlockPublic,
     trace_len: usize,
 ) -> Result<RowMajorMatrix<Val>, String> {
-    // Defense-in-depth at the verify-side params-pure
-    // entry. The deep helpers (`schedule_layout`, `tile_chunk_range`,
-    // `strip_opening_rows`) `assert!` invariants that *hold under
-    // validated `ZkParams` + in-range `tile_i/j` + a non-degenerate
-    // `trace_len`*. The production verifier reaches here only with
-    // validated params (via `ai-pow::zk_bridge`), so the asserts
-    // are unreachable on the chain path. This entry validation turns
-    // an attacker-controlled-params bypass (a broken canonical-program
-    // trust pin) into a typed `Err` rather than a deep cryptic panic.
+    // Validate parameters before schedule and opening helpers assert their
+    // geometry invariants. Invalid parameters return a typed error here.
     params.validate()?;
     if !params.noise_rank.is_multiple_of(16) {
         return Err(format!(
@@ -803,6 +781,24 @@ pub fn canonical_program_for_strip_schedule(
     bp: &BlockPublic,
     trace_len: usize,
 ) -> Result<RowMajorMatrix<Val>, String> {
+    canonical_program_for_strip_schedule_with_rules(
+        params,
+        strip_schedule,
+        bp,
+        trace_len,
+        ProofRules::Hardened,
+    )
+}
+
+/// Reconstruct the program for the consensus-selected rule set, preserving
+/// the committed program for each supported version.
+pub fn canonical_program_for_strip_schedule_with_rules(
+    params: &ZkParams,
+    strip_schedule: &StripIndexSchedule,
+    bp: &BlockPublic,
+    trace_len: usize,
+    rules: ProofRules,
+) -> Result<RowMajorMatrix<Val>, String> {
     params.validate_base()?;
     if !params.noise_rank.is_multiple_of(16) {
         return Err(format!(
@@ -830,14 +826,14 @@ pub fn canonical_program_for_strip_schedule(
     } else {
         schedule_layout_for_strip_schedule(params, strip_schedule, trace_len)
     };
-    let sp = StripPlan::build_for_strip_schedule(params, strip_schedule)?;
-    let program: Vec<RowDescriptor> = (0..trace_len)
-        .map(|r| row_descriptor(r, l.class_of(r), &l, &sp, params, bp))
-        .collect();
-    let rows = build_preprocessed_columns(&program, trace_len);
-    let w = rows.first().map(|r| r.len()).unwrap_or(0);
-    let flat: Vec<Val> = rows.into_iter().flatten().collect();
-    Ok(RowMajorMatrix::new(flat, w))
+    let sp = StripPlan::build_for_strip_schedule_with_rules(params, strip_schedule, rules)?;
+    let width = crate::composite_full_air::PROGRAM_COLS.len();
+    let mut flat = Vec::with_capacity(trace_len * width);
+    for row in 0..trace_len {
+        let descriptor = row_descriptor(row, l.class_of(row), &l, &sp, params, bp);
+        flat.extend(preprocessed_program_row(row, &descriptor));
+    }
+    Ok(RowMajorMatrix::new(flat, width))
 }
 
 /// One 8-row BLAKE3 block of a tile's strip-opening — the
@@ -855,9 +851,14 @@ enum StripBlock {
         b: usize,
         single_chunk_root: bool,
     },
-    /// An auth-fold parent compression (`place_parent`); `is_root`
-    /// ⇒ `F_ROOT` + the `IS_HASH_A/B` finalize selector.
-    Parent { is_root: bool },
+    /// An auth-fold parent compression (`place_parent`). Computed children
+    /// carry their producing block's backwards distance from this parent;
+    /// authentication siblings have no in-trace source.
+    Parent {
+        is_root: bool,
+        left_source_back: Option<usize>,
+        right_source_back: Option<usize>,
+    },
 }
 
 /// Params-pure post-order block list for one tile's strip-opening
@@ -880,7 +881,7 @@ fn strip_blocks(c0: usize, c1: usize, num_chunks: usize) -> Vec<StripBlock> {
         }
         return out;
     }
-    fn subtree_inside(out: &mut Vec<StripBlock>, lo: usize, hi: usize, is_root: bool) {
+    fn subtree_inside(out: &mut Vec<StripBlock>, lo: usize, hi: usize, is_root: bool) -> usize {
         if hi - lo == 1 {
             // place_leaf_chunk(chunk_index=lo,
             // single_chunk_root=false) — a leaf is never root when
@@ -892,27 +893,45 @@ fn strip_blocks(c0: usize, c1: usize, num_chunks: usize) -> Vec<StripBlock> {
                     single_chunk_root: false,
                 });
             }
-            return;
+            return out.len() - 1;
         }
         let mid = lo + left_len((hi - lo) as u64) as usize;
-        subtree_inside(out, lo, mid, false);
-        subtree_inside(out, mid, hi, false);
-        out.push(StripBlock::Parent { is_root });
+        let left = subtree_inside(out, lo, mid, false);
+        let right = subtree_inside(out, mid, hi, false);
+        let parent = out.len();
+        out.push(StripBlock::Parent {
+            is_root,
+            left_source_back: Some(parent - left),
+            right_source_back: Some(parent - right),
+        });
+        parent
     }
-    fn fold(out: &mut Vec<StripBlock>, lo: usize, hi: usize, c0: usize, c1: usize, is_root: bool) {
+    fn fold(
+        out: &mut Vec<StripBlock>,
+        lo: usize,
+        hi: usize,
+        c0: usize,
+        c1: usize,
+        is_root: bool,
+    ) -> Option<usize> {
         if hi <= c0 || lo >= c1 {
-            return; // auth sibling — 0 rows
+            return None; // auth sibling — 0 rows
         }
         if c0 <= lo && hi <= c1 {
-            subtree_inside(out, lo, hi, is_root);
-            return;
+            return Some(subtree_inside(out, lo, hi, is_root));
         }
         let mid = lo + left_len((hi - lo) as u64) as usize;
-        fold(out, lo, mid, c0, c1, false);
-        fold(out, mid, hi, c0, c1, false);
-        out.push(StripBlock::Parent { is_root });
+        let left = fold(out, lo, mid, c0, c1, false);
+        let right = fold(out, mid, hi, c0, c1, false);
+        let parent = out.len();
+        out.push(StripBlock::Parent {
+            is_root,
+            left_source_back: left.map(|source| parent - source),
+            right_source_back: right.map(|source| parent - source),
+        });
+        Some(parent)
     }
-    fold(&mut out, 0, num_chunks, c0, c1, true);
+    let _ = fold(&mut out, 0, num_chunks, c0, c1, true);
     out
 }
 
@@ -941,7 +960,7 @@ fn strip_blocks_set(sel: &[usize], num_chunks: usize) -> Vec<StripBlock> {
     fn sel_count(sel: &[usize], lo: usize, hi: usize) -> usize {
         sel.partition_point(|&c| c < hi) - sel.partition_point(|&c| c < lo)
     }
-    fn subtree_inside(out: &mut Vec<StripBlock>, lo: usize, hi: usize, is_root: bool) {
+    fn subtree_inside(out: &mut Vec<StripBlock>, lo: usize, hi: usize, is_root: bool) -> usize {
         if hi - lo == 1 {
             for b in 0..16 {
                 out.push(StripBlock::Leaf {
@@ -950,28 +969,45 @@ fn strip_blocks_set(sel: &[usize], num_chunks: usize) -> Vec<StripBlock> {
                     single_chunk_root: false,
                 });
             }
-            return;
+            return out.len() - 1;
         }
         let mid = lo + left_len((hi - lo) as u64) as usize;
-        subtree_inside(out, lo, mid, false);
-        subtree_inside(out, mid, hi, false);
-        out.push(StripBlock::Parent { is_root });
+        let left = subtree_inside(out, lo, mid, false);
+        let right = subtree_inside(out, mid, hi, false);
+        let parent = out.len();
+        out.push(StripBlock::Parent {
+            is_root,
+            left_source_back: Some(parent - left),
+            right_source_back: Some(parent - right),
+        });
+        parent
     }
-    fn fold(out: &mut Vec<StripBlock>, lo: usize, hi: usize, sel: &[usize], is_root: bool) {
+    fn fold(
+        out: &mut Vec<StripBlock>,
+        lo: usize,
+        hi: usize,
+        sel: &[usize],
+        is_root: bool,
+    ) -> Option<usize> {
         let cnt = sel_count(sel, lo, hi);
         if cnt == 0 {
-            return; // auth sibling — 0 rows
+            return None; // auth sibling — 0 rows
         }
         if cnt == hi - lo {
-            subtree_inside(out, lo, hi, is_root);
-            return;
+            return Some(subtree_inside(out, lo, hi, is_root));
         }
         let mid = lo + left_len((hi - lo) as u64) as usize;
-        fold(out, lo, mid, sel, false);
-        fold(out, mid, hi, sel, false);
-        out.push(StripBlock::Parent { is_root });
+        let left = fold(out, lo, mid, sel, false);
+        let right = fold(out, mid, hi, sel, false);
+        let parent = out.len();
+        out.push(StripBlock::Parent {
+            is_root,
+            left_source_back: left.map(|source| parent - source),
+            right_source_back: right.map(|source| parent - source),
+        });
+        Some(parent)
     }
-    fold(&mut out, 0, num_chunks, sel, true);
+    let _ = fold(&mut out, 0, num_chunks, sel, true);
     out
 }
 
@@ -987,6 +1023,7 @@ pub fn strip_opening_rows_set(sel: &[usize], num_chunks: usize) -> usize {
 /// region's `IS_HASH_A/B` finalize selector (4 = `IS_HASH_A`
 /// A-side, 5 = `IS_HASH_B` B-side — `place_matrix_hash_a/b`).
 struct StripPlan {
+    rules: ProofRules,
     ca0: usize,
     cb0: usize,
     a_lane_base: usize,
@@ -1003,9 +1040,18 @@ struct StripPlan {
 }
 
 impl StripPlan {
+    #[cfg(test)]
     fn build_for_strip_schedule(
         params: &ZkParams,
         strip_schedule: &StripIndexSchedule,
+    ) -> Result<Self, String> {
+        Self::build_for_strip_schedule_with_rules(params, strip_schedule, ProofRules::Hardened)
+    }
+
+    fn build_for_strip_schedule_with_rules(
+        params: &ZkParams,
+        strip_schedule: &StripIndexSchedule,
+        rules: ProofRules,
     ) -> Result<Self, String> {
         let ((_ca0, _ca1, a_nc), (_cb0, _cb1, b_nc)) = strip_schedule.chunk_ranges(params)?;
         let k = params.k as usize;
@@ -1023,15 +1069,15 @@ impl StripPlan {
         let a_lane_base = covering_id_lane_base("A", ca0, k)?;
         let b_lane_base = covering_id_lane_base("B", cb0, k)?;
         let w_tile = strip_schedule.b_indices.len();
-        // Bases cover every lane from the row containing the first selected
-        // chunk through the last opened row or column. This keeps the matrix
-        // sides disjoint for sparse and non-origin schedules.
-        let (a_id_base, b_id_base) = crate::composite_trace::try_noised_id_bases(
+        // Select the producer namespace using the consensus rules.
+        let (a_id_base, b_id_base) = crate::composite_trace::try_noised_id_bases_with_rules(
             covering_id_span("A", &strip_schedule.a_indices, ca0, k)? - 1,
             covering_id_span("B", &strip_schedule.b_indices, cb0, k)? - 1,
             k,
+            rules,
         )?;
         Ok(StripPlan {
+            rules,
             ca0,
             cb0,
             a_lane_base,
@@ -1076,6 +1122,7 @@ fn strip_row_descriptor(
     j: usize,
     selector_idx: usize,
     row_idx: usize,
+    rules: ProofRules,
 ) -> RowDescriptor {
     let (tweak, is_root) = match spec {
         StripBlock::Leaf {
@@ -1104,7 +1151,7 @@ fn strip_row_descriptor(
                 is_root,
             )
         }
-        StripBlock::Parent { is_root } => {
+        StripBlock::Parent { is_root, .. } => {
             let mut flags = F_KEYED_HASH | F_PARENT;
             if is_root {
                 flags |= F_ROOT;
@@ -1130,6 +1177,34 @@ fn strip_row_descriptor(
         if b > 0 && j == 1 {
             desc.selectors[7] = true; // IS_CV_IN
             desc.cv_or_tweak = (row_idx - 2) as u64;
+        }
+    }
+    if let (
+        ProofRules::Hardened,
+        StripBlock::Parent {
+            left_source_back,
+            right_source_back,
+            ..
+        },
+    ) = (rules, spec)
+    {
+        let source_row = |back: usize| {
+            (row_idx - j)
+                .checked_sub(back * 8)
+                .expect("parent child source must precede its parent")
+                + 7
+        };
+        if j == 1 {
+            if let Some(back) = left_source_back {
+                desc.selectors[12] = true; // IS_PARENT_CV, left half
+                desc.cv_or_tweak = source_row(back) as u64;
+            }
+        } else if j == 6 {
+            if let Some(back) = right_source_back {
+                desc.selectors[12] = true; // IS_PARENT_CV
+                desc.selectors[7] = true; // IS_CV_IN selects the right half
+                desc.cv_or_tweak = source_row(back) as u64;
+            }
         }
     }
     // κ-keyed compression round-0 rows: every chunk's block 0
@@ -1247,7 +1322,7 @@ fn row_descriptor(
                 "strip row offset {offset} past block list"
             );
             let spec = blocks[block];
-            let mut desc = strip_row_descriptor(spec, j, selector_idx, row_idx);
+            let mut desc = strip_row_descriptor(spec, j, selector_idx, row_idx, sp.rules);
             // Layer the 8 noise sub-slice pins onto the
             // co-located leaf round-0 producer rows (16|r path).
             if let StripBlock::Leaf { chunk_index, b, .. } = spec {
@@ -1482,12 +1557,12 @@ mod tests {
         );
         assert!(matches!(
             blocks.last(),
-            Some(StripBlock::Parent { is_root: true })
+            Some(StripBlock::Parent { is_root: true, .. })
         ));
         assert_eq!(
             blocks
                 .iter()
-                .filter(|b| matches!(b, StripBlock::Parent { is_root: true }))
+                .filter(|b| matches!(b, StripBlock::Parent { is_root: true, .. }))
                 .count(),
             1
         );
@@ -1773,7 +1848,7 @@ mod tests {
 
     /// The canonical `StripPlan` id bases are side-disjoint for a
     /// scattered schedule and identical to the tile-height derivation for
-    /// a contiguous tile.
+    /// a chunk-aligned contiguous tile.
     #[test]
     fn strip_plan_id_bases_side_disjoint_scattered_legacy_parity() {
         let p = ZkParams {
@@ -1804,7 +1879,7 @@ mod tests {
                 assert!(key < sp.b_id_base, "A key {key} must stay below b_id_base");
             }
         }
-        // Contiguous tile: span == h_tile ⇒ legacy base byte-for-byte.
+        // Chunk-aligned contiguous tile: legacy base byte-for-byte.
         let sched_t = StripIndexSchedule::from_tile(&p, 2, 3).expect("tile schedule");
         let sp_t = StripPlan::build_for_strip_schedule(&p, &sched_t).expect("plan builds");
         assert_eq!(
@@ -2257,7 +2332,7 @@ mod tests {
                         let roots = blocks
                             .iter()
                             .filter(|b| {
-                                matches!(b, StripBlock::Parent { is_root: true })
+                                matches!(b, StripBlock::Parent { is_root: true, .. })
                                     || matches!(
                                         b,
                                         StripBlock::Leaf {
