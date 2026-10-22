@@ -424,6 +424,7 @@ impl LockMatcher for SpendConditionMatcher {
                 source: LockResolutionSource::LockRootFirstName,
                 spend_condition: Some(condition.clone()),
                 spend_condition_count: None,
+                fund_maturity: None,
             },
             None => LockResolution::unknown(),
         }
