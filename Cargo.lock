@@ -2673,19 +2673,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "coinflip"
-version = "0.1.17"
-dependencies = [
- "nockchain-math",
- "nockchain-types",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tx-driver",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12926,4 +12913,3 @@ dependencies = [
 [[patch.unused]]
 name = "aws-runtime"
 version = "1.7.4"
-

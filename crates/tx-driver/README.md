@@ -150,6 +150,7 @@ can be told to misbehave in specific ways (redirect outputs, inflate the fee, ad
 an output, decline, go unavailable) so the driver's defences are exercised by the
 same code path as the good case.
 
-See [`crates/coinflip`](../coinflip) for a worked example: a two-party
-commit–reveal game whose stake note is a two-branch lock, funded through the
-driver.
+For a worked example, see `crates/coinflip` on the
+[`coinflip` branch](https://github.com/sigilante/nockchain/tree/coinflip/crates/coinflip)
+of sigilante/nockchain: a two-party commit–reveal game whose stake note is a
+two-branch lock, funded through the driver.
