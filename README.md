@@ -1,5 +1,15 @@
 # Nockchain
 
+> **About this fork.** This is [sigilante](https://github.com/sigilante)'s fork of
+> [nockchain/nockchain](https://github.com/nockchain/nockchain). Its `master`
+> tracks upstream. Work that lives only here is on feature branches:
+>
+> - [`coinflip`](https://github.com/sigilante/nockchain/tree/coinflip/crates/coinflip):
+>   a two-party commit–reveal coinflip, settled on chain through
+>   [`tx-driver`](https://github.com/nockchain/nockchain/pull/148). It runs against
+>   an in-memory chain, so it needs no node:
+>   `cargo run -p coinflip --bin coinflip-demo`.
+
 ## What is Nockchain?
 
 Nockchain is a Proof-of-Work blockchain built around verifiable Nock
