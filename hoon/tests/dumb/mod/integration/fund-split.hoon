@@ -8,7 +8,7 @@
 ::        %improper-fund-split (fund missing, wrong amount, wrong key),
 ::      - the entry-count cap (max-coinbase-split + 1 = 3) holds.
 ::    Pattern matches mod/integration/asert-activation.hoon: we use a
-::    custom blockchain-constants with v1-phase=5 / asert-phase=5 so a
+::    custom blockchain-constants with v1-phase=5 / phase.zk-asert=5 so a
 ::    handful of blocks reaches the post-activation regime.
 /=  helpers  /tests/dumb/helpers
 /=  dcon  /apps/dumbnet/lib/consensus
@@ -20,37 +20,37 @@
 ::
 =>
 |%
-::  bc-fund-split: low v1-phase / asert-phase so we reach post-activation
+::  bc-fund-split: low v1-phase / phase.zk-asert so we reach post-activation
 ::    in a few blocks. Heights 1..4 are v0; height 5+ is v1 post-activation.
 ++  bc-fund-split
   %*  .  default-bc:helpers
     blocks-per-epoch            1.000.000      :: avoid epoch boundary inside test
     v1-phase                    5
-    asert-phase                 5
-    asert-anchor-height         4
-    asert-anchor-target-atom    ^~((div max-tip5-atom:tip5 (bex 14)))
-    asert-ideal-block-time      150
-    asert-half-life             43.200
-    asert-anchor-min-timestamp  (add (time-in-secs:page:txe *@da) 1.200)
+    phase.zk-asert                 5
+    anchor-height.zk-asert         4
+    anchor-target-atom.zk-asert    ^~((div max-tip5-atom:tip5 (bex 14)))
+    ideal-block-time.zk-asert      150
+    half-life.zk-asert             43.200
+    anchor-min-timestamp.zk-asert  (add (time-in-secs:page:txe *@da) 1.200)
   ==
 ::
 ::  bc-pre-activation-v1: opens a real pre-asert-activation v1 window
-::    by separating v1-phase from asert-phase. Heights 1 are v0; heights
+::    by separating v1-phase from phase.zk-asert. Heights 1 are v0; heights
 ::    2..4 are v1 pre-asert-activation; height 5+ is v1 post-activation.
 ::    Used by test-fund-split-rejects-pre-activation-three-entries to
-::    pin the consensus-layer height-aware count rule
-::    (docs/2026-05-01-MR2545-EMISSIONS-REVIEW.md P1 #1).
+::    pin the consensus-layer height-aware count rule.
 ++  bc-pre-activation-v1
   %*  .  default-bc:helpers
     blocks-per-epoch            1.000.000
     v1-phase                    2
-    asert-phase                 5
-    asert-anchor-height         4
-    asert-anchor-target-atom    ^~((div max-tip5-atom:tip5 (bex 14)))
-    asert-ideal-block-time      150
-    asert-half-life             43.200
-    asert-anchor-min-timestamp  (add (time-in-secs:page:txe *@da) 1.200)
+    phase.zk-asert                 5
+    anchor-height.zk-asert         4
+    anchor-target-atom.zk-asert    ^~((div max-tip5-atom:tip5 (bex 14)))
+    ideal-block-time.zk-asert      150
+    half-life.zk-asert             43.200
+    anchor-min-timestamp.zk-asert  (add (time-in-secs:page:txe *@da) 1.200)
   ==
+::
 --
 ::
 |%
@@ -58,6 +58,8 @@
 ++  t  ~(. txe bc-fund-split)
 ++  h-pre  ~(. helpers bc-pre-activation-v1)
 ++  t-pre  ~(. txe bc-pre-activation-v1)
+::  +der: pre-activation derived-state (read-only extra arg for consensus door)
+++  der  ^-  derived-state  *derived-state
 ::
 ::  +with-coinbase-and-rehash: replace a v1 page's coinbase with the
 ::    given map and recompute the page digest. Mirrors the digest
@@ -73,7 +75,7 @@
   ?^  -.with-cb  with-cb(digest d)
   with-cb(digest d)
 ::
-::  +second-pkh: a non-zero, non-fund-address hash for the second
+::  +second-pkh: a non-zero, non-protocol-fund-address hash for the second
 ::    miner-side recipient. Derived from default-a-pt-2 so it is
 ::    distinct from default-keys-1's pubkey hash.
 ++  second-pkh
@@ -129,10 +131,9 @@
   (expect-eq !>(5) !>(~(height get:page:t pag)))
 ::
 ::  +test-fund-split-accepts-two-miners-plus-fund: post-activation
-::    candidate with 3 entries — 2 miner PKHs + fund-address at
+::    candidate with 3 entries — 2 miner PKHs + protocol-fund-address at
 ::    floor(emission/5). The total adds to emission, the fund slot
-::    matches, so validate-page-with-txs accepts. Pins the multi-miner
-::    semantic preserved by Fix 2.
+::    matches, so validate-page-with-txs accepts a two-miner payout.
 ++  test-fund-split-accepts-two-miners-plus-fund
   =/  con  (initial-consensus-state-custom:h bc-fund-split)
   =^  par=page:t  con  (add-n-pages:h 4 con default-retain:h)
@@ -146,10 +147,10 @@
     %-  ~(gas z-by *(z-map hash:t coins:t))
     :~  [first-miner-pkh share-a]
         [second-pkh share-b]
-        [fund-address:t fund]
+        [protocol-fund-address:t fund]
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con bc-fund-split) pag)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der bc-fund-split) pag)
   (expect-eq !>(%.y) !>(?=(%.y -.r)))
 ::
 ::  +test-fund-split-rejects-no-fund-slot: 2-entry post-activation
@@ -167,14 +168,12 @@
         [second-pkh (sub emi half)]
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con bc-fund-split) pag)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der bc-fund-split) pag)
   (expect-eq !>(%improper-fund-split) !>((rejection-reason r)))
 ::
-::  +test-fund-split-rejects-three-entries-no-fund-slot: 3-entry
-::    post-activation coinbase that totals to emission but no key is
-::    the fund address. Pre-Fix-2 this was rejected by the strict
-::    `=(2 ~(wyt z-by +.cb))` pin; post-Fix-2 it must still reject
-::    because the fund slot is missing.
+::  +test-fund-split-rejects-three-entries-no-fund-slot: a 3-entry
+::    post-activation coinbase that totals to emission must reject
+::    when none of its keys is the required fund address.
 ++  test-fund-split-rejects-three-entries-no-fund-slot
   =/  con  (initial-consensus-state-custom:h bc-fund-split)
   =^  par=page:t  con  (add-n-pages:h 4 con default-retain:h)
@@ -190,7 +189,7 @@
         [third-pkh third]
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con bc-fund-split) pag)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der bc-fund-split) pag)
   (expect-eq !>(%improper-fund-split) !>((rejection-reason r)))
 ::
 ::  +test-fund-split-rejects-wrong-fund-share: 2-entry post-activation
@@ -208,17 +207,17 @@
   =/  bad-cb=(z-map hash:t coins:t)
     %-  ~(gas z-by *(z-map hash:t coins:t))
     :~  [first-miner-pkh miner-bad]
-        [fund-address:t fund-bad]
+        [protocol-fund-address:t fund-bad]
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con bc-fund-split) pag)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der bc-fund-split) pag)
   (expect-eq !>(%improper-fund-split) !>((rejection-reason r)))
 ::
-::  +test-fund-split-rejects-wrong-fund-address: 2-entry post-activation
+::  +test-fund-split-rejects-wrong-protocol-fund-address: 2-entry post-activation
 ::    coinbase totalling emission, with the canonical fund amount but
-::    that amount paid to a non-fund-address hash. The fund slot is
+::    that amount paid to a non-protocol-fund-address hash. The fund slot is
 ::    therefore absent — rejected.
-++  test-fund-split-rejects-wrong-fund-address
+++  test-fund-split-rejects-wrong-protocol-fund-address
   =/  con  (initial-consensus-state-custom:h bc-fund-split)
   =^  par=page:t  con  (add-n-pages:h 4 con default-retain:h)
   =/  base  (make-empty-page:h par)
@@ -228,24 +227,18 @@
   =/  bad-cb=(z-map hash:t coins:t)
     %-  ~(gas z-by *(z-map hash:t coins:t))
     :~  [first-miner-pkh miner]
-        [second-pkh fund]                    :: NOT fund-address
+        [second-pkh fund]                    :: NOT protocol-fund-address
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con bc-fund-split) pag)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der bc-fund-split) pag)
   (expect-eq !>(%improper-fund-split) !>((rejection-reason r)))
 ::
-::  +test-fund-split-rejects-pre-activation-three-entries: closes the gap
-::    flagged in docs/2026-05-01-MR2545-EMISSIONS-REVIEW.md P1 #1. The v1
-::    parser-level shape check (++based:coinbase-split:v1) admits
-::    `max-coinbase-split + 1` entries to leave room for the post-
-::    activation fund slot, but pre-asert-activation v1 blocks must not
-::    use that extra entry — they have no fund slot. With
-::    bc-pre-activation-v1 (v1-phase=2, asert-phase=5) heights 2..4 are
-::    a real pre-asert-activation v1 window. Build to height 2 (so the
-::    parent is v1) and hand-craft a 3-entry coinbase at height 3.
-::    Without the consensus-layer phase-gated count check this block
-::    would validate; with the fix it rejects as
-::    %coinbase-split-pre-activation-too-many.
+::  +test-fund-split-rejects-pre-activation-three-entries: the v1
+::    parser admits max-coinbase-split + 1 entries for the post-activation
+::    fund slot, while pre-ASERT v1 blocks permit only miner entries.
+::    bc-pre-activation-v1 (v1-phase=2, phase.zk-asert=5) supplies
+::    a pre-activation v1 window at heights 2..4. A three-entry coinbase
+::    at height 3 must return %coinbase-split-pre-activation-too-many.
 ++  test-fund-split-rejects-pre-activation-three-entries
   =/  con  (initial-consensus-state-custom:h-pre bc-pre-activation-v1)
   =^  par=page:t-pre  con  (add-n-pages:h-pre 2 con default-retain:h-pre)
@@ -262,7 +255,7 @@
     ==
   =/  pag  (with-coinbase-and-rehash base bad-cb)
   =/  r=(reason tx-acc:t-pre)
-    (~(validate-page-with-txs dcon con bc-pre-activation-v1) pag)
+    (~(validate-page-with-txs dcon con der bc-pre-activation-v1) pag)
   (expect-eq !>(%coinbase-split-pre-activation-too-many) !>((rejection-reason r)))
 ::
 ::  +test-fund-split-accepts-pre-activation-two-entries: complement to the
@@ -284,25 +277,44 @@
     ==
   =/  pag  (with-coinbase-and-rehash base ok-cb)
   =/  r=(reason tx-acc:t-pre)
-    (~(validate-page-with-txs dcon con bc-pre-activation-v1) pag)
+    (~(validate-page-with-txs dcon con der bc-pre-activation-v1) pag)
   (expect-eq !>(%.y) !>(?=(%.y -.r)))
 ::
-::  +test-fund-split-post-cap-zero-emission-no-fund-slot: closes the gap
-::    flagged in docs/2026-05-01-MR2545-EMISSIONS-REVIEW.md P1 #2. After
-::    `tail-end` the schedule emits zero subsidy, so the expected fund
-::    share is 0. ++based on v1 coinbase-split rejects zero-coin entries,
-::    so the only way for a post-cap block to pay the fund is to omit the
-::    slot entirely. Pre-fix, ++check-fund-split unconditionally required
-::    the fund slot to exist; that made post-cap blocks unmineable. This
-::    is a unit test of ++check-fund-split with hand-crafted inputs since
-::    reaching height tail-end+1 in an integration test is impractical
+::  A coinbase variant from the wrong side of v1-phase must be rejected by
+::  validation, before the state-mutating +accept-page invariant can crash.
+++  test-coinbase-variant-height-mismatch-rejects
+  =/  con  (initial-consensus-state-custom:h-pre bc-pre-activation-v1)
+  =/  v1-before-phase=page:v1:t-pre
+    %*  .  *page:v1:t-pre
+      parent  default-genesis-id:h-pre
+      height  1
+    ==
+  =/  v0-at-phase=page:v0:t-pre
+    %*  .  *page:v0:t-pre
+      parent  default-genesis-id:h-pre
+      height  2
+    ==
+  =/  early=(reason tx-acc:t-pre)
+    (~(validate-page-with-txs dcon con der bc-pre-activation-v1) v1-before-phase)
+  =/  late=(reason tx-acc:t-pre)
+    (~(validate-page-with-txs dcon con der bc-pre-activation-v1) v0-at-phase)
+  ;:  weld
+    (expect-eq !>(%coinbase-version-height-mismatch) !>((rejection-reason early)))
+    (expect-eq !>(%coinbase-version-height-mismatch) !>((rejection-reason late)))
+  ==
+::
+::  +test-fund-split-post-cap-zero-emission-no-fund-slot: after `tail-end`
+::    the schedule emits zero subsidy, so the expected fund share is 0.
+::    ++based on v1 coinbase-split rejects zero-coin entries, requiring
+::    the fund slot to be absent. This tests ++check-fund-split directly
+::    with fixed inputs rather than building tail-end+1 blocks
 ::    (16,144,876 blocks).
 ++  test-fund-split-post-cap-zero-emission-no-fund-slot
   =/  con  (initial-consensus-state-custom:h bc-fund-split)
   =/  cb=coinbase-split:t
     :-  %1
     (~(put z-by *(z-map hash:t coins:t)) [first-miner-pkh 100])
-  (expect-eq !>(%.y) !>((~(check-fund-split dcon con bc-fund-split) cb 0)))
+  (expect-eq !>(%.y) !>((~(check-fund-split dcon con der bc-fund-split) cb 0)))
 ::
 ::  +test-fund-split-post-cap-zero-emission-empty-coinbase: post-cap with
 ::    zero fees and zero emission — the canonical empty coinbase must
@@ -311,10 +323,10 @@
 ++  test-fund-split-post-cap-zero-emission-empty-coinbase
   =/  con  (initial-consensus-state-custom:h bc-fund-split)
   =/  cb=coinbase-split:t  [%1 *(z-map hash:t coins:t)]
-  (expect-eq !>(%.y) !>((~(check-fund-split dcon con bc-fund-split) cb 0)))
+  (expect-eq !>(%.y) !>((~(check-fund-split dcon con der bc-fund-split) cb 0)))
 ::
 ::  +test-fund-split-post-cap-zero-emission-rejects-fund-slot: the
-::    inverse — a post-cap block that includes a fund-address slot
+::    inverse — a post-cap block that includes a protocol-fund-address slot
 ::    must reject. With expected fund == 0, any positive fund slot is
 ::    a fee diversion (since total-split has already been pinned to
 ::    fees). The rule still rejects that case so the post-cap path
@@ -325,7 +337,8 @@
     :-  %1
     %-  ~(gas z-by *(z-map hash:t coins:t))
     :~  [first-miner-pkh 50]
-        [fund-address:t 50]
+        [protocol-fund-address:t 50]
     ==
-  (expect-eq !>(%.n) !>((~(check-fund-split dcon con bc-fund-split) cb 0)))
+  (expect-eq !>(%.n) !>((~(check-fund-split dcon con der bc-fund-split) cb 0)))
+::
 --

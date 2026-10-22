@@ -4,10 +4,12 @@ use chaff::Chaff;
 use kernels_open_dumb::KERNEL;
 use nockapp::kernel::boot;
 use nockchain::NockchainAPIConfig;
-use zkvm_jetpack::hot::produce_prover_hot_state;
 
-// When enabled, use jemalloc for more stable memory allocation
-#[cfg(all(feature = "jemalloc", not(feature = "tracing-heap")))]
+// jemalloc is REQUIRED (not optional): the AI-PoW verifier-setup table pages large
+// contexts in/out of memory, and returning that freed memory to the OS relies on
+// jemalloc's decay-based purging (the system allocator retains it, so RSS would grow
+// with every page-in).
+#[cfg(not(feature = "tracing-heap"))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -19,10 +21,12 @@ static ALLOC: tracy_client::ProfiledAllocator<tikv_jemallocator::Jemalloc> =
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     nockvm::check_endian();
-    let cli = nockchain::NockchainCli::parse_with_default_stack_size(boot::NockStackSize::Large);
+    let mut cli =
+        nockchain::NockchainCli::parse_with_default_stack_size(boot::NockStackSize::Large);
     boot::init_default_tracing(&cli.nockapp_cli);
 
-    let prover_hot_state = produce_prover_hot_state();
+    let private_grpc_config = nockchain::private_grpc_config(&cli)?;
+    let prover_hot_state = nockchain::consensus::prepare_consensus_runtime(&mut cli)?;
 
     let api_config = if let Some(addr) = cli.bind_public_grpc_addr {
         NockchainAPIConfig::EnablePublicServer(addr)
@@ -30,9 +34,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
         NockchainAPIConfig::DisablePublicServer
     };
 
-    let mut nockchain =
-        nockchain::init_with_kernel::<Chaff>(cli, KERNEL, prover_hot_state.as_slice(), api_config)
-            .await?;
+    let mut nockchain = nockchain::init_with_kernel::<Chaff>(
+        cli,
+        KERNEL,
+        prover_hot_state.as_slice(),
+        api_config,
+        private_grpc_config,
+    )
+    .await?;
     nockchain.run().await?;
     Ok(())
 }

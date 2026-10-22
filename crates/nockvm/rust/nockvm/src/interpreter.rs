@@ -864,7 +864,10 @@ pub fn interpret(context: &mut Context, mut subject: Noun, formula: Noun) -> Res
                                 let dispatch = context.jet_dispatch;
                                 if let Some((jet, _path, test)) = context
                                     .warm
-                                    .find_jet(&mut context.stack, &mut res, &mut formula, dispatch)
+                                    .find_jet_with_space(
+                                        &mut context.stack, &mut res, &mut formula, &space,
+                                        dispatch,
+                                    )
                                     .next()
                                 {
                                     match jet(context, res) {
@@ -1192,9 +1195,12 @@ pub fn interpret(context: &mut Context, mut subject: Noun, formula: Noun) -> Res
                         }
                     };
                 }
-                NockWork::Work12(ref mut scry) => {
-                    cold_paths::step_work12(context, scry, &mut res, &space)?;
-                    continue;
+                NockWork::Work12(scry) => {
+                    match cold_paths::step_work12(context, scry, &mut res, &space) {
+                        Ok(_) => continue,
+                        Err(err @ Error::Deterministic(_, _)) => break Err(err),
+                        Err(err) => return Err(err),
+                    }
                 }
             };
         }
@@ -1407,7 +1413,7 @@ mod cold_paths {
                                 if atom.as_noun().raw_equals(&D(0)) {
                                     return Err(Error::ScryBlocked(scry.path));
                                 } else {
-                                    return Err(Error::ScryCrashed(D(0)));
+                                    return Err(Error::Deterministic(Mote::Exit, D(0)));
                                 }
                             }
                             Right(cell) => {
@@ -1418,7 +1424,7 @@ mod cold_paths {
                                         let hunk =
                                             T(stack, &[D(tas!(b"hunk")), scry.reff, scry.path]);
                                         mean_push(stack, hunk);
-                                        return Err(Error::ScryCrashed(D(0)));
+                                        return Err(Error::Deterministic(Mote::Exit, D(0)));
                                     }
                                     Right(cell) => {
                                         *res = cell.tail().noun();

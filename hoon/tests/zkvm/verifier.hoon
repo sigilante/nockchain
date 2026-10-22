@@ -1,7 +1,8 @@
 /=  *  /common/zeke
 /=  sp  /common/stark/prover
 /=  *  /common/test
-/=  *  /common/tx-engine
+/=  tx0  /common/tx-engine-0
+/=  tx1  /common/tx-engine-1
 /=  bp  /tests/loki/bad-pow
 /=  nv  /common/nock-verifier
 /=  np  /common/nock-prover
@@ -15,6 +16,76 @@
 ++  test-good-proof
   =/  res  (verify:vrf pf ~ 4)
   (expect !>(res))
+::
+++  test-v2-proof-relabelled-hardened-versions-are-bad
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  v5=proof  [%5 objects.pf ~ 0]
+  =/  v3-res  (verify:vrf v3 ~ 4)
+  =/  v5-res  (verify:vrf v5 ~ 4)
+  (expect !>(?&(!v3-res !v5-res)))
+::
+++  test-v3-pow-is-domain-separated-from-fiat-shamir
+  =/  v2=proof  [%2 objects.pf ~ 0]
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  raw-pow=tip5-hash-atom
+    (digest-to-atom:tip5 (hash-proof (get-pow v2)))
+  %+  expect-eq
+    !>([%.y %.n])
+  !>  :_  =((proof-to-pow v3) raw-pow)
+      =((proof-to-pow v2) raw-pow)
+::
+++  test-v5-work-and-block-id-commit-to-object-zero-not-witness
+  =/  v5=proof  [%5 objects.pf ~ 0]
+  =/  heights=proof-data  (grab-proof-entry:bp v5 %heights 1)
+  ?>  ?=(%heights -.heights)
+  =/  changed-tail=proof
+    (replace-proof-entry:bp v5 %heights heights(p [0 p.heights]) 1)
+  =/  puzzle=proof-data  (grab-proof-entry:bp v5 %puzzle 1)
+  ?>  ?=(%puzzle -.puzzle)
+  =/  changed-nonce=proof
+    (replace-proof-entry:bp v5 %puzzle puzzle(nonce (twiddle-digest:bp nonce.puzzle)) 1)
+  =/  changed-commitment=proof
+    (replace-proof-entry:bp v5 %puzzle puzzle(commitment (twiddle-digest:bp commitment.puzzle)) 1)
+  =/  base-page-v0=form:page:tx0  *form:page:tx0
+  =/  original-page-v0=form:page:tx0  base-page-v0(pow `v5)
+  =/  changed-tail-page-v0=form:page:tx0  base-page-v0(pow `changed-tail)
+  =/  changed-nonce-page-v0=form:page:tx0  base-page-v0(pow `changed-nonce)
+  =/  changed-commitment-page-v0=form:page:tx0  base-page-v0(pow `changed-commitment)
+  =/  base-page-v1=form:page:tx1  *form:page:tx1
+  =/  original-page-v1=form:page:tx1  base-page-v1(pow `v5)
+  =/  changed-tail-page-v1=form:page:tx1  base-page-v1(pow `changed-tail)
+  =/  changed-nonce-page-v1=form:page:tx1  base-page-v1(pow `changed-nonce)
+  =/  changed-commitment-page-v1=form:page:tx1  base-page-v1(pow `changed-commitment)
+  %+  expect-eq
+    !>([%.y %.n %.y %.y %.y %.n %.n %.n %.n %.n %.n %.n %.n])
+  !>  :*  =((proof-to-pow v5) (proof-to-pow changed-tail))
+          =((hash-proof v5) (hash-proof changed-tail))
+          =((hash-proof-for-block v5) (hash-proof-for-block changed-tail))
+          =((compute-digest:page:tx0 original-page-v0) (compute-digest:page:tx0 changed-tail-page-v0))
+          =((compute-digest:page:tx1 original-page-v1) (compute-digest:page:tx1 changed-tail-page-v1))
+          =((proof-to-pow v5) (proof-to-pow changed-nonce))
+          =((hash-proof-for-block v5) (hash-proof-for-block changed-nonce))
+          =((compute-digest:page:tx0 original-page-v0) (compute-digest:page:tx0 changed-nonce-page-v0))
+          =((compute-digest:page:tx1 original-page-v1) (compute-digest:page:tx1 changed-nonce-page-v1))
+          =((proof-to-pow v5) (proof-to-pow changed-commitment))
+          =((hash-proof-for-block v5) (hash-proof-for-block changed-commitment))
+          =((compute-digest:page:tx0 original-page-v0) (compute-digest:page:tx0 changed-commitment-page-v0))
+          =((compute-digest:page:tx1 original-page-v1) (compute-digest:page:tx1 changed-commitment-page-v1))
+      ==
+::
+++  test-v5-block-id-excludes-proof-stream-bookkeeping
+  =/  v2=proof  [%2 objects.pf ~ 0]
+  =/  v3=proof  [%3 objects.pf ~ 0]
+  =/  v5=proof  [%5 objects.pf ~ 0]
+  =/  v5-hashes=proof  v5(hashes ~[*noun-digest:tip5])
+  =/  v5-index=proof  v5(read-index 1)
+  %+  expect-eq
+    !>([%.n %.n %.y %.y])
+  !>  :*  =((hash-proof-for-block v2) (hash-proof-for-block v3))
+          =((hash-proof-for-block v3) (hash-proof-for-block v5))
+          =((hash-proof-for-block v5) (hash-proof-for-block v5-hashes))
+          =((hash-proof-for-block v5) (hash-proof-for-block v5-index))
+      ==
 ::
 ++  test-bad-proof-empty-proof
   =/  pf  pf(objects *proof-objects)
@@ -163,7 +234,7 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-base-m-root-not-after-heights
-  =/  pf  (replace-proof-entry:bp pf %m-root [%terms *bpoly] 1)
+  =/  pf  (replace-proof-entry:bp pf %m-root [%terms zero-bpoly] 1)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -196,7 +267,7 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-ext-m-root-not-after-base-m-root
-  =/  pf  (replace-proof-entry:bp pf %m-root [%terms *bpoly] 2)
+  =/  pf  (replace-proof-entry:bp pf %m-root [%terms zero-bpoly] 2)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -257,12 +328,12 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-mega-m-root-not-after-ext-m-root
-  =/  pf  (replace-proof-entry:bp pf %m-root [%terms *bpoly] 3)
+  =/  pf  (replace-proof-entry:bp pf %m-root [%terms zero-bpoly] 3)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-terminals-not-after-mega-m-root
-  =/  pf  (replace-proof-entry:bp pf %terms [%evals *fpoly] 1)
+  =/  pf  (replace-proof-entry:bp pf %terms [%evals zero-fpoly] 1)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -332,7 +403,7 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-evals-not-after-comp-m
-  =/  pf  (replace-proof-entry:bp pf %evals [%codeword *fpoly] 1)
+  =/  pf  (replace-proof-entry:bp pf %evals [%codeword zero-fpoly] 1)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -521,7 +592,7 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-deep-m-root-not-after-comp-evals
-  =/  pf  (replace-proof-entry:bp pf %m-root [%codeword *fpoly] 4)
+  =/  pf  (replace-proof-entry:bp pf %m-root [%codeword zero-fpoly] 4)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -628,7 +699,7 @@
   (expect-eq !>(%.n) !>(res))
 ::
 ++  test-bad-proof-m-pathbf-doesnt-follow-m-paths
-  =/  pf  (replace-proof-entry:bp pf %m-pathbf [%m-path *proof-path] 1)
+  =/  pf  (replace-proof-entry:bp pf %m-pathbf [%m-path [zero-fpoly ~]] 1)
   =/  res  (verify:vrf pf ~ 4)
   (expect-eq !>(%.n) !>(res))
 ::
@@ -694,6 +765,47 @@
   :*  (canonical-pow-proof:dk [112.499 padded-proof])
       (canonical-pow-proof:dk [canonical-pow-polynomial-height:dk padded-proof])
   ==
+:::
+++  test-proof-array-shape-validation
+  =/  poly
+    =/  m  (grab-proof-entry:bp pf %poly 1)
+    ?>  ?=(%poly -.m)  m
+  =/  malformed=bpoly  p.poly(len +(len.p.poly))
+  =/  malformed-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %poly
+        [%poly malformed]
+        1
+    ==
+  ::  Keep the logical length and payload words fixed but change the ignored
+  ::  terminal marker from 1 to 2.  This used to pass Hoon while native decoding
+  ::  rejected the same proof noun.
+  =/  bad-marker=bpoly
+    p.poly(dat (add dat.p.poly (lsh [6 len.p.poly] 1)))
+  =/  bad-marker-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %poly
+        [%poly bad-marker]
+        1
+    ==
+  =/  m-path
+    =/  m  (grab-proof-entry:bp pf %m-path 1)
+    ?>  ?=(%m-path -.m)  m
+  =/  bad-path-proof=proof:sp
+    %-  replace-proof-entry:bp
+    :*  pf
+        %m-path
+        m-path(path.p (unbase-noun-digests:bp path.p.m-path))
+        1
+    ==
+  %+  expect-eq  !>([%.y %.n %.n %.n])
+  !>  :*  (proof-arrays-valid pf)
+          (proof-arrays-valid malformed-proof)
+          (proof-arrays-valid bad-marker-proof)
+          (proof-arrays-valid bad-path-proof)
+      ==
 :::
 ++  test-bad-proof-poly-wrong
   =/  poly

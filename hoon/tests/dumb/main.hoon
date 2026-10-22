@@ -10,14 +10,20 @@
 /=  mempool-tests  /tests/dumb/mod/integration/mempool
 /=  merk-proof-tests  /tests/dumb/mod/unit/lock-merkle-proof
 /=  bythos-tests  /tests/dumb/mod/unit/bythos-gating
-/=  review-fix-tests  /tests/dumb/mod/unit/review-fixes
+/=  validation-invariant-tests  /tests/dumb/mod/unit/validation-invariants
 /=  emissions-tests  /tests/dumb/mod/unit/emissions
 /=  coinbase-split-tests  /tests/dumb/mod/unit/coinbase-split
 /=  block-size-tests  /tests/dumb/mod/unit/block-size
+/=  ai-pow-jet-tests  /tests/dumb/mod/unit/ai-pow-jet
+/=  dual-puzzle-tests  /tests/dumb/mod/unit/dual-puzzle
 /=  fund-split-tests  /tests/dumb/mod/integration/fund-split
-/=  benches  /tests/dumb/mod/benchmarks/huge-tx
-/=  h-zoon-benches  /tests/dumb/mod/benchmarks/h-zoon-hot-path
-/=  pending-scale-benches  /tests/dumb/mod/benchmarks/pending-blocks-scale
+/=  pre-ai-activation-tests  /tests/dumb/mod/integration/pre-ai-activation
+/=  time-banked-fork-tests  /tests/dumb/mod/integration/time-banked-fork
+::  Roswell aggregation excludes benchmark suites while z/h container cold hints
+::  emit per-operation `unknown jet` logs.
+:: /=  benches  /tests/dumb/mod/benchmarks/huge-tx
+:: /=  h-zoon-benches  /tests/dumb/mod/benchmarks/h-zoon-hot-path
+:: /=  pending-scale-benches  /tests/dumb/mod/benchmarks/pending-blocks-scale
 |=  name=term
 ^-  (list test-arm:tt)
 ;:  weld
@@ -32,12 +38,16 @@
   (get-prefix-arms:tt name !>(mempool-tests))
   (get-prefix-arms:tt name !>(merk-proof-tests))
   (get-prefix-arms:tt name !>(bythos-tests))
-  (get-prefix-arms:tt name !>(review-fix-tests))
+  (get-prefix-arms:tt name !>(validation-invariant-tests))
   (get-prefix-arms:tt name !>(emissions-tests))
   (get-prefix-arms:tt name !>(coinbase-split-tests))
   (get-prefix-arms:tt name !>(block-size-tests))
+  (get-prefix-arms:tt name !>(ai-pow-jet-tests))
+  (get-prefix-arms:tt name !>(dual-puzzle-tests))
   (get-prefix-arms:tt name !>(fund-split-tests))
-  (get-prefix-arms:tt name !>(benches))
-  (get-prefix-arms:tt name !>(h-zoon-benches))
-  (get-prefix-arms:tt name !>(pending-scale-benches))
+  (get-prefix-arms:tt name !>(pre-ai-activation-tests))
+  (get-prefix-arms:tt name !>(time-banked-fork-tests))
+::  (get-prefix-arms:tt name !>(benches))
+::  (get-prefix-arms:tt name !>(h-zoon-benches))
+::  (get-prefix-arms:tt name !>(pending-scale-benches))
 ==

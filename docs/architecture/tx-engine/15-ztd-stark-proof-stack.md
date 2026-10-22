@@ -70,37 +70,18 @@ Covered in detail in files 11 (Tip5) and 13 (Merkle trees). Key components:
 
 ### Proof Stream
 
-The proof stream is the central abstraction for building non-interactive proofs via the Fiat-Shamir heuristic:
-
-```hoon
-++  proof-stream
-  |_  [objects=(list proof-data) read-index=@ sponge=tip5-state]
-```
+A proof is an ordered list of tagged `proof-data` objects. The prover appends commitments, evaluations, and Merkle openings to that list; the verifier consumes those objects in the prescribed order. Each consumed object is converted into a Tip5 hashable value, and the consumed transcript derives the next Fiat-Shamir challenges.
 
 | Arm | Purpose |
 |---|---|
-| `push` | Append a proof object to the stream |
-| `pull` | Read the next proof object from the stream |
-| `prover-fiat-shamir` | Generate verifier challenges from prover's transcript |
-| `verifier-fiat-shamir` | Regenerate challenges from received proof objects |
-
-The Fiat-Shamir transform converts an interactive proof protocol (where the verifier sends random challenges) into a non-interactive one (where challenges are derived by hashing the transcript). The `sponge` field is a Tip5 sponge state that absorbs proof objects and squeezes out challenges.
+| `push` | Append a proof object. |
+| `pull` | Consume the next proof object. |
+| `prover-fiat-shamir` | Derive prover challenges from the transcript. |
+| `verifier-fiat-shamir` | Derive the matching verifier challenges. |
 
 ### Proof Data Types
 
-```hoon
-+$  proof-data
-  $%  [%tip5-digest noun-digest:tip5]
-      [%merk-proof merk-proof:merkle]
-      [%merk-data merk-data:merkle]
-      [%codeword-data codeword-data]
-      [%fp-codeword-data fp-codeword-data]
-      [%deep-point deep-point]
-      [%fp-deep-point fp-deep-point]
-  ==
-```
-
-Each variant carries a different type of proof artifact — hash digests, Merkle proofs, polynomial evaluation data, and deep composition points.
+The proof-data union carries Merkle roots and openings, the puzzle statement, base- and extension-field polynomial data, evaluations, table heights, and the composition commitment. The exact object union, transcript order, noun wire representation, packed polynomial layout, and `%poly` canonicality rule are specified in [16 — ZK PoW Proof Data Encoding](16-zk-pow-proof-data-encoding.md).
 
 ### Constraint Utilities
 

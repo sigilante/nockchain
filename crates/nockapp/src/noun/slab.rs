@@ -5,9 +5,8 @@ use std::fmt::Debug;
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 
-use bitvec::prelude::{BitSlice, BitVec, Lsb0};
+use bitvec::prelude::{BitSlice, Lsb0};
 use bitvec::view::BitView;
-use bitvec::{bits, bitvec};
 use bytes::Bytes;
 use either::Either;
 use ibig::Stack;
@@ -136,12 +135,16 @@ impl Region {
         self.allocation_stop = std::ptr::null_mut();
     }
 
+    #[inline]
+    unsafe fn has_capacity(&self, words: usize) -> bool {
+        !self.allocation_start.is_null()
+            && words <= self.allocation_stop.offset_from(self.allocation_start) as usize
+    }
+
     /// Ensure the active block has room for `words` 8-byte words, growing with a
     /// fresh geometrically-larger block if not.
     unsafe fn ensure(&mut self, words: usize) {
-        if self.allocation_start.is_null()
-            || self.allocation_start.add(words) > self.allocation_stop
-        {
+        if !self.has_capacity(words) {
             let next_idx = std::cmp::max(self.slabs.len(), min_idx_for_size(words));
             self.slabs
                 .resize(next_idx + 1, (std::ptr::null_mut(), Layout::new::<u8>()));
@@ -311,69 +314,112 @@ impl<J> NounSlab<J> {
 
     fn rehome_noun(&mut self, noun: Noun) -> Noun {
         let mut copied = IntMap::new();
-        self.rehome_noun_inner(noun, &mut copied)
-    }
-
-    fn rehome_noun_inner(&mut self, noun: Noun, copied: &mut IntMap<u64, Noun>) -> Noun {
-        match noun.as_either_direct_allocated() {
-            Either::Left(direct) => direct.as_noun(),
-            Either::Right(allocated) => match allocated.as_either() {
-                Either::Left(indirect) => {
-                    let Some(data_ptr) = indirect.data_pointer_stack() else {
-                        panic!(
-                            "Cannot splice offset-form noun into NounSlab without a source NounSpace"
-                        );
-                    };
-                    if self.contains_ptr(data_ptr as *const u8) {
-                        return noun;
-                    }
-
-                    let src_ptr = unsafe { indirect.to_raw_pointer_stack() };
-                    let src_key = src_ptr as u64;
-                    if let Some(copied_noun) = copied.get(src_key) {
-                        return *copied_noun;
-                    }
-
-                    let size = unsafe { *src_ptr.add(1) as usize };
-                    let new_mem = unsafe { self.alloc_indirect(size) };
-                    unsafe {
-                        copy_nonoverlapping(src_ptr, new_mem, size + 2);
-                    }
-                    let copied_noun =
-                        unsafe { IndirectAtom::from_raw_pointer(new_mem).as_atom().as_noun() };
-                    copied.insert(src_key, copied_noun);
-                    copied_noun
-                }
-                Either::Right(cell) => {
-                    let Some(cell_ptr) = cell.stack_memory_pointer() else {
-                        panic!(
-                            "Cannot splice offset-form noun into NounSlab without a source NounSpace"
-                        );
-                    };
-                    let src_key = cell_ptr as u64;
-                    if let Some(copied_noun) = copied.get(src_key) {
-                        return *copied_noun;
-                    }
-
-                    let source_head = unsafe { (*cell_ptr).head };
-                    let source_tail = unsafe { (*cell_ptr).tail };
-                    let rehomed_head = self.rehome_noun_inner(source_head, copied);
-                    let rehomed_tail = self.rehome_noun_inner(source_tail, copied);
-
-                    if self.contains_ptr(cell_ptr as *const u8)
-                        && unsafe { rehomed_head.raw_equals(&source_head) }
-                        && unsafe { rehomed_tail.raw_equals(&source_tail) }
-                    {
-                        copied.insert(src_key, noun);
-                        return noun;
-                    }
-
-                    let copied_noun = Cell::new(self, rehomed_head, rehomed_tail).as_noun();
-                    copied.insert(src_key, copied_noun);
-                    copied_noun
-                }
+        // Iterative worklist: network-decoded nouns can be arbitrarily deep
+        // (a jammed right-leaning chain compresses ~60,000 cells into
+        // ~45 KB), so the re-homing walk must not recurse on the worker
+        // thread's stack.
+        enum Task {
+            Rehome(Noun),
+            FinishCell {
+                src: Noun,
+                src_key: u64,
+                cell_ptr: *const CellMemory,
+                src_head: Noun,
+                src_tail: Noun,
             },
         }
+
+        let mut results: Vec<Noun> = Vec::new();
+        let mut stack = vec![Task::Rehome(noun)];
+        while let Some(task) = stack.pop() {
+            match task {
+                Task::Rehome(noun) => match noun.as_either_direct_allocated() {
+                    Either::Left(direct) => results.push(direct.as_noun()),
+                    Either::Right(allocated) => match allocated.as_either() {
+                        Either::Left(indirect) => {
+                            let Some(data_ptr) = indirect.data_pointer_stack() else {
+                                panic!(
+                                    "Cannot splice offset-form noun into NounSlab without a source NounSpace"
+                                );
+                            };
+                            if self.contains_ptr(data_ptr as *const u8) {
+                                results.push(noun);
+                                continue;
+                            }
+
+                            let src_ptr = unsafe { indirect.to_raw_pointer_stack() };
+                            let src_key = src_ptr as u64;
+                            if let Some(copied_noun) = copied.get(src_key) {
+                                results.push(*copied_noun);
+                                continue;
+                            }
+
+                            let size = unsafe { *src_ptr.add(1) as usize };
+                            let new_mem = unsafe { self.alloc_indirect(size) };
+                            unsafe {
+                                copy_nonoverlapping(src_ptr, new_mem, size + 2);
+                            }
+                            let copied_noun = unsafe {
+                                IndirectAtom::from_raw_pointer(new_mem).as_atom().as_noun()
+                            };
+                            copied.insert(src_key, copied_noun);
+                            results.push(copied_noun);
+                        }
+                        Either::Right(cell) => {
+                            let Some(cell_ptr) = cell.stack_memory_pointer() else {
+                                panic!(
+                                    "Cannot splice offset-form noun into NounSlab without a source NounSpace"
+                                );
+                            };
+                            let src_key = cell_ptr as u64;
+                            if let Some(copied_noun) = copied.get(src_key) {
+                                results.push(*copied_noun);
+                                continue;
+                            }
+
+                            let src_head = unsafe { (*cell_ptr).head };
+                            let src_tail = unsafe { (*cell_ptr).tail };
+                            stack.push(Task::FinishCell {
+                                src: noun,
+                                src_key,
+                                cell_ptr,
+                                src_head,
+                                src_tail,
+                            });
+                            // LIFO: head converts first (deeper in `results`),
+                            // tail second (on top), matching the recursion order.
+                            stack.push(Task::Rehome(src_tail));
+                            stack.push(Task::Rehome(src_head));
+                        }
+                    },
+                },
+                Task::FinishCell {
+                    src,
+                    src_key,
+                    cell_ptr,
+                    src_head,
+                    src_tail,
+                } => {
+                    let rehomed_tail = results.pop().expect("cell tail result is pending");
+                    let rehomed_head = results.pop().expect("cell head result is pending");
+
+                    if self.contains_ptr(cell_ptr as *const u8)
+                        && unsafe { rehomed_head.raw_equals(&src_head) }
+                        && unsafe { rehomed_tail.raw_equals(&src_tail) }
+                    {
+                        copied.insert(src_key, src);
+                        results.push(src);
+                    } else {
+                        let copied_noun = Cell::new(self, rehomed_head, rehomed_tail).as_noun();
+                        copied.insert(src_key, copied_noun);
+                        results.push(copied_noun);
+                    }
+                }
+            }
+        }
+        results
+            .pop()
+            .expect("rehome_noun produces exactly one root result")
     }
 
     pub fn coerce_jammer<I>(mut self) -> NounSlab<I> {
@@ -813,6 +859,15 @@ impl<J> NounSlab<J> {
         space.with_brand(f)
     }
 
+    /// Bytes reserved by this slab's backing allocation regions.
+    pub fn allocated_bytes(&self) -> u64 {
+        self.frames
+            .iter()
+            .fold(self.current.total_bytes(), |total, frame| {
+                total.saturating_add(frame.total_bytes())
+            })
+    }
+
     pub fn ptr_ranges(&self) -> Vec<(usize, usize)> {
         let mut ranges = Vec::with_capacity(self.current.slabs.len());
         self.current.ptr_ranges_into(&mut ranges);
@@ -885,6 +940,18 @@ impl<J: Jammer> NounSlab<J> {
     }
 }
 
+impl NounSlab<NockJammer> {
+    /// Decode a jammed noun while bounding the number of encoded noun
+    /// positions the decoder will process.
+    pub fn cue_into_with_max_nodes(
+        &mut self,
+        jammed: Bytes,
+        max_nodes: usize,
+    ) -> Result<Noun, CueError> {
+        NockJammer::cue_with_max_nodes(self, jammed, max_nodes)
+    }
+}
+
 impl<J> Stack for NounSlab<J> {
     unsafe fn alloc_layout(&mut self, layout: Layout) -> *mut u64 {
         self.current.alloc_layout(layout)
@@ -908,6 +975,8 @@ pub enum CueError {
     BackrefTooBig,
     #[error("cue: truncated buffer")]
     TruncatedBuffer,
+    #[error("cue: decoded noun exceeds node limit {max_nodes}")]
+    NodeLimitExceeded { max_nodes: usize },
 }
 
 /// Slab size from vector index, in 8-byte words
@@ -1034,99 +1103,279 @@ pub struct NockJammer;
 
 impl Jammer for NockJammer {
     fn jam(noun: Noun, space: &NounSpace) -> Bytes {
-        fn mat_backref(buffer: &mut BitVec<u8, Lsb0>, backref: usize) {
+        use bitvec::field::BitField;
+        // LSB-first bit stream accumulated a u64 word at a time. Byte i, bit
+        // i%8 of the output is stream bit i — the exact layout
+        // `BitVec<u8, Lsb0>::as_raw_slice` produced — but appending costs a
+        // shift-or instead of per-field `BitVec` bookkeeping.
+        struct BitWriter {
+            words: Vec<u64>,
+            acc: u64,
+            used: u32,
+        }
+
+        impl BitWriter {
+            fn new() -> Self {
+                Self {
+                    words: Vec::with_capacity(1 << 16),
+                    acc: 0,
+                    used: 0,
+                }
+            }
+
+            fn len(&self) -> usize {
+                self.words.len() * 64 + self.used as usize
+            }
+
+            /// Append the low `count` bits of `value`, LSB first.
+            #[inline]
+            fn push_bits(&mut self, value: u64, count: u32) {
+                debug_assert!(count <= 64);
+                if count == 0 {
+                    return;
+                }
+                let value = if count == 64 {
+                    value
+                } else {
+                    value & ((1u64 << count) - 1)
+                };
+                self.acc |= value << self.used;
+                let filled = self.used + count;
+                if filled >= 64 {
+                    self.words.push(self.acc);
+                    let consumed = 64 - self.used;
+                    self.acc = if consumed == 64 { 0 } else { value >> consumed };
+                    self.used = filled - 64;
+                } else {
+                    self.used = filled;
+                }
+            }
+
+            #[inline]
+            fn push_zeros(&mut self, mut count: usize) {
+                while count > 0 {
+                    let chunk = count.min(64) as u32;
+                    self.push_bits(0, chunk);
+                    count -= chunk as usize;
+                }
+            }
+
+            fn into_bytes(self) -> Vec<u8> {
+                let bits = self.len();
+                let mut out = Vec::with_capacity(bits.div_ceil(8));
+                for word in &self.words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                if self.used > 0 {
+                    let tail_bytes = (self.used as usize).div_ceil(8);
+                    out.extend_from_slice(&self.acc.to_le_bytes()[..tail_bytes]);
+                }
+                out
+            }
+        }
+
+        // Open-addressed structural memo: (cached mug, noun, bit offset)
+        // entries with linear probing. Same dedup relation as `NounMap`
+        // (`slab_mug` + `noun_equality`), so backref choices — and output
+        // bytes — are identical; it just avoids a heap-allocated `Vec` bucket
+        // per distinct mug and `IntMap`'s rehash churn.
+        struct JamMemo {
+            entries: Vec<(u32, Noun, u64)>,
+            empty: Vec<bool>,
+            mask: usize,
+            len: usize,
+        }
+
+        impl JamMemo {
+            fn new() -> Self {
+                let cap = 1 << 16;
+                Self {
+                    entries: vec![(0, D(0), 0); cap],
+                    empty: vec![true; cap],
+                    mask: cap - 1,
+                    len: 0,
+                }
+            }
+
+            #[inline]
+            fn slot_of(&self, mug: u32) -> usize {
+                // splitmix64-style spread so linear probing stays short.
+                let mut key = mug as u64;
+                key = (key ^ (key >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                key = (key ^ (key >> 27)).wrapping_mul(0x94d049bb133111eb);
+                (key ^ (key >> 31)) as usize & self.mask
+            }
+
+            fn grow(&mut self) {
+                let cap = self.entries.len() * 2;
+                let old = std::mem::replace(&mut self.entries, vec![(0, D(0), 0); cap]);
+                let old_empty = std::mem::replace(&mut self.empty, vec![true; cap]);
+                self.mask = cap - 1;
+                for (index, entry) in old.into_iter().enumerate() {
+                    if old_empty[index] {
+                        continue;
+                    }
+                    let mut slot = self.slot_of(entry.0);
+                    while !self.empty[slot] {
+                        slot = (slot + 1) & self.mask;
+                    }
+                    self.entries[slot] = entry;
+                    self.empty[slot] = false;
+                }
+            }
+
+            /// Offset of an equal noun, or the slot to insert it at.
+            fn find(
+                &mut self,
+                noun: Noun,
+                mug: u32,
+                space: &NounSpace,
+            ) -> std::result::Result<u64, usize> {
+                if (self.len + 1) * 4 >= self.entries.len() * 3 {
+                    self.grow();
+                }
+                let mut slot = self.slot_of(mug);
+                loop {
+                    if self.empty[slot] {
+                        return Err(slot);
+                    }
+                    let (entry_mug, entry_noun, offset) = self.entries[slot];
+                    if entry_mug == mug
+                        && (unsafe { noun.raw_equals(&entry_noun) }
+                            || noun_equality(noun.in_space(space), entry_noun.in_space(space)))
+                    {
+                        return Ok(offset);
+                    }
+                    slot = (slot + 1) & self.mask;
+                }
+            }
+
+            #[inline]
+            fn insert_at(&mut self, slot: usize, noun: Noun, mug: u32, offset: u64) {
+                self.entries[slot] = (mug, noun, offset);
+                self.empty[slot] = false;
+                self.len += 1;
+            }
+        }
+
+        fn mat_backref(buffer: &mut BitWriter, backref: usize) {
             if backref == 0 {
-                buffer.extend_from_bitslice(bits![u8, Lsb0; 1, 1, 1]);
+                buffer.push_bits(0b111, 3);
                 return;
             }
             let backref_sz = met0_u64_to_usize(backref as u64);
             let backref_sz_sz = met0_u64_to_usize(backref_sz as u64);
-            buffer.extend_from_bitslice(bits![u8, Lsb0; 1, 1]); // backref tag
-            let buffer_len = buffer.len();
-            buffer.resize(buffer_len + backref_sz_sz, false);
-            buffer.push(true);
-            buffer.extend_from_bitslice(
-                &BitSlice::<_, Lsb0>::from_element(&backref_sz)[0..backref_sz_sz - 1],
-            );
-            buffer
-                .extend_from_bitslice(&BitSlice::<_, Lsb0>::from_element(&backref)[0..backref_sz]);
+            buffer.push_bits(0b11, 2); // backref tag
+            buffer.push_zeros(backref_sz_sz);
+            buffer.push_bits(1, 1);
+            buffer.push_bits(backref_sz as u64, (backref_sz_sz - 1) as u32);
+            buffer.push_bits(backref as u64, backref_sz as u32);
         }
 
-        fn mat_atom(buffer: &mut BitVec<u8, Lsb0>, atom: Atom, space: &NounSpace) {
+        fn mat_atom(buffer: &mut BitWriter, atom: Atom, space: &NounSpace) {
             if unsafe { atom.as_noun().raw_equals(&D(0)) } {
-                buffer.extend_from_bitslice(bits![u8, Lsb0; 0, 1]);
+                buffer.push_bits(0b10, 2);
                 return;
             }
             let atom_sz = met0_usize(atom, space);
             let atom_sz_sz = met0_u64_to_usize(atom_sz as u64);
-            buffer.push(false); // atom tag
-            let buffer_len = buffer.len();
-            buffer.resize(buffer_len + atom_sz_sz, false);
-            buffer.push(true);
-            buffer.extend_from_bitslice(
-                &BitSlice::<_, Lsb0>::from_element(&atom_sz)[0..atom_sz_sz - 1],
-            );
-            buffer.extend_from_bitslice(&atom.in_space(space).as_bitslice()[0..atom_sz]);
-        }
-        let mut backref_map = NounMap::<usize>::new();
-        let mut stack = vec![noun];
-        let mut buffer = bitvec![u8, Lsb0; 0; 0];
-        while let Some(noun) = stack.pop() {
-            if let Some(backref) = backref_map.get(noun, space) {
-                if let Ok(atom) = noun.as_atom() {
-                    if met0_u64_to_usize(*backref as u64) < met0_usize(atom, space) {
-                        mat_backref(&mut buffer, *backref);
-                    } else {
-                        mat_atom(&mut buffer, atom, space)
-                    }
-                } else {
-                    mat_backref(&mut buffer, *backref);
-                }
+            buffer.push_bits(0, 1); // atom tag
+            buffer.push_zeros(atom_sz_sz);
+            buffer.push_bits(1, 1);
+            buffer.push_bits(atom_sz as u64, (atom_sz_sz - 1) as u32);
+            if let Ok(direct) = atom.as_direct() {
+                buffer.push_bits(direct.data(), atom_sz as u32);
             } else {
-                backref_map.insert(noun, buffer.len(), space);
-                match noun.as_either_atom_cell() {
-                    Either::Left(atom) => {
-                        mat_atom(&mut buffer, atom, space);
+                for chunk in atom.in_space(space).as_bitslice()[0..atom_sz].chunks(64) {
+                    buffer.push_bits(chunk.load_le::<u64>(), chunk.len() as u32);
+                }
+            }
+        }
+
+        let mut backref_map = JamMemo::new();
+        let mut stack = vec![noun];
+        let mut buffer = BitWriter::new();
+        while let Some(noun) = stack.pop() {
+            let mug = slab_mug(noun, space);
+            match backref_map.find(noun, mug, space) {
+                Ok(backref) => {
+                    if let Ok(atom) = noun.as_atom() {
+                        if met0_u64_to_usize(backref) < met0_usize(atom, space) {
+                            mat_backref(&mut buffer, backref as usize);
+                        } else {
+                            mat_atom(&mut buffer, atom, space)
+                        }
+                    } else {
+                        mat_backref(&mut buffer, backref as usize);
                     }
-                    Either::Right(cell) => {
-                        buffer.extend_from_bitslice(bits![u8, Lsb0; 1, 0]); // cell tag
-                        let cell = cell.in_space(space);
-                        stack.push(cell.tail().noun());
-                        stack.push(cell.head().noun());
+                }
+                Err(slot) => {
+                    backref_map.insert_at(slot, noun, mug, buffer.len() as u64);
+                    match noun.as_either_atom_cell() {
+                        Either::Left(atom) => {
+                            mat_atom(&mut buffer, atom, space);
+                        }
+                        Either::Right(cell) => {
+                            buffer.push_bits(0b01, 2); // cell tag
+                            let cell = cell.in_space(space);
+                            stack.push(cell.tail().noun());
+                            stack.push(cell.head().noun());
+                        }
                     }
                 }
             }
         }
 
-        Bytes::copy_from_slice(buffer.as_raw_slice())
+        Bytes::from(buffer.into_bytes())
     }
 
     fn cue(slab: &mut NounSlab, jammed: Bytes) -> Result<Noun, CueError> {
+        Self::cue_with_max_nodes(slab, jammed, usize::MAX)
+    }
+}
+
+impl NockJammer {
+    fn cue_with_max_nodes(
+        slab: &mut NounSlab,
+        jammed: Bytes,
+        max_nodes: usize,
+    ) -> Result<Noun, CueError> {
+        fn take_bits<'a>(
+            cursor: &mut usize,
+            len: usize,
+            buffer: &'a BitSlice<u8, Lsb0>,
+        ) -> Result<&'a BitSlice<u8, Lsb0>, CueError> {
+            let end = cursor
+                .checked_add(len)
+                .filter(|end| *end <= buffer.len())
+                .ok_or(CueError::TruncatedBuffer)?;
+            let bits = &buffer[*cursor..end];
+            *cursor = end;
+            Ok(bits)
+        }
+
         fn rub_backref(cursor: &mut usize, buffer: &BitSlice<u8, Lsb0>) -> Result<usize, CueError> {
             if let Some(idx) = buffer[*cursor..].first_one() {
                 if idx == 0 {
-                    *cursor += 1;
+                    take_bits(cursor, 1, buffer)?;
                     Ok(0)
                 } else {
-                    *cursor += idx + 1;
+                    if idx > usize::BITS as usize {
+                        return Err(CueError::BackrefTooBig);
+                    }
+                    take_bits(cursor, idx + 1, buffer)?;
                     let mut sz = 0usize;
                     let sz_slice = BitSlice::<_, Lsb0>::from_element_mut(&mut sz);
-                    if buffer.len() < *cursor + idx - 1 {
-                        Err(CueError::TruncatedBuffer)?;
-                    };
-                    sz_slice[0..idx - 1].clone_from_bitslice(&buffer[*cursor..*cursor + idx - 1]);
+                    let size_bits = take_bits(cursor, idx - 1, buffer)?;
+                    sz_slice[0..idx - 1].clone_from_bitslice(size_bits);
                     sz_slice.set(idx - 1, true);
-                    *cursor += idx - 1;
-                    if sz > size_of::<usize>() << 3 {
-                        Err(CueError::BackrefTooBig)?;
+                    if sz > usize::BITS as usize {
+                        return Err(CueError::BackrefTooBig);
                     }
-                    if buffer.len() < *cursor + sz {
-                        Err(CueError::TruncatedBuffer)?;
-                    }
+                    let encoded = take_bits(cursor, sz, buffer)?;
                     let mut backref = 0usize;
                     let backref_slice = BitSlice::<_, Lsb0>::from_element_mut(&mut backref);
-                    backref_slice[0..sz].clone_from_bitslice(&buffer[*cursor..*cursor + sz]);
-                    *cursor += sz;
+                    backref_slice[0..sz].clone_from_bitslice(encoded);
                     Ok(backref)
                 }
             } else {
@@ -1141,31 +1390,28 @@ impl Jammer for NockJammer {
         ) -> Result<Atom, CueError> {
             if let Some(idx) = buffer[*cursor..].first_one() {
                 if idx == 0 {
-                    *cursor += 1;
+                    take_bits(cursor, 1, buffer)?;
                     unsafe { Ok(DirectAtom::new_unchecked(0).as_atom()) }
                 } else {
-                    *cursor += idx + 1;
+                    if idx > usize::BITS as usize {
+                        return Err(CueError::BackrefTooBig);
+                    }
+                    take_bits(cursor, idx + 1, buffer)?;
                     let mut sz = 0usize;
                     let sz_slice = BitSlice::<_, Lsb0>::from_element_mut(&mut sz);
-                    if buffer.len() < *cursor + idx - 1 {
-                        Err(CueError::TruncatedBuffer)?;
-                    }
-                    sz_slice[0..idx - 1].clone_from_bitslice(&buffer[*cursor..*cursor + idx - 1]);
+                    let size_bits = take_bits(cursor, idx - 1, buffer)?;
+                    sz_slice[0..idx - 1].clone_from_bitslice(size_bits);
                     sz_slice.set(idx - 1, true);
-                    *cursor += idx - 1;
-                    if buffer.len() < *cursor + sz {
-                        Err(CueError::TruncatedBuffer)?;
-                    }
+                    let atom_bits = take_bits(cursor, sz, buffer)?;
                     if sz < 64 {
                         // Direct atom: less than 64 bits
                         let mut data = 0u64;
                         let atom_slice = BitSlice::<_, Lsb0>::from_element_mut(&mut data);
-                        atom_slice[0..sz].clone_from_bitslice(&buffer[*cursor..*cursor + sz]);
-                        *cursor += sz;
+                        atom_slice[0..sz].clone_from_bitslice(atom_bits);
                         Ok(unsafe { DirectAtom::new_unchecked(data).as_atom() })
                     } else {
                         // Indirect atom
-                        let indirect_words = (sz + 63) >> 6; // fast round to 64-bit words
+                        let indirect_words = sz.div_ceil(64);
                         let (indirect, data_ptr) =
                             unsafe { IndirectAtom::new_raw_mut_zeroed(slab, indirect_words) };
                         let slice = unsafe {
@@ -1173,8 +1419,7 @@ impl Jammer for NockJammer {
                                 data_ptr, indirect_words,
                             ))
                         };
-                        slice[0..sz].clone_from_bitslice(&buffer[*cursor..*cursor + sz]);
-                        *cursor += sz;
+                        slice[0..sz].clone_from_bitslice(atom_bits);
                         let words =
                             unsafe { std::slice::from_raw_parts_mut(data_ptr, indirect_words) };
                         let mut used_words = words.len();
@@ -1211,6 +1456,10 @@ impl Jammer for NockJammer {
         loop {
             match stack.pop() {
                 Some(CueStackEntry::DestinationPointer(dest)) => {
+                    noun_counter += 1;
+                    if noun_counter > max_nodes {
+                        return Err(CueError::NodeLimitExceeded { max_nodes });
+                    }
                     let backref = cursor as u64;
                     if cursor >= bitslice.len() {
                         return Err(CueError::TruncatedBuffer);
@@ -1261,7 +1510,6 @@ impl Jammer for NockJammer {
                     break;
                 }
             }
-            noun_counter += 1;
         }
         tracing::trace!("cue_into: noun_counter {}", noun_counter);
         slab.set_root(res);
@@ -1283,6 +1531,34 @@ mod tests {
 
     use super::*;
     use crate::AtomExt;
+
+    #[test]
+    fn region_capacity_boundaries() {
+        let mut backing = [0u64; 8];
+        let base = backing.as_mut_ptr();
+        // This region borrows the backing slice and owns no blocks to free.
+        let mut region = Region {
+            slabs: Vec::new(),
+            allocation_start: unsafe { base.add(3) },
+            allocation_stop: unsafe { base.add(backing.len()) },
+        };
+        unsafe {
+            assert!(region.has_capacity(0));
+            assert!(region.has_capacity(4));
+            assert!(region.has_capacity(5));
+            assert!(!region.has_capacity(6));
+            assert!(!region.has_capacity(usize::MAX));
+
+            region.allocation_start = region.allocation_stop;
+            assert!(region.has_capacity(0));
+            assert!(!region.has_capacity(1));
+
+            let empty = Region::empty();
+            assert!(!empty.has_capacity(0));
+            assert!(!empty.has_capacity(1));
+            assert!(!empty.has_capacity(usize::MAX));
+        }
+    }
 
     fn assert_set_root_rejects(root: Noun) {
         let mut slab: NounSlab = NounSlab::new();
@@ -1542,6 +1818,44 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "deep chain is slow under miri")]
+    fn modify_survives_deep_chain_on_worker_stack() {
+        // A jammed right-leaning chain of 60,000 cells, cued and re-rooted
+        // through `modify`, must fit within the worker thread's stack.
+        let (jammed, depth): (std::sync::Arc<Vec<u8>>, usize) = {
+            let mut stack = NockStack::new(NOCK_STACK_SIZE_TINY, 0);
+            let depth = 60_000usize;
+            let mut noun = D(0);
+            for _ in 0..depth {
+                noun = T(&mut stack, &[D(1), noun]);
+            }
+            let mut slab: NounSlab = NounSlab::new();
+            slab.copy_into(noun, &stack.noun_space());
+            let bytes = slab.jam().to_vec();
+            (std::sync::Arc::new(bytes), depth)
+        };
+
+        // 2 MB stack — the tokio worker size class the network decoder
+        // runs on.
+        let child = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut slab: NounSlab = NounSlab::new();
+                let noun = slab
+                    .cue_into(Bytes::copy_from_slice(&jammed))
+                    .expect("cue_into is iterative and must not overflow");
+                slab.set_root(noun);
+                // Network-equivalent sink: modify -> rehome walk.
+                slab.modify(|response_noun| vec![D(tas!(b"fact")), D(0), response_noun]);
+                depth
+            })
+            .expect("spawn worker thread");
+
+        let completed = child.join().expect("modify must not overflow the stack");
+        assert_eq!(completed, depth);
+    }
+
+    #[test]
     fn test_cue_into_rejects_truncated_atom_without_panicking() {
         let mut slab: NounSlab = NounSlab::new();
 
@@ -1554,6 +1868,69 @@ mod tests {
             result.expect("catch_unwind result"),
             Err(CueError::TruncatedBuffer)
         ));
+    }
+
+    #[test]
+    fn test_cue_into_rejects_atom_size_larger_than_payload_before_allocating() {
+        const PAYLOAD: &[u8] = &[
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xfe, 0xfd, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xff, 0x01,
+        ];
+        let mut slab: NounSlab<NockJammer> = NounSlab::new();
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            slab.cue_into(Bytes::from_static(PAYLOAD))
+        }));
+
+        assert!(result.is_ok(), "declared atom size must not panic");
+        assert!(matches!(
+            result.expect("catch_unwind result"),
+            Err(CueError::TruncatedBuffer)
+        ));
+    }
+
+    #[test]
+    fn test_cue_into_rejects_oversized_size_prefix_without_panicking() {
+        let mut atom_payload = vec![0; 18];
+        atom_payload[8] = 0x04;
+        let mut backref_payload = vec![0; 17];
+        backref_payload[0] = 0x03;
+        backref_payload[8] = 0x08;
+
+        for payload in [atom_payload, backref_payload] {
+            let mut slab: NounSlab = NounSlab::new();
+            let result = catch_unwind(AssertUnwindSafe(|| slab.cue_into(Bytes::from(payload))));
+
+            assert!(result.is_ok(), "oversized size prefix must not panic");
+            assert!(matches!(
+                result.expect("catch_unwind result"),
+                Err(CueError::BackrefTooBig)
+            ));
+        }
+    }
+
+    #[test]
+    fn test_cue_into_enforces_node_limit_before_unbounded_growth() {
+        let mut source: NounSlab = NounSlab::new();
+        let mut noun = D(0);
+        for value in 1..=16 {
+            noun = T(&mut source, &[D(value), noun]);
+        }
+        source.set_root(noun);
+
+        let jammed = source.jam();
+        let mut destination: NounSlab = NounSlab::new();
+        let result = destination.cue_into_with_max_nodes(jammed.clone(), 8);
+
+        assert!(matches!(
+            result,
+            Err(CueError::NodeLimitExceeded { max_nodes: 8 })
+        ));
+
+        let mut within_limit: NounSlab = NounSlab::new();
+        within_limit
+            .cue_into_with_max_nodes(jammed, 33)
+            .expect("decoder should accept a noun exactly at the node limit");
     }
 
     #[test]

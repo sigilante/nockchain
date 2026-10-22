@@ -10,6 +10,7 @@
 
 pub mod backbone;
 pub mod config;
+pub mod consensus;
 pub mod setup;
 pub mod traces;
 
@@ -25,6 +26,7 @@ use libp2p::{allow_block_list, connection_limits, memory_connection_limits, Peer
 use nockapp::kernel::boot;
 use nockapp::utils::make_tas;
 use nockapp::NockApp;
+use nockapp_grpc::private_nockapp::PrivateGrpcServerConfig;
 use termcolor::{ColorChoice, StandardStream};
 pub mod colors;
 
@@ -35,6 +37,8 @@ use nockvm::jets::hot::HotEntry;
 use nockvm::noun::{D, T, YES};
 use nockvm_macros::tas;
 use tracing::{debug, info, instrument};
+
+const FAKENET_AI_POW_ZK_ASERT_ANCHOR_TARGET_BEX: usize = 314;
 
 /// Module for handling driver initialization signals
 pub mod driver_init {
@@ -163,15 +167,21 @@ impl NockchainAPIConfig {
     }
 }
 
-/// Boots and runs the Nockchain node with the supplied public API config.
+/// Boots and runs the node with private API policy resolved before runtime preparation.
 pub async fn run_nockchain_app(
     cli: config::NockchainCli,
     hot_state: &[HotEntry],
     server_config: NockchainAPIConfig,
+    private_grpc_config: PrivateGrpcServerConfig,
 ) -> Result<(), Box<dyn Error>> {
-    let mut nockchain =
-        init_with_kernel::<chaff::Chaff>(cli, kernels_open_dumb::KERNEL, hot_state, server_config)
-            .await?;
+    let mut nockchain = init_with_kernel::<chaff::Chaff>(
+        cli,
+        kernels_open_dumb::KERNEL,
+        hot_state,
+        server_config,
+        private_grpc_config,
+    )
+    .await?;
     nockchain.run().await?;
     Ok(())
 }
@@ -222,16 +232,68 @@ fn load_keypair(keypair_path: &Path, force_old: bool) -> Result<Keypair, Box<dyn
     }
 }
 
-#[instrument(skip(kernel_jam, hot_state))]
+/// Cap on the operator-supplied allowed-peers file, checked before the file
+/// is read, so a misdirected multi-gigabyte file cannot exhaust memory at
+/// startup.
+const MAX_ALLOWED_PEERS_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+fn load_allowed_peers(
+    path: &Path,
+) -> Result<allow_block_list::Behaviour<allow_block_list::AllowedPeers>, Box<dyn Error>> {
+    load_allowed_peers_with_cap(path, MAX_ALLOWED_PEERS_FILE_BYTES)
+}
+
+fn load_allowed_peers_with_cap(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<allow_block_list::Behaviour<allow_block_list::AllowedPeers>, Box<dyn Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "allowed peers file {} is too large ({} bytes; cap {max_bytes})",
+            path.display(),
+            metadata.len()
+        )
+        .into());
+    }
+    let contents = std::fs::read_to_string(path)?;
+    let mut allow_behavior =
+        allow_block_list::Behaviour::<allow_block_list::AllowedPeers>::default();
+    for line in contents.lines() {
+        let peer_id_bytes = bs58::decode(line)
+            .into_vec()
+            .map_err(|e| format!("invalid peer ID line {line:?} in allowed peers file: {e}"))?;
+        let peer_id = PeerId::from_bytes(&peer_id_bytes)
+            .map_err(|_| format!("invalid peer ID line {line:?} in allowed peers file"))?;
+        allow_behavior.allow_peer(peer_id);
+    }
+    Ok(allow_behavior)
+}
+
+/// Resolve private API policy before consensus preparation or kernel startup.
+pub fn private_grpc_config(cli: &NockchainCli) -> Result<PrivateGrpcServerConfig, Box<dyn Error>> {
+    let addr = cli.bind_private_grpc_addr.unwrap_or_else(|| {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.bind_private_grpc_port)
+    });
+    Ok(PrivateGrpcServerConfig::from_env(
+        addr, cli.allow_unauthenticated_private_grpc,
+    )?)
+}
+
+#[instrument(skip(kernel_jam, hot_state, private_grpc_config))]
 pub async fn init_with_kernel<J: Jammer + Send + 'static>(
     cli: config::NockchainCli,
     kernel_jam: &[u8],
     hot_state: &[HotEntry],
     server_config: NockchainAPIConfig,
+    private_grpc_config: PrivateGrpcServerConfig,
 ) -> Result<NockApp<J>, Box<dyn Error>> {
+    private_grpc_config.validate()?;
     welcome();
 
     cli.validate()?;
+    let effective_fakenet_ai_activation_height = cli.effective_fakenet_ai_activation_height()?;
+    let fakenet_ai_asert_override = cli.fakenet_ai_asert.clone().into_config()?;
 
     let nockapp_cli = cli.nockapp_cli.clone();
 
@@ -251,24 +313,11 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
     let persist_identity = !cli.new_peer_id;
     let keypair = { load_keypair(identity_path.as_path(), persist_identity)? };
     info!("allowed_peers_path: {:?}", cli.allowed_peers_path);
-    let allowed = cli.allowed_peers_path.as_ref().map(|path| {
-        let contents = fs::read_to_string(path).expect("failed to read allowed peers file: {}");
-        let peer_ids: Vec<PeerId> = contents
-            .lines()
-            .map(|line| {
-                let peer_id_bytes = bs58::decode(line)
-                    .into_vec()
-                    .expect("failed to decode peer ID bytes from base58");
-                PeerId::from_bytes(&peer_id_bytes).expect("failed to decode peer ID from bytes")
-            })
-            .collect();
-        let mut allow_behavior =
-            allow_block_list::Behaviour::<allow_block_list::AllowedPeers>::default();
-        for peer_id in peer_ids {
-            allow_behavior.allow_peer(peer_id);
-        }
-        allow_behavior
-    });
+    let allowed = cli
+        .allowed_peers_path
+        .as_ref()
+        .map(|path| load_allowed_peers(Path::new(path)))
+        .transpose()?;
 
     let bind_multiaddrs = cli
         .bind
@@ -305,19 +354,15 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
             cli.max_established_per_peer
                 .or(Some(libp2p_config.max_established_connections_per_peer)),
         );
-    let memory_limits = if cli.max_system_memory_bytes.is_some()
-        && cli.max_system_memory_fraction.is_some()
-    {
-        panic!( "Must provide neither or one of --max-system-memory_bytes or --max-system-memory_percentage" )
+    // (Conflicting --max-system-memory-bytes and
+    // --max-system-memory-fraction are rejected by `NockchainCli::validate`.)
+    let memory_limits = if let Some(max_bytes) = cli.max_system_memory_bytes {
+        Some(memory_connection_limits::Behaviour::with_max_bytes(
+            max_bytes,
+        ))
     } else {
-        if let Some(max_bytes) = cli.max_system_memory_bytes {
-            Some(memory_connection_limits::Behaviour::with_max_bytes(
-                max_bytes,
-            ))
-        } else {
-            cli.max_system_memory_fraction
-                .map(memory_connection_limits::Behaviour::with_max_percentage)
-        }
+        cli.max_system_memory_fraction
+            .map(memory_connection_limits::Behaviour::with_max_percentage)
     };
 
     // Full backbone pool. The libp2p driver dials a rotating round-robin window
@@ -397,7 +442,7 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
             if mainnet_flag.is_atom() {
                 Some(unsafe { mainnet_flag.raw_equals(&YES) })
             } else {
-                panic!("Invalid mainnet flag")
+                return Err("invalid mainnet flag in kernel state".into());
             }
         } else {
             None
@@ -409,16 +454,14 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         let tag = make_tas(&mut peek_slab, "genesis-seal-set").as_noun();
         let peek_noun = T(&mut peek_slab, &[tag, D(0)]);
         peek_slab.set_root(peek_noun);
-        if let Some(peek_res) = nockapp.peek_handle(peek_slab).await? {
-            let genesis_seal = unsafe { peek_res.root() };
-            if genesis_seal.is_atom() {
-                unsafe { genesis_seal.raw_equals(&YES) }
-            } else {
-                panic!("Invalid genesis seal")
-            }
-        } else {
-            panic!("Genesis seal peak failed")
+        let Some(peek_res) = nockapp.peek_handle(peek_slab).await? else {
+            return Err("genesis seal peek failed: kernel state may be missing or corrupt".into());
+        };
+        let genesis_seal = unsafe { peek_res.root() };
+        if !genesis_seal.is_atom() {
+            return Err("invalid genesis seal in kernel state".into());
         }
+        unsafe { genesis_seal.raw_equals(&YES) }
     };
 
     let born_init_tx = if cli.fakenet {
@@ -431,15 +474,125 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
         if let Some(bythos_phase) = cli.fakenet_bythos_phase {
             fakenet_constants = fakenet_constants.with_bythos_phase(bythos_phase);
         }
+        // --fakenet-ai-pow: one-flag working dual-puzzle defaults. Activation
+        // at height 20 (not 1) so the ASERT anchors sit on real, recent
+        // blocks and the shared anchor cache — populated when the anchor
+        // block is accepted — drives both retargets. An anchor at genesis
+        // would read the prebuilt jam's ancient baked timestamp and pin every
+        // target at its ceiling. Explicit ASERT/activation flags override
+        // piecemeal below.
+        if cli.fakenet_ai_pow {
+            const AI_POW_FAKENET_ACTIVATION: u64 = 20;
+            let anchor = AI_POW_FAKENET_ACTIVATION - 1;
+            if effective_fakenet_ai_activation_height.is_none()
+                && fakenet_ai_asert_override.is_none()
+            {
+                fakenet_constants =
+                    fakenet_constants.with_ai_pow_activation_height(AI_POW_FAKENET_ACTIVATION);
+                let mut ai_asert = fakenet_constants.ai_asert.clone();
+                ai_asert.phase = AI_POW_FAKENET_ACTIVATION;
+                ai_asert.anchor_height = anchor;
+                ai_asert.anchor_target_atom = (ibig::UBig::from(1u64) << 232) - 1;
+                ai_asert.ideal_block_time = 60;
+                ai_asert.half_life = 600;
+                ai_asert.anchor_min_timestamp = 0;
+                fakenet_constants = fakenet_constants.with_ai_asert(ai_asert);
+            }
+            if cli.fakenet_asert.clone().into_config()?.is_none() {
+                let mut zk_asert = fakenet_constants.zk_asert.clone();
+                zk_asert.phase = AI_POW_FAKENET_ACTIVATION;
+                fakenet_constants = fakenet_constants.with_zk_asert(zk_asert);
+                let mut zk_post = fakenet_constants.zk_asert_post_ai.clone();
+                zk_post.phase = AI_POW_FAKENET_ACTIVATION;
+                zk_post.anchor_height = anchor;
+                zk_post.anchor_target_atom =
+                    ibig::UBig::from(1u64) << FAKENET_AI_POW_ZK_ASERT_ANCHOR_TARGET_BEX;
+                zk_post.ideal_block_time = 60;
+                zk_post.half_life = 600;
+                zk_post.anchor_min_timestamp = 0;
+                fakenet_constants = fakenet_constants.with_zk_asert_post_ai(zk_post);
+            }
+            if cli.fakenet_update_candidate_interval_secs.is_none() {
+                fakenet_constants =
+                    fakenet_constants.with_update_candidate_timestamp_interval(Seconds(120));
+            }
+        }
+        let ai_asert_override = fakenet_ai_asert_override;
+        if let Some(ai_activation) = effective_fakenet_ai_activation_height {
+            // AI admission, the AI ASERT pin, and the post-AI ZK regime share
+            // one activation boundary. Both puzzle pins use the preceding block
+            // so their schedule cache is available at activation.
+            fakenet_constants = fakenet_constants.with_ai_pow_activation_height(ai_activation);
+            let mut zk_post = fakenet_constants.zk_asert_post_ai.clone();
+            zk_post.phase = ai_activation;
+            zk_post.anchor_height = ai_activation - 1;
+            fakenet_constants = fakenet_constants.with_zk_asert_post_ai(zk_post);
+            let mut ai_asert = fakenet_constants.ai_asert.clone();
+            ai_asert.phase = ai_activation;
+            ai_asert.anchor_height = ai_activation - 1;
+            fakenet_constants = fakenet_constants.with_ai_asert(ai_asert);
+        }
         if let Some(asert) = cli.fakenet_asert.into_config()? {
-            fakenet_constants = fakenet_constants
-                .with_asert_phase(asert.phase)
-                .with_asert_anchor_height(asert.anchor_height)
-                .with_asert_anchor_target_bex(asert.anchor_target_bex);
+            // ZK-puzzle ASERT overrides (--fakenet-asert-* / --fakenet-zk-asert-*).
+            let mut zk_asert = fakenet_constants.zk_asert.clone();
+            zk_asert.phase = asert.phase;
+            zk_asert.anchor_height = asert.anchor_height;
+            zk_asert.anchor_target_atom =
+                ibig::UBig::from(1u64) << (asert.anchor_target_bex as usize);
+            if let Some(ideal) = asert.ideal_block_time {
+                zk_asert.ideal_block_time = ideal;
+            }
+            if let Some(half_life) = asert.half_life {
+                zk_asert.half_life = half_life;
+            }
+            fakenet_constants = fakenet_constants.with_zk_asert(zk_asert);
+
+            // Fakenet ergonomics: the ZK flags also drive the post-AI-activation
+            // regime (zk_asert_post_ai), which is the regime actually in force once
+            // AI is active from a low height. Copy the same anchor target / ideal /
+            // half-life so there is ONE ZK difficulty knob across the regime
+            // switch. anchor_min_timestamp stays 0: the target reads the
+            // recovered anchor median from the shared cache, which is populated
+            // when the anchor block (phase - 1) is accepted — pinning a sentinel
+            // here would pin the ZK target at its ceiling forever.
+            let mut zk_post = fakenet_constants.zk_asert_post_ai.clone();
+            zk_post.anchor_target_atom =
+                ibig::UBig::from(1u64) << (asert.anchor_target_bex as usize);
+            if let Some(ideal) = asert.ideal_block_time {
+                zk_post.ideal_block_time = ideal;
+            }
+            if let Some(half_life) = asert.half_life {
+                zk_post.half_life = half_life;
+            }
+            fakenet_constants = fakenet_constants.with_zk_asert_post_ai(zk_post);
+        }
+        if let Some(asert) = ai_asert_override {
+            // The effective activation logic guarantees this phase matches AI
+            // admission and the post-AI ZK regime.
+            let mut ai_asert = fakenet_constants.ai_asert.clone();
+            ai_asert.phase = asert.phase;
+            ai_asert.anchor_height = asert.anchor_height;
+            ai_asert.anchor_target_atom =
+                ibig::UBig::from(1u64) << (asert.anchor_target_bex as usize);
+            if let Some(ideal) = asert.ideal_block_time {
+                ai_asert.ideal_block_time = ideal;
+            }
+            if let Some(half_life) = asert.half_life {
+                ai_asert.half_life = half_life;
+            }
+            fakenet_constants = fakenet_constants.with_ai_asert(ai_asert);
         }
         if let Some(interval_secs) = cli.fakenet_update_candidate_interval_secs {
             fakenet_constants =
                 fakenet_constants.with_update_candidate_timestamp_interval(Seconds(interval_secs));
+        }
+        let max_minable_ai_target = (ibig::UBig::from(1u64) << 232) - 1;
+        if fakenet_constants.ai_asert.anchor_target_atom > max_minable_ai_target {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fakenet AI ASERT anchor target exceeds the minable consensus domain",
+            )
+            .into());
         }
         setup::poke(
             &mut nockapp,
@@ -531,12 +684,10 @@ pub async fn init_with_kernel<J: Jammer + Send + 'static>(
             .add_io_driver(nockapp_grpc::public_nockchain::grpc_server_driver(addr))
             .await;
     }
-    let private_grpc_addr = cli.bind_private_grpc_addr.unwrap_or_else(|| {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cli.bind_private_grpc_port)
-    });
+    // Configuration was resolved and validated before kernel side effects.
     nockapp
         .add_io_driver(nockapp_grpc::private_nockapp::grpc_server_driver(
-            private_grpc_addr,
+            private_grpc_config,
         ))
         .await;
 
@@ -583,4 +734,59 @@ fn welcome() {
     //];
 
     //print_version_info(&mut stdout, &info);
+}
+
+#[cfg(test)]
+mod allowed_peers_tests {
+    use std::io::Write;
+
+    use super::{load_allowed_peers_with_cap, MAX_ALLOWED_PEERS_FILE_BYTES};
+
+    fn temp_file(contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "nockchain-allowed-peers-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut file = std::fs::File::create(&path).expect("create temp file");
+        file.write_all(contents).expect("write temp file");
+        path
+    }
+
+    #[test]
+    fn load_allowed_peers_rejects_oversized_file_before_reading() {
+        let path = temp_file(b"12D3KooWnot_a_real_peer_id_0000000000000000");
+        // A cap below the file size must reject without reading the file.
+        let err = match load_allowed_peers_with_cap(&path, 8) {
+            Ok(_) => panic!("oversized allowed peers file must be rejected"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("too large"));
+        std::fs::remove_file(&path).ok();
+
+        // The production cap accepts this small file.
+        let path = temp_file(
+            libp2p::identity::Keypair::generate_ed25519()
+                .public()
+                .to_peer_id()
+                .to_base58()
+                .as_bytes(),
+        );
+        assert!(load_allowed_peers_with_cap(&path, MAX_ALLOWED_PEERS_FILE_BYTES).is_ok());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_allowed_peers_rejects_malformed_lines_without_panicking() {
+        let path = temp_file(b"this is not a base58 peer id");
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            load_allowed_peers_with_cap(&path, MAX_ALLOWED_PEERS_FILE_BYTES)
+        }));
+        assert!(result.is_ok(), "malformed line must not panic");
+        assert!(result.expect("no panic").is_err());
+        std::fs::remove_file(&path).ok();
+    }
 }

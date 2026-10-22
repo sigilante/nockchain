@@ -10,6 +10,99 @@
 |_  constants=_bc-no-timelock:helpers
 +*  t  ~(. tx-engine constants)
     h  ~(. helpers constants)
+::  +der: pre-activation derived-state (read-only extra arg for consensus/miner doors)
+++  der  ^-  derived-state  *derived-state
+++  test-v1-spend-1-parent-hash-binding
+  =/  note=nnote:t
+    (make-simple-note:v1:h p:default-keys-1:h 100.000)
+  =/  other-note=nnote:t
+    (make-simple-note:v1:h p:default-keys-2:h 100.000)
+  =/  parent-hash=hash:t  (hash:nnote:t note)
+  =/  other-parent-hash=hash:t  (hash:nnote:t other-note)
+  ?.  !=(parent-hash other-parent-hash)
+    (expect !>(%.n))
+  =/  pk=schnorr-pubkey:t
+    (head ~(tap z-in pubkeys.p:default-keys-1:h))
+  =/  [root=hash:t *]  (make-pkh-lock:v1:h 1 ~[pk])
+  =/  matching-seed=seed:v1:t
+    (make-seed:v1:h root 90.000 parent-hash)
+  =/  mismatched-seed=seed:v1:t
+    (make-seed:v1:h root 90.000 other-parent-hash)
+  =/  matching-spend=spend-1:v1:t
+    %*  .  *spend-1:v1:t
+      seeds  (~(put z-in *seeds:v1:t) matching-seed)
+      fee    10.000
+    ==
+  =/  mismatched-spend=spend-1:v1:t
+    matching-spend(seeds (~(put z-in *seeds:v1:t) mismatched-seed))
+  %+  expect-eq
+    !>([%.y %.n])
+  !>  :*  (verify-parent-hashes:spend-1:v1:t matching-spend note)
+          (verify-parent-hashes:spend-1:v1:t mismatched-spend note)
+      ==
+::
+++  replay-guard-validation
+  |=  [activation=page-number:t page-num=page-number:t parent-match=?]
+  =/  bc=blockchain-constants:t
+    constants(ai-pow-activation-height activation)
+  =/  et  ~(. tx-engine bc)
+  =/  pk=schnorr-pubkey:t
+    (head ~(tap z-in pubkeys.p:default-keys-1:h))
+  =/  [root=hash:t sc=spend-condition:v1:t *]
+    (make-pkh-lock:v1:h 1 ~[pk])
+  =/  note=nnote-1:v1:t
+    %*  .  *nnote-1:v1:t
+      version      %1
+      origin-page  0
+      name         (new-v1:nname:t root [*hash:t %.n])
+      note-data    *(z-map @tas *)
+      assets       100.000
+    ==
+  =/  other-note=nnote-1:v1:t  note(origin-page 1)
+  =/  parent-hash=hash:t
+    ?:(parent-match (hash:nnote:t note) (hash:nnote:t other-note))
+  =/  seed=seed:v1:t
+    (make-seed:v1:h root 90.000 parent-hash)
+  =/  spend=spend-1:v1:t
+    %*  .  *spend-1:v1:t
+      seeds  (~(put z-in *seeds:v1:t) seed)
+      fee    10.000
+    ==
+  =/  sig-hash=hash:t  (sig-hash:spend-1:v1:t spend)
+  =/  witness=witness:t
+    (make-pkh-witness:v1:h root sc sig-hash ~[[s:default-keys-1:h pk]])
+  =.  spend  spend(witness witness)
+  =/  name=nname:t  ~(name get:nnote:t note)
+  =/  balance=(h-map nname:t nnote:t)
+    (~(put h-by *(h-map nname:t nnote:t)) name note)
+  =/  spends=spends:v1:t
+    (~(put z-by *spends:v1:t) name [%1 spend])
+  %-  validate-with-context:spends:et
+  :*  balance
+      spends
+      page-num
+      max-size.data.bc
+      bythos-phase.bc
+  ==
+::
+++  test-v1-spend-1-parent-hash-legacy-before-ai-activation
+  =/  activation=page-number:t  50
+  %+  expect-eq
+    !>([%.y ~])
+  !>((replay-guard-validation [activation (dec activation) %.n]))
+::
+++  test-v1-spend-1-parent-hash-rejected-at-ai-activation
+  =/  activation=page-number:t  50
+  %+  expect-eq
+    !>([%.n %v1-spend-1-parent-hash-failed])
+  !>((replay-guard-validation [activation activation %.n]))
+::
+++  test-v1-spend-1-matching-parent-hash-accepted-at-ai-activation
+  =/  activation=page-number:t  50
+  %+  expect-eq
+    !>([%.y ~])
+  !>((replay-guard-validation [activation activation %.y]))
+::
 ++  test-process-v0-into-v1
   =/  con=consensus-state  initial-consensus-state:h
   =^  par=page:t  con  (add-n-pages:h 1 con default-retain:h)
@@ -25,8 +118,8 @@
   =/  tac=tx-acc:t
     (new:tx-acc:t (~(get h-by balance.con) ~(digest get:page:t new-page)) ~(height get:page:t new-page))
   ::  add the new page to the consensus state
-  =.  con  (~(accept-page dcon con constants) new-page tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) new-page)
+  =.  con  (~(accept-page dcon con der constants) new-page tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) new-page)
   =^  last=page:t  con  (add-n-pages:h (sub v1-phase:t ~(height get:page:t new-page)) con default-retain:h)
   ::  create a tx-acc for the last page
   =/  tac=tx-acc:t
@@ -78,12 +171,12 @@
       page1(digest new-digest)
     page1(digest new-digest)
   =/  r1=(reason tx-acc:t)
-    (~(validate-page-with-txs dcon con constants) page1)
+    (~(validate-page-with-txs dcon con der constants) page1)
   ?:  ?=(%.n -.r1)
     ~&  >  [%page1-validate-failed +.r1]
     (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page1 +.r1 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page1)
+  =.  con  (~(accept-page dcon con der constants) page1 +.r1 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page1)
   ::  second v0 coinbase page
   =/  page2=page:t  (make-empty-page:h page1)
   =/  coin2=coinbase:t  (new:v0:coinbase:t page2 p:default-keys-1:h)
@@ -93,12 +186,12 @@
       page2(digest new-digest)
     page2(digest new-digest)
   =/  r2=(reason tx-acc:t)
-    (~(validate-page-with-txs dcon con constants) page2)
+    (~(validate-page-with-txs dcon con der constants) page2)
   ?:  ?=(%.n -.r2)
     ~&  >  [%page2-validate-failed +.r2]
     (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page2 +.r2 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page2)
+  =.  con  (~(accept-page dcon con der constants) page2 +.r2 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page2)
   ::  advance to exactly v1 activation height
   =^  last=page:t
     con
@@ -169,15 +262,15 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  ?>  -:(~(validate-page-without-txs dcon con constants) new-page ~(timestamp get:page:t new-page))
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  ?>  -:(~(validate-page-without-txs dcon con der constants) new-page ~(timestamp get:page:t new-page))
   ::
-  =/  tac  (~(validate-page-with-txs dcon con constants) new-page)
+  =/  tac  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.n -.tac)
     ~&  >  [%reason +.tac]
     (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) new-page +.tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) new-page)
+  =.  con  (~(accept-page dcon con der constants) new-page +.tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) new-page)
   =/  old-in-balance=?
     ?|  (~(has h-bi balance.con) ~(digest get:page:t new-page) ~(name get:nnote:t coin1))
         (~(has h-bi balance.con) ~(digest get:page:t new-page) ~(name get:nnote:t coin2))
@@ -207,10 +300,10 @@
     ?^  -.page1
       page1(digest new-digest)
     page1(digest new-digest)
-  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page1)
+  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page1)
   ?:  ?=(%.n -.r1)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page1 +.r1 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page1)
+  =.  con  (~(accept-page dcon con der constants) page1 +.r1 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page1)
   ::  second v0 coinbase page
   =/  page2=page:t  (make-empty-page:h page1)
   =/  coin2=coinbase:t  (new:v0:coinbase:t page2 p:default-keys-1:h)
@@ -219,10 +312,10 @@
     ?^  -.page2
       page2(digest new-digest)
     page2(digest new-digest)
-  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page2)
+  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page2)
   ?:  ?=(%.n -.r2)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page2 +.r2 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page2)
+  =.  con  (~(accept-page dcon con der constants) page2 +.r2 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page2)
   ::  advance to exactly v1 activation height
   =^  last=page:t
     con
@@ -333,14 +426,14 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  ?>  -:(~(validate-page-without-txs dcon con constants) new-page ~(timestamp get:page:t new-page))
-  =/  tac  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  ?>  -:(~(validate-page-without-txs dcon con der constants) new-page ~(timestamp get:page:t new-page))
+  =/  tac  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.n -.tac)
     ~&  >  [%reason +.tac]
     (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) new-page +.tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) new-page)
+  =.  con  (~(accept-page dcon con der constants) new-page +.tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) new-page)
   =/  old-in-balance=?
     ?|  (~(has h-bi balance.con) ~(digest get:page:t new-page) name1)
         (~(has h-bi balance.con) ~(digest get:page:t new-page) name2)
@@ -368,10 +461,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  move to activation height
   =^  last=page:t
     con
@@ -457,10 +550,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -552,10 +645,10 @@
       page0(digest new-digest)
     page0(digest new-digest)
   ::  validate and accept the page with the coinbase
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::
   ::  step 2: spend coinbase into intermediate note with 2-of-3 lock
   ::
@@ -677,10 +770,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -740,7 +833,7 @@
   =/  sp1b=spend-1:v1:t  sp1b(witness witb)
   =/  sps2=spends:v1:t  (~(put z-by *spends:v1:t) name1 [%1 sp1b])
   =/  raw2=raw-tx:v1:t  (new:raw-tx:v1:t sps2)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw2)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw2)
   =/  new-page=page:t  (make-empty-page:h page1)
   =/  tx2=tx:t  (new:tx:t raw2 ~(height get:page:t new-page))
   =/  new-tx-ids  (~(put z-in *(z-set tx-id:t)) ~(id get:raw-tx:t raw2))
@@ -753,7 +846,7 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.y -.r)  (expect !>(%.n))
   (expect !>(%.y))
 ::
@@ -768,10 +861,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -833,7 +926,7 @@
   =/  sp1=spend-1:v1:t  sp1(witness wit)
   =/  sps=spends:v1:t  (~(put z-by *spends:v1:t) nam [%1 sp1])
   =/  raw=raw-tx:v1:t  (new:raw-tx:v1:t sps)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
   ::  build child page after page-in (now = since+1 < since+2) -> fail
   =/  new-page=page:t  (make-empty-page:h page-in)
   =/  tx1=tx:t  (new:tx:t raw ~(height get:page:t new-page))
@@ -847,7 +940,7 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.y -.r)  (expect !>(%.n))
   (expect !>(%.y))
 ::
@@ -862,10 +955,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -958,12 +1051,12 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   =/  min=mining-state  initial-mining-state:h
-  =.  min  (~(heard-new-block dmin min constants) con *@da)
+  =.  min  (~(heard-new-block dmin min der constants) con *@da)
   =/  nam=nname:t  ~(name get:nnote:t coin)
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root=hash:t sc=spend-condition:v1:t *]
@@ -983,7 +1076,7 @@
   =/  sp1=spend-1:v1:t  sp1(witness wit)
   =/  sps=spends:v1:t  (~(put z-by *spends:v1:t) nam [%1 sp1])
   =/  raw=raw-tx:v1:t  (new:raw-tx:v1:t sps)
-  =.  min  (~(heard-new-tx dmin min constants) raw)
+  =.  min  (~(heard-new-tx dmin min der constants) raw)
   %+  expect-eq
     !>(%.y)
   !>((~(has z-in ~(tx-ids get:page:t candidate-block.min)) ~(id get:raw-tx:t raw)))
@@ -1001,10 +1094,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  construct v1 note with %hax lock via pkh spend
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1079,10 +1172,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  construct %hax input note
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1142,8 +1235,8 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.y -.r)  (expect !>(%.n))
   (expect !>(%.y))
 ::
@@ -1160,10 +1253,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  construct %hax input note
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1224,8 +1317,8 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.y -.r)  (expect !>(%.n))
   (expect !>(%.y))
 ::
@@ -1242,10 +1335,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  construct %hax input note
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1323,10 +1416,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build input v1 note locked with tim(rel min=`2)
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1390,8 +1483,8 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.y -.r)  (expect !>(%.n))
   (expect !>(%.y))
 ::
@@ -1408,10 +1501,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build input v1 note locked with tim(rel min=`2)
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-cb=hash:t sc-cb=spend-condition:v1:t *]
@@ -1492,14 +1585,14 @@
     ?:  =(50 i)
       [con min txs]
     =/  new-page  (make-empty-page:h curr-page)
-    =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) new-page)
+    =/  r=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) new-page)
     ?.  ?=(%.y -.r)
       ~&  failed-reason++.r  !!
     =/  acc=tx-acc:t  +.r
-    =.  con  (~(accept-page dcon con constants) new-page acc *@da)
-    =.  con  (~(update-heaviest dcon con constants) new-page)
-    =.  con  (~(garbage-collect dcon con constants) default-retain:h)
-    =.  min  (~(heard-new-block dmin min constants) con *@da)
+    =.  con  (~(accept-page dcon con der constants) new-page acc *@da)
+    =.  con  (~(update-heaviest dcon con der constants) new-page)
+    =.  con  (~(garbage-collect dcon con der constants) default-retain:h)
+    =.  min  (~(heard-new-block dmin min der constants) con *@da)
     =/  =coinbase:t
       ?^  -.new-page
         (new:v0:coinbase:t new-page p:default-keys-1:h)
@@ -1513,7 +1606,7 @@
     %+  roll
       txs
     |=  [=raw-tx:t min=_min]
-    =/  new-min  (~(heard-new-tx dmin min constants) raw-tx)
+    =/  new-min  (~(heard-new-tx dmin min der constants) raw-tx)
     ::  We are asserting that the mining state has changed here
     ::  If it hasn't changed, that means that adding the raw-tx
     ::  causes the block size to exceed the limit.
@@ -1539,10 +1632,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   =/  nam=nname:t  ~(name get:nnote:t coin)
   ::  build merkle proof for witness using spend condition
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
@@ -1586,10 +1679,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  advance to v1 activation height
   =^  last=page:t  con  (add-n-pages:h (sub v1-phase:t ~(height get:page:t page0)) con default-retain:h)
   =/  tac=tx-acc:t
@@ -1649,7 +1742,7 @@
   =|  raw=raw-tx:t
   ?>  ?=(@ -.raw)
   =.  id.raw  (compute-id:raw-tx:t raw)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
   =/  new-tx-ids  (~(put z-in *(z-set tx-id:t)) ~(id get:raw-tx:t raw))
   =.  new-page
     ?^  -.new-page
@@ -1661,7 +1754,7 @@
       new-page(digest new-digest)
     new-page(digest new-digest)
   =/  tac=(reason tx-acc:t)
-    (~(validate-page-with-txs dcon con constants) new-page)
+    (~(validate-page-with-txs dcon con der constants) new-page)
   %+  expect-eq  !>(%.n)
   !>(-:tac)
 ::
@@ -1851,6 +1944,7 @@
         sig-hash=(sig-hash:spend-1:v1:t +.sen)
         witness=witness.+.sen
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
   %+  expect-eq
     !>(%.n)
@@ -1979,6 +2073,7 @@
         sig-hash=sig-hb
         witness=witness.sp1b
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
   ::  expect: lock check returns %.n (false) for unauthorized key
   %+  expect-eq
@@ -2025,6 +2120,7 @@
         sig-hash=(sig-hash:spend-1:v1:t +.sen)
         witness=witness.+.sen
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
   %+  expect-eq
     !>(%.n)
@@ -2042,10 +2138,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  advance to v1 activation
   =^  last=page:t  con  (add-n-pages:h 1 con default-retain:h)
   ::  lift v0 coinbase to v1 multisig output using spend-0
@@ -2127,10 +2223,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -2182,10 +2278,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -2223,10 +2319,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -2268,10 +2364,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -2325,10 +2421,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  first create a v1 note with %tim lock (rel min=2)
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  [root-pkh=hash:t sc-pkh=spend-condition:v1:t *]
@@ -2407,10 +2503,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   =/  tac=tx-acc:t
     (new:tx-acc:t (~(get h-by balance.con) ~(digest get:page:t page0)) ~(height get:page:t page0))
   ::  build spend-1 with mismatched fee
@@ -2593,10 +2689,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -2684,10 +2780,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build spend-1 with fee=10.000
   =/  new-page=page:t  (make-empty-page:h page0)
   =/  nam=nname:t  ~(name get:nnote:t coin)
@@ -2743,13 +2839,13 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  ?>  -:(~(validate-page-without-txs dcon con constants) new-page ~(timestamp get:page:t new-page))
-  =/  tac  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  ?>  -:(~(validate-page-without-txs dcon con der constants) new-page ~(timestamp get:page:t new-page))
+  =/  tac  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.n -.tac)
     (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) new-page +.tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) new-page)
+  =.  con  (~(accept-page dcon con der constants) new-page +.tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) new-page)
   =/  old-in-balance=?
     (~(has h-bi balance.con) ~(digest get:page:t new-page) ~(name get:nnote:t make-default-coinbase:v1:h))
   =/  outs=outputs:t  ~(outputs get:tx:t tx)
@@ -2801,10 +2897,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  create two spends from same coinbase
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  lock3=lock:t  (lock-from-sig:t p:default-keys-3:h)
@@ -2813,11 +2909,11 @@
   =/  raw2=raw-tx:t
     (simple-from-note:raw-tx:t p:default-keys-1:h p:default-keys-3:h coin s:default-keys-1:h)
   ::  heard first tx
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw1)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw1)
   ::  heard second tx with same input
   %+  expect-eq
     !>(%.y)
-  !>((~(inputs-spent dcon con constants) raw2))
+  !>((~(inputs-spent dcon con der constants) raw2))
 ::
 ++  test-v1-pending-reject-inputs-not-in-balance
   =/  con=consensus-state  initial-consensus-state:h
@@ -2828,7 +2924,7 @@
   ::  heard tx
   %+  expect-eq
     !>(%.n)
-  !>((~(inputs-in-heaviest-balance dcon con constants) raw))
+  !>((~(inputs-in-heaviest-balance dcon con der constants) raw))
 ::
 ++  test-v1-pending-accepts-inputs-not-in-spent-by
   =/  con=consensus-state  initial-consensus-state:h
@@ -2843,10 +2939,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  raw=raw-tx:t
@@ -2855,7 +2951,7 @@
   ::  heard tx
   %+  expect-eq
     !>(%.n)
-  !>((~(inputs-spent dcon con constants) raw))
+  !>((~(inputs-spent dcon con der constants) raw))
 ::
 ++  test-v1-pending-accepts-inputs-in-heaviest-balance
   =/  con=consensus-state  initial-consensus-state:h
@@ -2870,10 +2966,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  raw=raw-tx:t
@@ -2882,7 +2978,7 @@
   ::  heard tx
   %+  expect-eq
     !>(%.y)
-  !>((~(inputs-in-heaviest-balance dcon con constants) raw))
+  !>((~(inputs-in-heaviest-balance dcon con der constants) raw))
 ::
 ++  test-v1-remove-pending-block
   =/  con=consensus-state  initial-consensus-state:h
@@ -2897,10 +2993,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  make tx
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  raw=raw-tx:t
@@ -2921,9 +3017,9 @@
   ::
   =/  expect-con  con
   ::  add block to pending state
-  =^  miss  con  (~(add-pending-block dcon con constants) new-page)
+  =^  miss  con  (~(add-pending-block dcon con der constants) new-page)
   ::  remove block from pending state
-  =.  con  (~(reject-pending-block dcon con constants) ~(digest get:page:t new-page))
+  =.  con  (~(reject-pending-block dcon con der constants) ~(digest get:page:t new-page))
   ::
   %+  expect-eq
     !>  expect-con
@@ -2942,10 +3038,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  make tx
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  raw=raw-tx:t
@@ -2965,10 +3061,10 @@
     new-page(digest new-digest)
   ::
   ::  add block to pending state
-  =^  miss  con  (~(add-pending-block dcon con constants) new-page)
+  =^  miss  con  (~(add-pending-block dcon con der constants) new-page)
   ::
   ::  add tx to pending state
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
   ::
   =/  expect-ready
     ~[~(digest get:page:t new-page)]
@@ -2990,10 +3086,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  make tx1
   =/  lock2=lock:t  (lock-from-sig:t p:default-keys-2:h)
   =/  raw1=raw-tx:t
@@ -3018,10 +3114,10 @@
     new-page(digest new-digest)
   ::
   ::  add block to pending state
-  =^  miss  con  (~(add-pending-block dcon con constants) new-page)
+  =^  miss  con  (~(add-pending-block dcon con der constants) new-page)
   ::
   ::
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw2)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw2)
   ::
   ::  dont add tx to pending state
   =/  expect-ready  ~
@@ -3044,10 +3140,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build spend-1 with insufficient fee (below minimum of 256)
   =/  nam=nname:t  ~(name get:nnote:t coin)
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
@@ -3085,10 +3181,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -3145,10 +3241,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -3226,12 +3322,12 @@
     ?^  -.new-page
       new-page(digest new-digest)
     new-page(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw)
-  ?>  -:(~(validate-page-without-txs dcon con constants) new-page ~(timestamp get:page:t new-page))
-  =/  tac  (~(validate-page-with-txs dcon con constants) new-page)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw)
+  ?>  -:(~(validate-page-without-txs dcon con der constants) new-page ~(timestamp get:page:t new-page))
+  =/  tac  (~(validate-page-with-txs dcon con der constants) new-page)
   ?:  ?=(%.n -.tac)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) new-page +.tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) new-page)
+  =.  con  (~(accept-page dcon con der constants) new-page +.tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) new-page)
   %+  expect-eq  !>(%1)
   !>(-.tx)
 ::
@@ -3249,10 +3345,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build seed with note-data but pay less than required
   =/  nam=nname:t  ~(name get:nnote:t coin)
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
@@ -3322,10 +3418,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  build seed with note-data exceeding max-size (2048 leaves)
   =/  nam=nname:t  ~(name get:nnote:t coin)
   =/  pk=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
@@ -3378,10 +3474,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  get actual coinbase from balance
   =/  page0-balance  (need (~(get h-by balance.con) ~(digest get:page:t page0)))
   =/  coin=nnote:t  (get-coinbase-from-balance:v1:h page0 page0-balance)
@@ -3444,12 +3540,12 @@
     ?^  -.page-in
       page-in(digest new-digest)
     page-in(digest new-digest)
-  =^  ready  con  (~(add-raw-tx dcon con constants) raw0)
-  ?>  -:(~(validate-page-without-txs dcon con constants) page-in ~(timestamp get:page:t page-in))
-  =/  tac  (~(validate-page-with-txs dcon con constants) page-in)
+  =^  ready  con  (~(add-raw-tx dcon con der constants) raw0)
+  ?>  -:(~(validate-page-without-txs dcon con der constants) page-in ~(timestamp get:page:t page-in))
+  =/  tac  (~(validate-page-with-txs dcon con der constants) page-in)
   ?:  ?=(%.n -.tac)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page-in +.tac *@da)
-  =.  con  (~(update-heaviest dcon con constants) page-in)
+  =.  con  (~(accept-page dcon con der constants) page-in +.tac *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page-in)
   %+  expect-eq  !>(%1)
   !>(-.tx)
 ::
@@ -3529,10 +3625,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  create combined lock script: 2-of-3 multisig + timelock
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  pk2=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-2:h))
@@ -3606,10 +3702,10 @@
     ?^  -.page0
       page0(digest new-digest)
     page0(digest new-digest)
-  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page0)
+  =/  r0=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page0)
   ?:  ?=(%.n -.r0)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page0 +.r0 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page0)
+  =.  con  (~(accept-page dcon con der constants) page0 +.r0 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page0)
   ::  create combined lock script: 2-of-3 multisig + timelock
   =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
   =/  pk2=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-2:h))
@@ -3684,10 +3780,10 @@
   =.  page1
     ?^  -.page1  page1(digest new-digest)
     page1(digest new-digest)
-  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page1)
+  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page1)
   ?:  ?=(%.n -.r1)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page1 +.r1 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page1)
+  =.  con  (~(accept-page dcon con der constants) page1 +.r1 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page1)
   ::  second v0 coinbase page
   =/  page2=page:t  (make-empty-page:h page1)
   =/  coin2=coinbase:t  (new:v0:coinbase:t page2 p:default-keys-1:h)
@@ -3695,10 +3791,10 @@
   =.  page2
     ?^  -.page2  page2(digest new-digest)
     page2(digest new-digest)
-  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page2)
+  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page2)
   ?:  ?=(%.n -.r2)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page2 +.r2 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page2)
+  =.  con  (~(accept-page dcon con der constants) page2 +.r2 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page2)
   ::  advance to exactly v1 activation height
   =^  last=page:t  con
     %^  add-n-pages:h
@@ -3775,10 +3871,10 @@
   =.  page1
     ?^  -.page1  page1(digest new-digest)
     page1(digest new-digest)
-  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page1)
+  =/  r1=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page1)
   ?:  ?=(%.n -.r1)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page1 +.r1 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page1)
+  =.  con  (~(accept-page dcon con der constants) page1 +.r1 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page1)
   ::  second v0 coinbase page
   =/  page2=page:t  (make-empty-page:h page1)
   =/  coin2=coinbase:t  (new:v0:coinbase:t page2 p:default-keys-1:h)
@@ -3786,10 +3882,10 @@
   =.  page2
     ?^  -.page2  page2(digest new-digest)
     page2(digest new-digest)
-  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con constants) page2)
+  =/  r2=(reason tx-acc:t)  (~(validate-page-with-txs dcon con der constants) page2)
   ?:  ?=(%.n -.r2)  (expect !>(%.n))
-  =.  con  (~(accept-page dcon con constants) page2 +.r2 *@da)
-  =.  con  (~(update-heaviest dcon con constants) page2)
+  =.  con  (~(accept-page dcon con der constants) page2 +.r2 *@da)
+  =.  con  (~(update-heaviest dcon con der constants) page2)
   ::  advance to exactly v1 activation height
   =^  last=page:t  con
     %^  add-n-pages:h
@@ -3860,7 +3956,7 @@
 ::    its m-of-n primitive. We cannot hold the four production fund seckeys, so
 ::    these exercise the generic arm with non-production keys (a 2-of-3 standing
 ::    in for the 3-of-4); the real constants are pinned by +test-fund-note-
-::    firstname and +test-fund-address-is-3-of-4-multisig in coinbase-split.
+::    firstname and +test-protocol-fund-address-is-3-of-4-multisig in coinbase-split.
 ::
 ::  +test-fund-multisig-spend-valid: a correctly-revealed multisig with enough
 ::    valid signatures over the spend's sig-hash is accepted.
@@ -3884,15 +3980,25 @@
       sig-ha
       ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2]]
     ==
+  =/  full-wit=witness:t  wit
+  =/  stub=lock-merkle-proof-stub:v1:t
+    (build-lock-merkle-proof-stub:lock:t sc 1)
+  ?>  ?=(^ spend-condition.stub)
+  =/  wit=witness:t  wit(lmp stub(axis 7))
+  =/  sp=spend-1:v1:t  sp(witness wit)
+  =/  sps=spends:v1:t
+    (~(put z-by *spends:v1:t) [fund-note-firstname:t *hash:t ~] [%1 sp])
+  ?>  (valid-stub-axes:spends:v1:t sps)
   =/  ctx=check-context:t
     :*  now=1
         since=0
         sig-hash=sig-ha
         witness=wit
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
-  %+  expect-eq  !>(%.y)
-  !>  (check-multisig-lock:check-context:t root ctx)
+  %+  expect-eq  !>([%.y %.y])
+  !>  [(check-multisig-lock:check-context:t root ctx) (check-multisig-lock:check-context:t root ctx(witness full-wit))]
 ::
 ::  +test-fund-multisig-spend-insufficient-sigs: fewer than m signatures is
 ::    rejected (check:pkh requires exactly m).
@@ -3916,15 +4022,21 @@
       sig-ha
       ~[[s:default-keys-1:h pk1]]
     ==
+  =/  full-wit=witness:t  wit
+  =/  stub=lock-merkle-proof-stub:v1:t
+    (build-lock-merkle-proof-stub:lock:t sc 1)
+  ?>  ?=(^ spend-condition.stub)
+  =/  wit=witness:t  wit(lmp stub(axis 7))
   =/  ctx=check-context:t
     :*  now=1
         since=0
         sig-hash=sig-ha
         witness=wit
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
-  %+  expect-eq  !>(%.n)
-  !>  (check-multisig-lock:check-context:t root ctx)
+  %+  expect-eq  !>([%.n %.n])
+  !>  [(check-multisig-lock:check-context:t root ctx) (check-multisig-lock:check-context:t root ctx(witness full-wit))]
 ::
 ::  +test-fund-multisig-spend-wrong-target: a valid multisig witness whose
 ::    revealed spend-condition does NOT hash to the target is rejected (the
@@ -3950,14 +4062,138 @@
       sig-ha
       ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2]]
     ==
+  =/  full-wit=witness:t  wit
+  =/  stub=lock-merkle-proof-stub:v1:t
+    (build-lock-merkle-proof-stub:lock:t sc 1)
+  ?>  ?=(^ spend-condition.stub)
+  =/  wit=witness:t  wit(lmp stub(axis 7))
   =/  ctx=check-context:t
     :*  now=1
         since=0
         sig-hash=sig-ha
         witness=wit
         bythos-phase=bythos-phase.constants
+        fund-minimum=~
     ==
   ::  target is the zero hash, not (hash:lock sc) -> binding fails
-  %+  expect-eq  !>(%.n)
-  !>  (check-multisig-lock:check-context:t *hash:t ctx)
+  %+  expect-eq  !>([%.n %.n])
+  !>  [(check-multisig-lock:check-context:t *hash:t ctx) (check-multisig-lock:check-context:t *hash:t ctx(witness full-wit))]
+:::
+::  Controlled targets exercise the composed recovery arm, not production keys.
+++  fund-recovery-case
+  |=  [now=page-number:t since=page-number:t minimum=(unit page-number:t) fault=@]
+  ^-  ?
+  =/  pk1=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-1:h))
+  =/  pk2=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-2:h))
+  =/  pk3=schnorr-pubkey:t  (head ~(tap z-in pubkeys.p:default-keys-3:h))
+  ::  Scalar one supplies a fourth deterministic public test key.
+  =/  sk4=schnorr-seckey:t  (from-atom:schnorr-seckey:t 0x1)
+  =/  pk4=schnorr-pubkey:t  (from-seckey:schnorr-pubkey:t sk4)
+  =/  outsider-sk=schnorr-seckey:t  (from-atom:schnorr-seckey:t 0x2)
+  =/  outsider=schnorr-pubkey:t  (from-seckey:schnorr-pubkey:t outsider-sk)
+  =/  [root=hash:t sc=spend-condition:v1:t *]
+    (make-pkh-lock:v1:h 3 ~[pk1 pk2 pk3 pk4])
+  =/  msg=hash:t  (sig-hash:spend-1:v1:t *spend-1:v1:t)
+  =/  signers=(list [schnorr-seckey:t schnorr-pubkey:t])
+    ?+  fault  ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2] [s:default-keys-3:h pk3]]
+      %1  ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2]]
+      %2  ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2] [s:default-keys-3:h pk3] [sk4 pk4]]
+      %3  ~[[s:default-keys-1:h pk1] [s:default-keys-2:h pk2] [outsider-sk outsider]]
+    ==
+  =/  wit=witness:t
+    (make-pkh-witness:v1:h root sc msg signers)
+  =/  stub=lock-merkle-proof-stub:v1:t
+    (build-lock-merkle-proof-stub:lock:t sc 1)
+  ?>  ?=(^ spend-condition.stub)
+  =/  wit=witness:t  wit(lmp stub(axis 7))
+  =?  wit  =(fault 6)
+    wit(pkh (~(put z-by pkh.wit) (hash:schnorr-pubkey:t pk1) [pk1 *schnorr-signature:t]))
+  =?  wit  =(fault 7)
+    wit(lmp [%full sc 1 [root ~]])
+  =?  wit  =(fault 8)
+    wit(lmp [%full ~ 1 [root ~]])
+  =?  wit  =(fault 9)
+    wit(lmp [~ 1 [root ~]])
+  =/  ctx=check-context:t
+    [now since ?:(=(fault 4) *hash:t msg) wit bythos-phase.constants minimum]
+  (check-fund-lock:check-context:t ?:(=(fault 5) *hash:t root) ctx)
+:::
+++  test-fund-recovery-maturity-boundaries
+  =/  h=@  (need consensus-batch-phase:page:t)
+  =/  results=(list ?)
+    :~  (fund-recovery-case (dec h) (sub h 2) ~ 0)
+        (fund-recovery-case h (dec h) `100 0)
+        (fund-recovery-case h (sub h 99) `100 0)
+        (fund-recovery-case h (sub h 100) `100 0)
+        (fund-recovery-case h (sub h 101) `100 0)
+        (fund-recovery-case +(h) (sub h 99) `100 0)
+        (fund-recovery-case (dec h) (sub h 2) ~ 0)
+        (fund-recovery-case h +(h) `100 0)
+        (fund-recovery-case h (dec h) `2 0)
+        (fund-recovery-case h (sub h 2) `2 0)
+        (fund-recovery-case h h `0 0)
+        (fund-recovery-case h +(h) `0 0)
+    ==
+  %+  expect-eq  !>(~[%.y %.n %.n %.y %.y %.y %.y %.n %.n %.y %.y %.n])
+  !>  results
+:::
+++  test-fund-recovery-authorization-both-sides
+  =/  results=(list ?)
+    %+  turn  ~[1 2 3 4 5 6]
+    |=  fault=@
+    ?|  (fund-recovery-case 99 98 ~ fault)
+        (fund-recovery-case 100 0 `100 fault)
+    ==
+  %+  expect-eq  !>(~[%.n %.n %.n %.n %.n %.n])
+  !>  results
+:::
+++  test-fund-recovery-facade-policy
+  =/  h=@  (need consensus-batch-phase:page:t)
+  %+  expect-eq
+    !>  [~ `coinbase-timelock-min.constants `coinbase-timelock-min.constants ~]
+  !>  :*  (fund-minimum-at:t (dec h))
+          (fund-minimum-at:t h)
+          (fund-minimum-at:t +(h))
+          (fund-minimum-at:t (dec h))
+      ==
+:::
+++  test-fund-recovery-configured-facade-composition
+  =/  h=@  (need consensus-batch-phase:page:t)
+  =/  configured=blockchain-constants:tx-engine
+    constants(coinbase-timelock-min 100)
+  =/  policy  ~(. tx-engine configured)
+  =/  results=(list ?)
+    %+  turn  ~[[(dec h) (sub h 2)] [h (dec h)] [h (sub h 99)] [h (sub h 100)] [h (sub h 101)] [+(h) (sub h 99)] [(dec h) (sub h 2)]]
+    |=  [height=@ origin=@]
+    (fund-recovery-case height origin (fund-minimum-at:policy height) 0)
+  =/  two  ~(. tx-engine configured(coinbase-timelock-min 2))
+  =/  zero  ~(. tx-engine configured(coinbase-timelock-min 0))
+  ;:  weld
+    (expect-eq !>(~[%.y %.n %.n %.y %.y %.y %.y]) !>(results))
+    (expect-eq !>(%.n) !>((fund-recovery-case h (dec h) (fund-minimum-at:two h) 0)))
+    (expect-eq !>(%.y) !>((fund-recovery-case h (sub h 2) (fund-minimum-at:two h) 0)))
+    (expect-eq !>(%.y) !>((fund-recovery-case h h (fund-minimum-at:zero h) 0)))
+    (expect-eq !>([~ 0]) !>((fund-minimum-at:zero h)))
+  ==
+:::
+++  test-fund-recovery-full-witness-composition
+  ;:  weld
+    (expect-eq !>(%.y) !>((fund-recovery-case 1 0 ~ 7)))
+    (expect-eq !>(%.n) !>((fund-recovery-case 99 0 `100 7)))
+    (expect-eq !>(%.y) !>((fund-recovery-case 100 0 `100 7)))
+  ==
+::::
+++  test-fund-recovery-empty-witnesses
+  ::  Maturity is satisfied in every case, so rejection must inspect the reveal.
+  =/  results=(list ?)
+    %+  turn  ~[8 9]
+    |=  fault=@
+    ?|  (fund-recovery-case 99 0 ~ fault)
+        (fund-recovery-case 100 0 `100 fault)
+    ==
+  ;:  weld
+    (expect-eq !>(~[%.n %.n]) !>(results))
+    (expect-eq !>(%.y) !>((fund-recovery-case 100 0 `100 0)))
+    (expect-eq !>(%.y) !>((fund-recovery-case 100 0 `100 7)))
+  ==
 --

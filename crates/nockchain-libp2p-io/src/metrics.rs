@@ -12,6 +12,7 @@ metrics_struct![
     (gossip_erred_heard_tx, "nockchain-libp2p-io.gossip_erred_heard_tx", Count),
     (gossip_erred_heard_elders, "nockchain-libp2p-io.gossip_erred_heard_elders", Count),
     (gossip_dropped, "nockchain-libp2p-io.gossip_dropped", Count),
+    // Retained for the public metrics schema; gen2-only networking never increments these.
     (legacy_gossip_received, "nockchain-libp2p-io.legacy_gossip_received", Count),
     (
         legacy_gossip_compatibility_rejected,
@@ -176,9 +177,10 @@ metrics_struct![
     ),
     (peer_request_rate_limited, "nockchain-libp2p-io.peer_request_rate_limited", Count),
     (request_failed, "nockchain-libp2p-io.request_failed", Count),
+    // Retained for the public metrics schema; gen2-only networking never increments these.
     (gen1_outbound_failures, "nockchain-libp2p-io.gen1_outbound_failures", Count),
-    (gen2_outbound_failures, "nockchain-libp2p-io.gen2_outbound_failures", Count),
     (gen1_outbound_timeouts, "nockchain-libp2p-io.gen1_outbound_timeouts", Count),
+    (gen2_outbound_failures, "nockchain-libp2p-io.gen2_outbound_failures", Count),
     (gen2_outbound_timeouts, "nockchain-libp2p-io.gen2_outbound_timeouts", Count),
     (gen2_batch_requests_sent, "nockchain-libp2p-io.gen2_batch_requests_sent", Count),
     (gen2_batch_requests_received, "nockchain-libp2p-io.gen2_batch_requests_received", Count),
@@ -215,6 +217,7 @@ metrics_struct![
         gen2_batch_result_unexpected_item_id,
         "nockchain-libp2p-io.gen2_batch_result_unexpected_item_id", Count
     ),
+    // Retained for the public metrics schema; gen2-only networking never increments these.
     (req_res_fallback_total, "nockchain-libp2p-io.req_res_fallback_total", Count),
     (
         req_res_block_by_height_gen1_routed,
@@ -268,23 +271,19 @@ metrics_struct![
     (heard_block_poke_time, "nockchain-libp2p-io.heard_block_poke_time", TimingCount),
     (heard_elders_poke_time, "nockchain-libp2p-io.heard_elders_poke_time", TimingCount),
     // ---- deadlock / livelock watchdog signals ----
-    // These are the Datadog-facing side of the 2026-04-17/18 incidents.
     // Alert recipes live in the Datadog monitors; these metrics feed them.
     //
     // heartbeat_tick: monotonic counter bumped every 5s by the libp2p
     // driver heartbeat task. `rate() == 0` for > 30s means the tokio
-    // runtime itself is parked (4/17 shape).
+    // runtime itself is parked.
     (heartbeat_tick, "nockchain-libp2p-io.heartbeat_tick", Count),
     // poke_completion_lag_seconds: seconds since the traffic cop last
     // observed a successful kernel-poke round trip. `max > 180` means
-    // the kernel side wedged even though the driver runtime is fine
-    // (4/18 shape). Exported as a gauge so Datadog can alert on max
-    // across any instance.
+    // the kernel side is stalled even though the driver runtime is fine.
+    // Exported as a gauge so Datadog can alert on max across any instance.
     (poke_completion_lag_seconds, "nockchain-libp2p-io.poke_completion_lag_seconds", Gauge),
     // oneshot_recv_error_total: every time a `handle_request_response`
-    // task returns Err(OneShotRecvError). Pre-fix (2026-04-17) this ran
-    // at ~16 k/hr on LAX1; post-fix it is 0. An alert at `rate > 10/s`
-    // would catch any regression of the gated-poke timing-drop bug.
+    // task returns Err(OneShotRecvError).
     (oneshot_recv_error_total, "nockchain-libp2p-io.oneshot_recv_error_total", Count),
     // watchdog_stack_dump_total: every time the watchdog (or a SIGQUIT)
     // writes a stack dump. Any non-zero value is an operational signal
@@ -303,6 +302,15 @@ metrics_struct![
     // prefetch_buffer_size: total deferred heard-blocks across all
     // heights, exposed as a gauge so growth and drain are both visible.
     (prefetch_buffer_size, "nockchain-libp2p-io.prefetch_buffer_size", Gauge),
+    // Effect loss and accepted kernel-tip frontier repair.
+    (kernel_effects_lagged_total, "nockchain-libp2p-io.kernel_effects_lagged_total", Count),
+    (seen_frontier_resync_total, "nockchain-libp2p-io.seen_frontier_resync_total", Count),
+    (
+        deferred_heights_above_stalled_frontier,
+        "nockchain-libp2p-io.deferred_heights_above_stalled_frontier", Gauge
+    ),
+    // Backing allocation bytes retained by deferred heard-block facts.
+    (prefetch_buffer_bytes, "nockchain-libp2p-io.prefetch_buffer_bytes", Gauge),
     // ---- Phase 4: kernel-demand range prefetch issuance ----
     // prefetch_issued_total: range prefetches dispatched alongside a
     // kernel-singleton block-by-height request.
@@ -321,10 +329,8 @@ metrics_struct![
         Count
     ),
     // ---- Phase 5: hardening ----
-    // prefetch_invalidated_total: deferred-buffer entries dropped because
-    // the kernel reported them as a liar-block (forked / poisoned). One
-    // increment per dropped block id; growth here without a corresponding
-    // sync-progress signal is the LAX1-shape stall signature.
+    // prefetch_invalidated_total: counts deferred entries invalidated by
+    // kernel validation, with one increment per dropped block id.
     (prefetch_invalidated_total, "nockchain-libp2p-io.prefetch_invalidated_total", Count),
     // prefetch_height_stuck_total: per-height retry budget exhaustions.
     // Once a height crosses this threshold we back off rather than
@@ -355,11 +361,5 @@ metrics_struct![
     ),
     // prefetch_peer_cooldown_total: transient range failures that put a
     // peer on range-prefetch cooldown.
-    (prefetch_peer_cooldown_total, "nockchain-libp2p-io.prefetch_peer_cooldown_total", Count),
-    // prefetch_peer_no_gen2_range_peer_total: range prefetch skipped
-    // because no connected Gen2 peer could be selected.
-    (
-        prefetch_peer_no_gen2_range_peer_total,
-        "nockchain-libp2p-io.prefetch_peer_no_gen2_range_peer_total", Count
-    )
+    (prefetch_peer_cooldown_total, "nockchain-libp2p-io.prefetch_peer_cooldown_total", Count)
 ];

@@ -18,7 +18,7 @@ use nockchain_libp2p_io::config::LibP2PConfig;
 use nockchain_libp2p_io::test_support::{
     build_req_res_test_swarm_with_protocol_trace, first_common_outbound_protocol, NockchainRequest,
     NockchainResponse, ProtocolTrace, RawRequestInjection, RawResponseInjection, ReqResTestEvent,
-    ReqResTestSwarm,
+    ReqResTestSwarm, TransportResponse,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -116,12 +116,8 @@ pub fn default_test_config() -> LibP2PConfig {
     LibP2PConfig::default()
 }
 
-pub fn expected_outbound_generation(config: &LibP2PConfig) -> &'static str {
-    if config.req_res_gen2_send_enabled {
-        "gen2"
-    } else {
-        "gen1"
-    }
+pub fn expected_outbound_generation(_config: &LibP2PConfig) -> &'static str {
+    "gen2"
 }
 
 pub fn expected_common_protocol(local: &LibP2PConfig, remote: &LibP2PConfig) -> Option<String> {
@@ -325,7 +321,7 @@ pub async fn run_round_trip_observing_request(
                                         .swarm
                                         .behaviour_mut()
                                         .request_response
-                                        .send_response(channel, response.clone())
+                                        .send_response(channel, TransportResponse::outgoing(response.clone()))
                                         .expect("response should send");
                                     transcript.record(
                                         responder.name,
@@ -336,6 +332,7 @@ pub async fn run_round_trip_observing_request(
                                     );
                                 }
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         responder.name,
                                         format!(
@@ -354,6 +351,7 @@ pub async fn run_round_trip_observing_request(
                         SwarmEvent::Behaviour(ReqResTestEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
                             match message {
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         requester.name,
                                         format!(
@@ -548,7 +546,7 @@ pub async fn run_request_until_outbound_failure_with_actions(
                                                 .swarm
                                                 .behaviour_mut()
                                                 .request_response
-                                                .send_response(channel, response.clone())
+                                                .send_response(channel, TransportResponse::outgoing(response.clone()))
                                                 .expect("response should send");
                                             transcript.record(
                                                 responder.name,
@@ -565,7 +563,7 @@ pub async fn run_request_until_outbound_failure_with_actions(
                                                 .swarm
                                                 .behaviour_mut()
                                                 .request_response
-                                                .send_response(channel, NockchainResponse::Ack { acked: true })
+                                                .send_response(channel, TransportResponse::outgoing(NockchainResponse::Ack { acked: true }))
                                                 .expect("raw response should send");
                                             transcript.record(
                                                 responder.name,
@@ -577,6 +575,7 @@ pub async fn run_request_until_outbound_failure_with_actions(
                                     }
                                 }
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         responder.name,
                                         format!(
@@ -629,6 +628,7 @@ pub async fn run_request_until_outbound_failure_with_actions(
                         SwarmEvent::Behaviour(ReqResTestEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
                             match message {
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         requester.name,
                                         format!(
@@ -706,6 +706,7 @@ pub async fn run_request_until_outbound_timeout(
                                     held_channels.push(channel);
                                 }
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         responder.name,
                                         format!(
@@ -744,6 +745,7 @@ pub async fn run_request_until_outbound_timeout(
                         SwarmEvent::Behaviour(ReqResTestEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
                             match message {
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         requester.name,
                                         format!(
@@ -833,6 +835,7 @@ pub async fn run_request_until_disconnect_cleanup_failure(
                                     }
                                 }
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         responder.name,
                                         format!(
@@ -877,6 +880,7 @@ pub async fn run_request_until_disconnect_cleanup_failure(
                         SwarmEvent::Behaviour(ReqResTestEvent::RequestResponse(request_response::Event::Message { peer, message, .. })) => {
                             match message {
                                 request_response::Message::Response { request_id, response } => {
+                                    let response = response.message;
                                     transcript.record(
                                         requester.name,
                                         format!(
@@ -929,8 +933,6 @@ pub async fn run_request_until_disconnect_cleanup_failure(
 
 fn describe_request(request: &NockchainRequest) -> &'static str {
     match request {
-        NockchainRequest::Request { .. } => "request",
-        NockchainRequest::Gossip { .. } => "gossip",
         NockchainRequest::AuthenticatedGossip { .. } => "authenticated-gossip",
         NockchainRequest::BatchRequest { .. } => "batch-request",
     }

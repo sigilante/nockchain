@@ -23,9 +23,24 @@
 ::
 +$  proof-objects  (list proof-data)
 ::
-+$  proof-version  ?(%2 %1 %0)
+::  Keep %2 first so the bunt/default remains backward-compatible.
+::  %0 through %3 and %5 are ZK proof-stream versions. %4 identifies the
+::  structured AI artifact and is never valid as a proof-stream payload.
++$  proof-version  ?(%2 %5 %4 %3 %1 %0)
 +$  proof
   $%  $:  version=%2
+          objects=proof-objects
+          hashes=(list noun-digest:tip5)
+          read-index=@
+      ==
+    ::
+      $:  version=%3
+          objects=proof-objects
+          hashes=(list noun-digest:tip5)
+          read-index=@
+      ==
+    ::
+      $:  version=%5
           objects=proof-objects
           hashes=(list noun-digest:tip5)
           read-index=@
@@ -42,24 +57,74 @@
           hashes=(list noun-digest:tip5)
           read-index=@
       ==
+    ::
+  ==
+::
+::  Array payloads carry a logical length and a backing atom.  Fiat-Shamir
+::  hashes both, so accepting a mismatch gives the prover transcript entropy
+::  that later arithmetic may ignore.  Merkle siblings must also be based
+::  before a hash jet sees them; relying on a check inside the Hoon hash arm can
+::  diverge when the arm is replaced by a release jet. Hardened versions %3
+::  and %5 validate the complete representation before any object is absorbed.
+++  proof-digest-based
+  |=  [a=belt b=belt c=belt d=belt e=belt]
+  ^-  ?
+  ?&  (based a)
+      (based b)
+      (based c)
+      (based d)
+      (based e)
+  ==
+::
+++  proof-arrays-valid
+  |=  p=proof
+  ^-  ?
+  %+  levy  objects.p
+  |=  pd=proof-data
+  ?+  -.pd  %.y
+    %m-root   (proof-digest-based p.pd)
+    %puzzle   ?&  (proof-digest-based commitment.pd)
+                  (proof-digest-based nonce.pd)
+              ==
+    %codeword  ~(cank fop p.pd)
+    %terms     ~(cank bop p.pd)
+    %m-path    ?&  ~(cank fop leaf.p.pd)
+                   (levy path.p.pd proof-digest-based)
+               ==
+    %m-pathbf  ?&  ~(cank bop leaf.p.pd)
+                   (levy path.p.pd proof-digest-based)
+               ==
+    %comp-m    (proof-digest-based p.pd)
+    %evals     ~(cank fop p.pd)
+    %poly      ~(cank bop p.pd)
   ==
 ::
 +$  tip5-hash-atom  @ux
 ::
-::  number of items in proof used for pow
+::  number of proof objects used for PoW before version 5
 ++  pow-items  7
-::  extract pow from proof
+::  Extract the proof prefix committed by PoW. Version 5 commits only to
+::  object 0, the block-bound puzzle object; older ZK versions retain objects
+::  0 through 6 exactly.
 ++  get-pow
   ~/  %get-pow
   |=  p=proof
   ^-  proof
-  p(objects (scag pow-items objects.p))
+  =/  count=@  ?:(=(%5 version.p) 1 pow-items)
+  p(objects (scag count objects.p))
 ::
 ++  proof-to-pow
   ~/  %proof-to-pow
   |=  =proof
   ^-  tip5-hash-atom
-  (digest-to-atom:tip5 (hash-proof (get-pow proof)))
+  =/  pow-digest=noun-digest:tip5  (hash-proof (get-pow proof))
+  =?  pow-digest  =(%3 version.proof)
+    %-  hash-hashable:tip5
+    [leaf+%zkpow-v3 hash+pow-digest]
+  =?  pow-digest  =(%5 version.proof)
+    %-  hash-hashable:tip5
+    [leaf+%zkpow-v5 hash+pow-digest]
+  (digest-to-atom:tip5 pow-digest)
 ::
 ++  hashable-proof-objects
   ~/  %hashable-proof-objects
@@ -75,6 +140,31 @@
   =^  lis=(list belt)  rng  (belts:rng 5)
   =-  ?>  ?=(noun-digest:tip5 -)  -
   (list-to-tuple:tip5 lis)
+::
+::  Hash the proof-derived identity committed by a block ID. Version 5 treats
+::  objects after the mining projection as a witness envelope: they remain
+::  mandatory for admission, but alternate valid witnesses for the same object
+::  0 identify the same block. Historical versions retain their existing rules.
+++  hash-proof-for-block
+  ~/  %hash-proof-for-block
+  |=  p=proof
+  ^-  noun-digest:tip5
+  ?:  =(%5 version.p)
+    %-  hash-hashable:tip5
+    :*  leaf+%zkblk-v5
+        leaf+version.p
+        hash+(hash-proof (get-pow p))
+    ==
+  =/  proof-digest=noun-digest:tip5  (hash-proof p)
+  ?:  ?=(?(%0 %1 %2) version.p)
+    proof-digest
+  %-  hash-hashable:tip5
+  :*  leaf+%zkblk-v3
+      leaf+version.p
+      hash+proof-digest
+      (hashable-noun-digests:tip5 hashes.p)
+      leaf+read-index.p
+  ==
 ::
 ++  absorb-proof-objects
   ~/  %absorb-proof-objects

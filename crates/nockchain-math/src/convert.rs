@@ -12,6 +12,42 @@ use crate::mary::*;
 use crate::noun_ext::{AtomMathExt, AtomMathExtHandle, NounMathExt, NounMathExtHandle};
 use crate::poly::*;
 
+#[inline(always)]
+fn poly_expected_words<T: Element>(len: u32) -> Option<usize> {
+    (len as usize).checked_mul(T::len())
+}
+
+#[inline(always)]
+fn poly_atom_has_legacy_shape<T: Element>(tail: AtomHandle<'_>, len: u32) -> bool {
+    let expected_words = poly_expected_words::<T>(len);
+    let actual_blocks = tail.bit_size().checked_add(63).map(|bits| bits / 64);
+    tail.is_indirect()
+        && matches!((expected_words, actual_blocks), (Some(expected), Some(actual)) if actual >= expected)
+}
+
+#[inline(always)]
+fn poly_atom_has_exact_shape<T: Element>(tail: AtomHandle<'_>, len: u32) -> bool {
+    let expected_bits = poly_expected_words::<T>(len)
+        .and_then(|words| words.checked_mul(u64::BITS as usize))
+        .and_then(|bits| bits.checked_add(1));
+    tail.is_indirect() && expected_bits == Some(tail.bit_size())
+}
+
+/// Check the canonical v3 array representation without changing the historical
+/// decoder's acceptance of noncanonical terminal markers.
+pub fn poly_noun_has_exact_shape<T: Element>(noun: &Noun, space: &NounSpace) -> bool {
+    let Ok(cell) = noun.in_space(space).as_cell() else {
+        return false;
+    };
+    let (Ok(head), Ok(tail)) = (cell.head().as_atom(), cell.tail().as_atom()) else {
+        return false;
+    };
+    let Ok(len) = head.atom().as_u32() else {
+        return false;
+    };
+    poly_atom_has_exact_shape::<T>(tail, len)
+}
+
 impl AtomMathExt for Atom {
     fn as_u32(&self) -> Result<u32> {
         if let Ok(a) = self.as_direct() {
@@ -234,14 +270,31 @@ impl MarySlice<'_> {
         let len = c.tail().as_cell()?.head().as_atom()?.atom().as_u32()?;
         let cell = c.tail().as_cell()?;
         let dat_atom = cell.tail().as_atom()?;
+        // `len` and `step` come from the decoded noun, so the claimed
+        // geometry must be checked against the backing atom before the
+        // `from_raw_parts` views below. A product that wraps in `u32`
+        // (e.g. 0x1_0000 * 0x1_0000) or exceeds the backing atom builds
+        // a slice that reads past the allocation in every consumer that
+        // iterates `dat`.
+        let expected_words = u64::from(len) * u64::from(step);
         let dat_slice: &[u64] = if dat_atom.is_direct() {
+            // A direct atom occupies a single word in the cell's tail
+            // slot, so at most one word can be claimed.
+            if expected_words > 1 {
+                return Err(());
+            }
             unsafe {
                 let cell_ptr = cell.raw_pointer();
                 let tail_ptr = &(*cell_ptr).tail as *const Noun;
-                std::slice::from_raw_parts(tail_ptr as *const u64, (len * step) as usize)
+                std::slice::from_raw_parts(tail_ptr as *const u64, expected_words as usize)
             }
         } else {
-            unsafe { std::slice::from_raw_parts(dat_atom.data_pointer(), (len * step) as usize) }
+            let actual_blocks = dat_atom.bit_size().checked_add(63).map(|bits| bits / 64);
+            if !matches!((expected_words, actual_blocks), (expected, Some(actual)) if actual as u64 >= expected)
+            {
+                return Err(());
+            }
+            unsafe { std::slice::from_raw_parts(dat_atom.data_pointer(), expected_words as usize) }
         };
         Ok(MarySlice {
             step,
@@ -312,7 +365,7 @@ impl BPolySlice<'_> {
         let tail = c.tail().as_atom();
         if let (Ok(head), Ok(tail)) = (head, tail) {
             let len32 = head.atom().as_u32()?;
-            if tail.is_direct() {
+            if !poly_atom_has_legacy_shape::<Belt>(tail, len32) {
                 return Err(BAIL_FAIL);
             }
             let dat_slice: BPolySlice = unsafe {
@@ -347,7 +400,7 @@ impl FPolySlice<'_> {
         let tail = c.tail().as_atom();
         if let (Ok(head), Ok(tail)) = (head, tail) {
             let len32 = head.atom().as_u32()?;
-            if tail.is_direct() {
+            if !poly_atom_has_legacy_shape::<Felt>(tail, len32) {
                 return Err(BAIL_FAIL);
             }
             let dat_slice: FPolySlice = unsafe {
@@ -382,7 +435,7 @@ impl FPolyVec {
         let tail = c.tail().as_atom();
         if let (Ok(head), Ok(tail)) = (head, tail) {
             let len32 = head.atom().as_u32()?;
-            if tail.is_direct() {
+            if !poly_atom_has_legacy_shape::<Felt>(tail, len32) {
                 return Err(BAIL_FAIL);
             }
             let dat_vec: FPolyVec = unsafe {
@@ -417,7 +470,7 @@ impl BPolyVec {
         let tail = c.tail().as_atom();
         if let (Ok(head), Ok(tail)) = (head, tail) {
             let len32 = head.atom().as_u32()?;
-            if tail.is_direct() {
+            if !poly_atom_has_legacy_shape::<Belt>(tail, len32) {
                 return Err(BAIL_FAIL);
             }
             let dat_vec: BPolyVec = unsafe {
@@ -466,5 +519,150 @@ impl NounEncode for BPolyVec {
             new_handle_mut_slice(allocator, Some(self.0.len()));
         res_poly.copy_from_slice(&self.0);
         finalize_poly(allocator, Some(self.0.len()), res)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nockvm::mem::{NockStack, NOCK_STACK_SIZE};
+    use nockvm::noun::T;
+    use noun_serde::{NounDecode, NounEncode};
+
+    use super::*;
+
+    #[test]
+    fn rejects_bpoly_length_larger_than_backing_atom() {
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let encoded = PolyVec::<Belt>(vec![Belt(7)]).to_noun(&mut stack);
+        let tail = {
+            let space = stack.noun_space();
+            encoded
+                .in_space(&space)
+                .as_cell()
+                .expect("encoded bpoly should be a cell")
+                .tail()
+                .noun()
+        };
+        let malformed = T(&mut stack, &[D(3), tail]);
+        let space = stack.noun_space();
+        assert!(BPolyVec::from_noun(&malformed, &space).is_err());
+    }
+
+    #[test]
+    fn rejects_fpoly_length_larger_than_backing_atom() {
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let encoded = PolyVec::<Felt>(vec![Felt::one()]).to_noun(&mut stack);
+        let tail = {
+            let space = stack.noun_space();
+            encoded
+                .in_space(&space)
+                .as_cell()
+                .expect("encoded fpoly should be a cell")
+                .tail()
+                .noun()
+        };
+        let malformed = T(&mut stack, &[D(2), tail]);
+        let space = stack.noun_space();
+        assert!(FPolyVec::from_noun(&malformed, &space).is_err());
+    }
+
+    fn mary_noun(stack: &mut NockStack, step: u64, len: u64, dat: Noun) -> Noun {
+        let inner = T(stack, &[D(len), dat]);
+        T(stack, &[D(step), inner])
+    }
+
+    #[test]
+    fn rejects_maryslice_length_times_step_overflow() {
+        // 0x1_0000 * 0x1_0000 wraps to zero in u32 arithmetic; in u64 it
+        // demands 2^32 words, which no backing atom in a real message
+        // can supply. The decode must reject instead of accepting a
+        // nonsense empty slice.
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [0_u64];
+        let dat =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let malformed = mary_noun(&mut stack, 0x1_0000, 0x1_0000, dat);
+        let space = stack.noun_space();
+        assert!(MarySlice::try_from(malformed, &space).is_err());
+    }
+
+    #[test]
+    fn rejects_maryslice_claimed_words_larger_than_backing_atom() {
+        // A one-word backing atom cannot supply 2^20 claimed words;
+        // before the backing check this built a slice that read past
+        // the allocation (SIGSEGV in every mary jet iterating `dat`).
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [0xDEAD_BEEF_u64];
+        let dat =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let malformed = mary_noun(&mut stack, 1, 1 << 20, dat);
+        let space = stack.noun_space();
+        assert!(MarySlice::try_from(malformed, &space).is_err());
+    }
+
+    #[test]
+    fn rejects_maryslice_direct_backing_overclaim() {
+        // A direct atom occupies one word in the cell's tail slot, so a
+        // two-word claim over it must be rejected.
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let malformed = mary_noun(&mut stack, 2, 1, D(0xDEAD_BEEF));
+        let space = stack.noun_space();
+        assert!(MarySlice::try_from(malformed, &space).is_err());
+    }
+
+    #[test]
+    fn maryslice_decodes_exact_backing_atom() {
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [0xDEAD_BEEF_u64];
+        let dat =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let mary = mary_noun(&mut stack, 1, 1, dat);
+        let space = stack.noun_space();
+        let decoded = MarySlice::try_from(mary, &space).expect("exact backing decodes");
+        assert_eq!(decoded.step, 1);
+        assert_eq!(decoded.len, 1);
+        assert_eq!(decoded.dat, &[0xDEAD_BEEF_u64]);
+    }
+
+    #[test]
+    fn maryslice_ignores_overlong_backing_atom() {
+        // Mirrors the poly decoders: an overlong backing atom is
+        // accepted, only underlength is rejected.
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [0xDEAD_BEEF_u64, 0_u64];
+        let dat =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let mary = mary_noun(&mut stack, 1, 1, dat);
+        let space = stack.noun_space();
+        let decoded = MarySlice::try_from(mary, &space).expect("overlong backing decodes");
+        assert_eq!(decoded.dat, &[0xDEAD_BEEF_u64]);
+    }
+
+    #[test]
+    fn legacy_decoder_accepts_noncanonical_terminal_marker_safely() {
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [7_u64, 2_u64];
+        let tail =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let malformed = T(&mut stack, &[D(1), tail]);
+        let space = stack.noun_space();
+        assert_eq!(
+            BPolyVec::from_noun(&malformed, &space).expect("legacy shape remains decodable"),
+            PolyVec(vec![Belt(7)])
+        );
+    }
+
+    #[test]
+    fn legacy_decoder_safely_ignores_overlong_backing_atom() {
+        let mut stack = NockStack::new(NOCK_STACK_SIZE, 0);
+        let words = [7_u64, 1_u64, 5_u64];
+        let tail =
+            unsafe { IndirectAtom::new_raw(&mut stack, words.len(), words.as_ptr()) }.as_noun();
+        let malformed = T(&mut stack, &[D(1), tail]);
+        let space = stack.noun_space();
+        assert_eq!(
+            BPolyVec::from_noun(&malformed, &space).expect("legacy suffix remains decodable"),
+            PolyVec(vec![Belt(7)])
+        );
     }
 }

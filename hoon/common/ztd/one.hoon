@@ -481,10 +481,20 @@
     =/  source  (cut 6 [(mul offset (add (mul j num-cols) i)) offset] dat.array.ma)
     m(dat.array (sew 6 [(mul offset target-index) offset source] dat.array.m))
   ::
-  ::  check if len matches the actual size of dat
+  ::  Historical shape rule: check if len matches the payload word count.
   ++  chck
     ^-  ?
     =((mul step.ma len.array.ma) (dec (met 6 dat.array.ma)))
+  ::
+  ::  Canonical v3 shape rule: also require the terminal marker to be exactly
+  ::  one.  A larger marker can occupy the same 64-bit word while being ignored
+  ::  by +mary-to-list, so word count alone is not a canonical encoding check.
+  ++  cank
+    ^-  ?
+    =/  words  (mul step.ma len.array.ma)
+    ?&  chck
+        =((met 0 dat.array.ma) (add 1 (mul 64 words)))
+    ==
   --  :: ave
 ::
 ++  transpose-fpolys
@@ -579,6 +589,10 @@
     ++  chck
       ^-  ?
       chck:op
+    ::
+    ++  cank
+      ^-  ?
+      cank:op
     --
   --
 ::
@@ -795,13 +809,25 @@
   (lth a p)
 ::
 ::  is this noun based
+++  max-noun-logical-nodes  1.048.576
 ++  based-noun
   ~/  %based-noun
   |=  n=*
   ^-  ?
+  -:(based-noun-with-budget n max-noun-logical-nodes)
+++  based-noun-with-budget
+  |=  [n=* remaining=@]
+  ^-  [? @]
+  ?:  =(remaining 0)
+    [%.n 0]
+  =/  next-remaining  (dec remaining)
   ?@  n
-    (based n)
-  &($(n -.n) $(n +.n))
+    [(based n) next-remaining]
+  =/  [head-ok=? head-remaining=@]
+    $(n -.n, remaining next-remaining)
+  ?.  head-ok
+    [%.n head-remaining]
+  $(n +.n, remaining head-remaining)
 ::
 ::  +badd: base field addition
 ++  badd
