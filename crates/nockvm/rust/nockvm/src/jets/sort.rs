@@ -48,7 +48,11 @@ pub mod util {
     use crate::noun::{Noun, NounSpace, NO, YES};
 
     pub fn dor(stack: &mut NockStack, a: Noun, b: Noun, space: &NounSpace) -> Noun {
-        if unsafe { a.raw_equals(&b) } {
+        // Hoon ++dor uses deep value equality first: separately allocated
+        // nouns with equal values must compare YES to preserve the total order.
+        // heads_equal supplies deep equality with a pointer fast path and
+        // cached-mug pre-filter.
+        if heads_equal(stack, a, b, space) {
             YES
         } else {
             match (a.as_either_atom_cell(), b.as_either_atom_cell()) {
@@ -94,7 +98,8 @@ pub mod util {
         }
     }
 
-    /// Structural equality for dor's head comparison (Hoon's `=(-.a -.b)`):
+    /// Structural equality for dor's equality checks (top-level `=(a b)`
+    /// and the head comparison `=(-.a -.b)`):
     /// pointer fast path, cached-mug pre-filter (`mug` caches recursively on
     /// both trees, so unequal heads reject in O(1) amortized), then a
     /// heap-free worklist walk with per-node mug rejection. Non-unifying:
@@ -237,6 +242,34 @@ mod tests {
         let b = T(&mut c.stack, &[head_b, D(0)]);
         let sam = T(&mut c.stack, &[a, b]);
         assert_jet(c, jet_dor, sam, YES);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "memfd_create unsupported in Miri")]
+    fn test_dor_equal_pointer_distinct_indirect_atoms() {
+        // Equal-valued indirect atoms must compare YES in both directions,
+        // regardless of allocation identity. gor/mor route mug-equal pairs
+        // through dor and must agree with its deep-value-equality ordering.
+        let c = &mut init_context();
+
+        // 2^63 = DIRECT_MAX+1: the first value that must be allocated
+        // as an indirect atom.
+        let big_a = A(&mut c.stack, &ubig!(_0x8000000000000000));
+        let big_b = A(&mut c.stack, &ubig!(_0x8000000000000000));
+        assert!(
+            unsafe { !big_a.raw_equals(&big_b) },
+            "fixture: separately-allocated indirect atoms are pointer-distinct"
+        );
+
+        let sam = T(&mut c.stack, &[big_a, big_b]);
+        assert_jet(c, jet_dor, sam, YES);
+        let sam = T(&mut c.stack, &[big_b, big_a]);
+        assert_jet(c, jet_dor, sam, YES);
+
+        let sam = T(&mut c.stack, &[big_a, big_b]);
+        assert_jet(c, jet_gor, sam, YES);
+        let sam = T(&mut c.stack, &[big_a, big_b]);
+        assert_jet(c, jet_mor, sam, YES);
     }
 
     #[test]

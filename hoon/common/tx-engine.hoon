@@ -22,8 +22,7 @@
 ::    boundary semantics also live in the 2-arg
 ::    +post-asert-activation:v1 (used by +new-candidate); the inline
 ::    `gte` here is the canonical definition for callers that read
-::    phase.zk-asert from blockchain-constants. See
-::    014-aletheia-emissions-audit.md finding #3.
+::    phase.zk-asert from blockchain-constants: height >= phase.zk-asert.
 ++  post-asert-activation
   |=  height=@
   ^-  ?
@@ -392,10 +391,9 @@
   ::  - %ai-pow: 2^256/(target+1) MAC-equivalents, converted at the
   ::    height-selected cross-puzzle exchange rate.
   ::
-  ::  Heaviness therefore scales inversely with target for both puzzles. The
-  ::  Logos exchange rate is retained below +zk-pow-v5-phase so historical
-  ::  accumulated work remains valid; version %5 switches to Tip5 hash-grinding
-  ::  pricing at the activation height.
+  ::  Heaviness therefore scales inversely with target for both puzzles.
+  ::  Each historical exchange rate is retained below its activation height,
+  ::  so later repricing never changes previously accumulated work.
   ++  block-work-at
     |=  [height=page-number puzzle=?(%dumb-zkpow %ai-pow) target-bn=bignum:bn]
     ^-  bignum:bn
@@ -430,16 +428,66 @@
   ++  zk-pow-v5-mac-equivalents-per-zk-hash
     ^~  1.028.807
   ::
+  ::  At the ASERT reset, retain 400 trillion MAC/s but use 28 million ZK
+  ::  hashes/s per GPU. Round 400,000,000,000,000 / 28,000,000 to nearest.
+  ++  asert-reset-mac-equivalents-per-zk-hash
+    ^~  14.285.714
+  ::
   ++  mac-equivalents-per-zk-work-unit-at
     |=  height=page-number
     ^-  @
     ?:  (lth height zk-pow-v5-phase)
       mac-equivalents-per-zk-attempt
-    zk-pow-v5-mac-equivalents-per-zk-hash
+    ?:  (lth height harden-phase)
+      zk-pow-v5-mac-equivalents-per-zk-hash
+    asert-reset-mac-equivalents-per-zk-hash
   ::
   ++  zk-pow-v5-phase
     ^-  page-number
     147.500
+  ::
+  ::  Shared release boundary for ASERT/work repricing, AI-PoW hardening,
+  ::  Pearl admission limits, and mainnet bridge deposit crediting.
+  ++  harden-phase
+    ^-  page-number
+    154.500
+  ::
+  ++  puzzle-asert-reset-at
+    |=  height=page-number
+    ^-  ?
+    ?|  =(height zk-pow-v5-phase)
+        =(height harden-phase)
+        =(height (need consensus-batch-phase))
+    ==
+  ::
+  ++  ai-pow-hardening-required
+    |=  height=page-number
+    ^-  ?
+    (gte height harden-phase)
+  ::
+  ::  Explicit verifier version selected from this block's height. Keep the
+  ::  boundary in Hoon; the certificate cannot choose its admission rules.
+  ++  ai-pow-proof-rules
+    |=  height=page-number
+    ^-  ?(%legacy %hardened %consrule)
+    (ai-pow-proof-rules-at height consensus-batch-phase)
+  ::
+  ::  Shared immutable boundary for consensus admission and both ASERT lanes.
+  ++  consensus-batch-phase
+    ^-  (unit page-number)
+    [~ 170.000]
+  ::
+  ++  ai-pow-proof-rules-at
+    |=  [height=page-number activation=(unit page-number)]
+    ^-  ?(%legacy %hardened %consrule)
+    ?^  activation
+      ?>  (gth u.activation harden-phase)
+      ?:  (gte height u.activation)
+        %consrule
+      ?:((ai-pow-hardening-required height) %hardened %legacy)
+    ?:((ai-pow-hardening-required height) %hardened %legacy)
+  ::
+  ++  ai-pow-canonical-witnesses-required  ai-pow-hardening-required
   ::
   ::  Integer ideals target 70.028% AI / 29.972% ZK and a 149.86s combined
   ::  cadence: AI rate 1/214, ZK rate 1/500.
@@ -466,6 +514,33 @@
   ++  zk-pow-v5-zk-anchor-target
     ^-  @
     (div max-target-atom (mul zk-pow-v5-reference-zk-hashes-per-second zk-pow-v5-zk-ideal-block-time))
+  ::
+  ::  Reset both lanes without changing the reference fleets or AI capacity.
+  ++  asert-reset-reference-zk-hashes-per-gpu-second  ^~  28.000.000
+  ::
+  ++  asert-reset-reference-zk-hashes-per-second
+    ^-  @
+    (mul zk-pow-v5-reference-zk-gpu-count asert-reset-reference-zk-hashes-per-gpu-second)
+  ::
+  ++  asert-reset-zk-anchor-target
+    ^-  @
+    (div max-target-atom (mul asert-reset-reference-zk-hashes-per-second zk-pow-v5-zk-ideal-block-time))
+  ::
+  ::  The consensus batch uses 100 billion ZK hashes/s and 20 ExaMAC/s.
+  ::  Keep both historical reference anchors unchanged.
+  ++  consensus-batch-reference-zk-hashes-per-second
+    ^~  100.000.000.000
+  ::
+  ++  consensus-batch-zk-anchor-target
+    ^-  @
+    (div max-target-atom (mul consensus-batch-reference-zk-hashes-per-second zk-pow-v5-zk-ideal-block-time))
+  ::
+  ++  consensus-batch-reference-ai-macs-per-second
+    ^~  20.000.000.000.000.000.000
+  ::
+  ++  consensus-batch-ai-anchor-target
+    ^-  @
+    (div (bex 256) (mul consensus-batch-reference-ai-macs-per-second zk-pow-v5-ai-ideal-block-time))
   ::
   ::  +dual-puzzle-phase: the height at which the dual-puzzle regime begins, and
   ::  therefore the first height at which heaviness is priced per puzzle.
@@ -766,6 +841,13 @@
     ?^  -.form  (compute-id:raw-tx:v0 form)
     (compute-id:raw-tx:v1 form)
   ::
+  ::  Admission shape only; v0 and contextual fund authorization are unchanged.
+  ++  valid-stub-axes
+    |=  =form
+    ^-  ?
+    ?^  -.form  %.y
+    (valid-stub-axes:raw-tx:v1 form)
+  ::
   ++  validate
     |=  =form
     ^-  ?
@@ -1003,6 +1085,15 @@
     =/  root=hash  (hash:lock sc)
     [root sc h]
   --
+::  Select only recovery maturity; ordinary authorization is never gated.
+++  fund-minimum-at
+  |=  height=page-number
+  ^-  (unit page-number)
+  =/  phase=(unit page-number)  consensus-batch-phase:page
+  ?~  phase  ~
+  ?:  (lth height u.phase)  ~
+  [~ coinbase-timelock-min]
+:::
 ++  spends
   =<  form
   =+  spends:v1
@@ -1023,6 +1114,7 @@
         max-size
         bythos-phase
         ai-pow-activation-height
+        (fund-minimum-at page-num)
     ==
   ::
   ::  count note-data words as stored on output notes (outputs are built by
@@ -1118,6 +1210,12 @@
     =/  witness-fee=coins  (div (mul witness-word-count effective-base-fee) witness-divisor)
     =/  word-fee=coins  (add seed-fee witness-fee)
     (max word-fee min-fee.data)
+  ++  meets-min-fee
+    |=  [sps=form page-num=page-number]
+    ^-  ?
+    =/  required=coins  (calculate-min-fee [sps page-num])
+    =/  paid=coins  (roll-fees sps)
+    (gte paid required)
   --
 ::
 ++  spend-v1
@@ -1391,9 +1489,7 @@
       [balance.form spends.raw1 height.form max-size.data bythos-phase]
     ?.  ?=(%.y -.validate-result)  validate-result
     ::  check fee covers word count
-    =/  min-fee=coins  (calculate-min-fee:spends [spends.raw1 height.form])
-    =/  paid-fee=coins  (roll-fees:spends spends.raw1)
-    ?.  (gte paid-fee min-fee)
+    ?.  (meets-min-fee:spends [spends.raw1 height.form])
       [%.n %v1-insufficient-fee]
     ::  add outputs to balance
     =/  add-result  (add-outputs outputs.tx1)

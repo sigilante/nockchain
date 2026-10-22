@@ -4,12 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bytes::Bytes;
 use libp2p::request_response::ResponseChannel;
 use libp2p::swarm::ConnectionId;
 use libp2p::PeerId;
 use nockapp::driver::PokeResult;
-use nockapp::noun::slab::NounSlab;
 use nockapp::wire::Wire;
 use nockapp::NockAppError;
 use nockvm::noun::NounAllocator;
@@ -18,11 +16,13 @@ use tracing::{debug, trace, warn};
 
 use crate::driver::gen2::*;
 use crate::driver::{
-    record_local_peer_abuse, Libp2pWire, LocalPeerAbuseKind, LocalPeerAbuseSeverity, SwarmAction,
+    record_local_peer_abuse, Libp2pWire, LocalPeerAbuseAddress, LocalPeerAbuseKind,
+    LocalPeerAbuseSeverity, SwarmAction,
 };
 use crate::ip_block::PeerExclusions;
 use crate::messages::{
-    BatchErrorClass, BatchResultStatus, NockchainFact, NockchainRequest, NockchainResponse,
+    request_slab_from_message, BatchErrorClass, BatchResultStatus, NockchainFact, NockchainRequest,
+    NockchainResponse,
 };
 use crate::metrics::NockchainP2PMetrics;
 use crate::p2p_state::{
@@ -35,8 +35,9 @@ use crate::traffic_cop;
 pub(super) async fn handle_inbound_request(
     peer: PeerId,
     connection_id: ConnectionId,
+    request_id: libp2p::request_response::InboundRequestId,
     request: NockchainRequest,
-    channel: ResponseChannel<NockchainResponse>,
+    channel: ResponseChannel<crate::behaviour::TransportResponse>,
     swarm_tx: mpsc::Sender<SwarmAction>,
     equix_builder: &mut equix::EquiXBuilder,
     local_peer_id: PeerId,
@@ -99,25 +100,8 @@ pub(super) async fn handle_inbound_request(
             return Ok(());
         }
     }
-    if matches!(&request, NockchainRequest::Gossip { .. }) {
-        metrics.legacy_gossip_received.increment();
-    }
-    if matches!(&request, NockchainRequest::Gossip { .. })
-        && !req_res_limits.legacy_gossip_accept_enabled
-    {
-        metrics.legacy_gossip_compatibility_rejected.increment();
-        metrics.gossip_dropped.increment();
-        warn!(
-            peer = %peer,
-            "Rejecting legacy gossip because unauthenticated gossip compatibility is disabled"
-        );
-        return Ok(());
-    }
 
-    if !matches!(
-        &request,
-        NockchainRequest::Gossip { .. } | NockchainRequest::AuthenticatedGossip { .. }
-    ) {
+    if matches!(&request, NockchainRequest::BatchRequest { .. }) {
         let admission = driver_state.lock().await.admit_request_from_connection(
             connection_id, req_res_limits.ip_bucket_request_admission_limit,
         );
@@ -142,8 +126,7 @@ pub(super) async fn handle_inbound_request(
                 &metrics,
                 &peer_exclusions,
                 peer,
-                Some(connection_id),
-                None,
+                LocalPeerAbuseAddress::Connection(connection_id),
                 LocalPeerAbuseKind::IpBucketRequestCap,
                 LocalPeerAbuseSeverity::Strong,
                 false,
@@ -180,8 +163,7 @@ pub(super) async fn handle_inbound_request(
             &metrics,
             &peer_exclusions,
             peer,
-            Some(connection_id),
-            None,
+            LocalPeerAbuseAddress::Connection(connection_id),
             LocalPeerAbuseKind::BadRequestPow,
             LocalPeerAbuseSeverity::Strong,
             true,
@@ -211,6 +193,7 @@ pub(super) async fn handle_inbound_request(
         metrics.authenticated_gossip_verified.increment();
     }
     let addr = { driver_state.lock().await.connection_address(connection_id) };
+    let endpoint = addr.as_ref().and_then(crate::p2p_util::quic_socket_addr);
     if let Some(addr) = addr {
         let addr_str = addr.to_string();
         debug!("Request received from peer at address {addr_str} with id {peer}");
@@ -249,8 +232,7 @@ pub(super) async fn handle_inbound_request(
             &metrics,
             &peer_exclusions,
             peer,
-            Some(connection_id),
-            None,
+            LocalPeerAbuseAddress::Connection(connection_id),
             LocalPeerAbuseKind::InboundAdmissionRejected,
             LocalPeerAbuseSeverity::Weak,
             false,
@@ -258,31 +240,18 @@ pub(super) async fn handle_inbound_request(
         .await?;
         return Ok(());
     }
+    debug!(monotonic_us = traffic_cop::observation_time_us(), peer = %peer,
+        request_id = %request_id, connection_id = ?connection_id, endpoint = ?endpoint,
+        nonce = match &request {
+            NockchainRequest::BatchRequest { nonce, .. }
+            | NockchainRequest::AuthenticatedGossip { nonce, .. } => *nonce,
+        },
+        "Nous req-res inbound request admitted");
 
     let driver_state_for_release = Arc::clone(&driver_state);
     let request_result: Result<(), NockAppError> = async move {
         match request {
-            NockchainRequest::Request {
-                pow: _,
-                nonce: _,
-                message,
-            } => {
-                trace!("handle_request_response: Request received");
-                let data_request = decode_request_item_message(&message)?;
-                let response = execute_request_item(
-                    peer, data_request, req_res_limits, &traffic, &metrics, &driver_state,
-                )
-                .await?
-                .into_single_response();
-                swarm_tx
-                    .send(SwarmAction::SendResponse { channel, response })
-                    .await
-                    .map_err(|_| {
-                        NockAppError::OtherError(String::from("Failed to send SwarmAction response"))
-                    })
-            }
-            NockchainRequest::Gossip { message }
-            | NockchainRequest::AuthenticatedGossip { message, .. } => {
+            NockchainRequest::AuthenticatedGossip { message, .. } => {
                 trace!("handle_request_response: Gossip received");
                 let admission = driver_state.lock().await.admit_gossip_from_connection(
                     connection_id,
@@ -303,8 +272,7 @@ pub(super) async fn handle_inbound_request(
                         &metrics,
                         &peer_exclusions,
                         peer,
-                        Some(connection_id),
-                        None,
+                        LocalPeerAbuseAddress::Connection(connection_id),
                         LocalPeerAbuseKind::GossipBucketCap,
                         LocalPeerAbuseSeverity::Strong,
                         false,
@@ -312,10 +280,7 @@ pub(super) async fn handle_inbound_request(
                     .await?;
                     return Ok(());
                 }
-                let mut request_slab: NounSlab = NounSlab::new();
-                let message_bytes = Bytes::from(message.to_vec());
-                let request_noun = request_slab.cue_into(message_bytes)?;
-                request_slab.set_root(request_noun);
+                let request_slab = request_slab_from_message(&message)?;
                 trace!("handle_request_response: Gossip noun parsed");
                 let driver_state_for_poke = driver_state.clone();
                 let metrics_for_poke = metrics.clone();
@@ -338,6 +303,15 @@ pub(super) async fn handle_inbound_request(
                     let gossip = NockchainFact::from_owned_noun_slab(request_slab)?;
                     let state_arc = driver_state_for_poke;
                     let track_state_arc = state_arc.clone();
+                    // Kernel effects can be dispatched before the poke Ack is
+                    // observed. Keep the source hint before the poke, but do
+                    // not count it as an accepted block receipt.
+                    if let NockchainFact::HeardBlock(block_id, _) = &gossip {
+                        track_state_arc
+                            .lock()
+                            .await
+                            .record_block_echo_source(peer, block_id);
+                    }
                     let metrics_arc = metrics_for_poke.clone();
                     let response_gate = ResponseProcessingGate::from(&gossip);
                     let response_gate_for_enable = response_gate.clone();

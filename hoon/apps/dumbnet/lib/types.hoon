@@ -745,9 +745,16 @@
     ==
   ==
 ::
+::  Internal producer context; not part of the network fact.
++$  gossip-origin  ?(%peer %local %chain %mining %kernel)
++$  gossip-phase
+  ?(%initial-acceptance %local-resend %pending-head %new-head %mining-regossip)
++$  gossip-context
+  [origin=gossip-origin phase=gossip-phase source=(unit peer-id)]
+::
 +$  effect
   $+  effect
-  $%  [%gossip p=fact]  :: broadcast tx or block to network
+  $%  [%gossip context=gossip-context p=fact]  :: broadcast tx or block to network
       [%request p=request]  :: request specific tx or block
       [%track p=track]  :: runtime tracking of blocks for %liar-block-id effect
       [%seen p=seen]    ::  seen so don't reprocess
@@ -767,7 +774,7 @@
       [%2 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
       [%3 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
       ::  %4 identifies the AI-PoW artifact emitted only through %mine-ai.
-      [%4 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
+      [%4 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@ candidate-height=page-number:dt]
       ::  %5 is the post-147500 ZK proof version.
       [%5 block-commitment=noun-digest:tip5:zeke target=bignum:bignum:dt pow-len=@]
   ==

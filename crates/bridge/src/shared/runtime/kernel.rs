@@ -42,6 +42,43 @@ fn runtime_transport_error<E: fmt::Display>(
     }
 }
 
+async fn await_kernel_poke_ack(
+    mut response: oneshot::Receiver<Result<(), BridgeError>>,
+    wait_target: &str,
+    heartbeat_interval: Duration,
+) -> Result<(), BridgeError> {
+    debug_assert!(!heartbeat_interval.is_zero());
+    let started_at = Instant::now();
+    let mut heartbeat = tokio::time::interval_at(
+        tokio::time::Instant::now() + heartbeat_interval,
+        heartbeat_interval,
+    );
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let ack = loop {
+        tokio::select! {
+            result = &mut response => {
+                break result.map_err(|e| {
+                    runtime_transport_error(
+                        BridgeRuntimeTransportErrorKind::PokeResponseDropped,
+                        e,
+                    )
+                })?;
+            }
+            _ = heartbeat.tick() => {
+                warn!(
+                    target: "bridge.runtime",
+                    wait_target,
+                    elapsed_secs=started_at.elapsed().as_secs(),
+                    heartbeat_interval_secs=heartbeat_interval.as_secs(),
+                    "blocking bridge kernel poke is still waiting for ack",
+                );
+            }
+        }
+    };
+    ack
+}
+
 fn since_height_path_slab(tag: &str, start_height: u64) -> NounSlab<NockJammer> {
     let mut slab: NounSlab<NockJammer> = NounSlab::new();
     let path = vec![tag.to_string(), start_height.to_string()];
@@ -242,7 +279,7 @@ impl NockBlockEvent {
 
 #[derive(Clone)]
 struct BridgeRuntimeHandleChannels {
-    inbound_tx: Sender<EventEnvelope<BridgeEvent>>,
+    inbound_tx: Sender<RuntimeEventRequest>,
     peek_tx: Sender<PeekRequest>,
     poke_tx: Sender<BridgePoke>,
 }
@@ -278,12 +315,32 @@ impl BridgeRuntimeHandle {
 
     pub async fn send_event(&self, event: BridgeEvent) -> Result<EventId, BridgeError> {
         let id = make_event_id(event.kind(), &event.identity_material());
-        let envelope = EventEnvelope { id, payload: event };
+        let request = RuntimeEventRequest {
+            event: EventEnvelope { id, payload: event },
+            respond_to: None,
+        };
         self.channels
             .inbound_tx
-            .send(envelope)
+            .send(request)
             .await
             .map_err(|e| BridgeError::Runtime(format!("inbound channel closed: {}", e)))?;
+        Ok(id)
+    }
+
+    async fn send_event_blocking(&self, event: BridgeEvent) -> Result<EventId, BridgeError> {
+        let id = make_event_id(event.kind(), &event.identity_material());
+        let wait_target = event.kind().as_str();
+        let (respond_to, response) = oneshot::channel();
+        let request = RuntimeEventRequest {
+            event: EventEnvelope { id, payload: event },
+            respond_to: Some(respond_to),
+        };
+        self.channels
+            .inbound_tx
+            .send(request)
+            .await
+            .map_err(|e| BridgeError::Runtime(format!("inbound channel closed: {}", e)))?;
+        await_kernel_poke_ack(response, wait_target, BLOCKING_POKE_ACK_HEARTBEAT_INTERVAL).await?;
         Ok(id)
     }
 
@@ -296,6 +353,15 @@ impl BridgeRuntimeHandle {
     /// Typed helper for harnesses/tests to inject a nock block event.
     pub async fn inject_nock_block(&self, block: NockBlockEvent) -> Result<EventId, BridgeError> {
         self.send_event(BridgeEvent::Chain(Box::new(ChainEvent::Nock(block))))
+            .await
+    }
+
+    /// Inject a Nock block and wait until the kernel has handled the poke.
+    pub(crate) async fn inject_nock_block_blocking(
+        &self,
+        block: NockBlockEvent,
+    ) -> Result<EventId, BridgeError> {
+        self.send_event_blocking(BridgeEvent::Chain(Box::new(ChainEvent::Nock(block))))
             .await
     }
 
@@ -757,35 +823,7 @@ impl BridgeRuntimeHandle {
             .map_err(|e| {
                 runtime_transport_error(BridgeRuntimeTransportErrorKind::PokeChannelClosed, e)
             })?;
-
-        let started_at = Instant::now();
-        let mut response = response;
-        let mut heartbeat = tokio::time::interval_at(
-            tokio::time::Instant::now() + heartbeat_interval,
-            heartbeat_interval,
-        );
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        let ack = loop {
-            tokio::select! {
-                result = &mut response => {
-                    break result.map_err(|e| {
-                        runtime_transport_error(BridgeRuntimeTransportErrorKind::PokeResponseDropped, e)
-                    })?;
-                }
-                _ = heartbeat.tick() => {
-                    warn!(
-                        target: "bridge.runtime",
-                        wire=%wire_path,
-                        elapsed_secs=started_at.elapsed().as_secs(),
-                        heartbeat_interval_secs=heartbeat_interval.as_secs(),
-                        "blocking bridge kernel poke is still waiting for ack",
-                    );
-                }
-            }
-        };
-        ack?;
-        Ok(())
+        await_kernel_poke_ack(response, &wire_path, heartbeat_interval).await
     }
 
     pub async fn send_stop(&self, last: StopLastBlocks) -> Result<(), BridgeError> {
@@ -961,12 +999,17 @@ struct PeekRequest {
     respond_to: oneshot::Sender<Result<Option<Vec<u8>>, BridgeError>>,
 }
 
+struct RuntimeEventRequest {
+    event: EventEnvelope<BridgeEvent>,
+    respond_to: Option<oneshot::Sender<Result<(), BridgeError>>>,
+}
+
 struct BridgeRuntimeDeps {
     cause_builder: Arc<dyn CauseBuilder>,
 }
 
 struct BridgeRuntimeChannels {
-    inbound_rx: Receiver<EventEnvelope<BridgeEvent>>,
+    inbound_rx: Receiver<RuntimeEventRequest>,
     poke_tx: Sender<BridgePoke>,
     poke_rx: Option<Receiver<BridgePoke>>,
     peek_rx: Option<Receiver<PeekRequest>>,
@@ -974,7 +1017,7 @@ struct BridgeRuntimeChannels {
 
 #[derive(Default)]
 struct BridgeRuntimeState {
-    pending_events: VecDeque<EventEnvelope<BridgeEvent>>,
+    pending_events: VecDeque<RuntimeEventRequest>,
 }
 
 pub struct BridgeRuntime {
@@ -1097,13 +1140,13 @@ impl BridgeRuntime {
         Ok(())
     }
 
-    async fn process_event(
-        &mut self,
-        event: EventEnvelope<BridgeEvent>,
-    ) -> Result<(), BridgeError> {
+    async fn process_event(&mut self, request: RuntimeEventRequest) -> Result<(), BridgeError> {
+        let RuntimeEventRequest { event, respond_to } = request;
         let outcome = self.deps.cause_builder.build_poke(&event)?;
         match outcome {
-            CauseBuildOutcome::Emit(poke) => {
+            CauseBuildOutcome::Emit(mut poke) => {
+                debug_assert!(poke.respond_to.is_none());
+                poke.respond_to = respond_to;
                 self.channels
                     .poke_tx
                     .send(poke)
@@ -1113,7 +1156,7 @@ impl BridgeRuntime {
             CauseBuildOutcome::Deferred(reason) => {
                 let kind = event.id.kind.as_str().to_string();
                 let digest = event.id.digest_excerpt();
-                self.enqueue_pending(event);
+                self.enqueue_pending(RuntimeEventRequest { event, respond_to });
                 debug!(
                     target: "bridge.runtime",
                     kind=%kind,
@@ -1131,23 +1174,26 @@ impl BridgeRuntime {
                     reason=%reason,
                     "event ignored"
                 );
+                if let Some(respond_to) = respond_to {
+                    let _ = respond_to.send(Ok(()));
+                }
             }
         }
         Ok(())
     }
 
-    fn enqueue_pending(&mut self, event: EventEnvelope<BridgeEvent>) {
+    fn enqueue_pending(&mut self, request: RuntimeEventRequest) {
         if self.state.pending_events.len() >= MAX_PENDING_EVENTS {
             if let Some(oldest) = self.state.pending_events.pop_front() {
                 warn!(
                     target: "bridge.runtime",
-                    kind=%oldest.id.kind.as_str(),
-                    digest=%oldest.id.digest_excerpt(),
+                    kind=%oldest.event.id.kind.as_str(),
+                    digest=%oldest.event.id.digest_excerpt(),
                     "dropping oldest pending event"
                 );
             }
         }
-        self.state.pending_events.push_back(event);
+        self.state.pending_events.push_back(request);
     }
 }
 
@@ -1287,6 +1333,42 @@ mod tests {
             .expect("Mutex poisoned in test - this should not happen");
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0].kind, BridgeEventKind::ChainBase));
+        Ok(())
+    }
+    #[tokio::test]
+    async fn blocking_event_waits_for_kernel_poke_ack() -> Result<(), BridgeError> {
+        let (mut runtime, handle) = BridgeRuntime::new(Arc::new(KernelCauseBuilder));
+        let mut poke_rx = runtime
+            .channels
+            .poke_rx
+            .take()
+            .expect("poke receiver missing");
+        let runtime_task = tokio::spawn(runtime.run());
+        let blocking_handle = handle.clone();
+        let event_task = tokio::spawn(async move {
+            blocking_handle
+                .send_event_blocking(BridgeEvent::Chain(Box::new(ChainEvent::Base(
+                    sample_base_batch(),
+                ))))
+                .await
+        });
+
+        let poke = poke_rx.recv().await.expect("event poke");
+        assert!(
+            !event_task.is_finished(),
+            "blocking event returned before the kernel acknowledged its poke"
+        );
+        poke.respond_to
+            .expect("blocking event response channel")
+            .send(Ok(()))
+            .expect("send event poke ack");
+        let id = event_task.await.expect("event task failed")?;
+        assert_eq!(id.kind, BridgeEventKind::ChainBase);
+
+        drop(handle);
+        runtime_task
+            .await
+            .expect("runtime task should complete successfully")?;
         Ok(())
     }
 
@@ -1484,6 +1566,40 @@ mod tests {
         let noun = unsafe { slab.root() };
         let space = slab.noun_space();
         BridgeCause::from_noun(noun, &space).expect("decode bridge cause")
+    }
+
+    fn malformed_tagged_cause_slab(tag: &str) -> NounSlab<NockJammer> {
+        let mut slab = NounSlab::new();
+        let tag = tag.to_string().to_noun(&mut slab);
+        let cause = nockvm::noun::T(&mut slab, &[nockvm::noun::D(0), tag, nockvm::noun::D(0)]);
+        slab.set_root(cause);
+        slab
+    }
+    fn malformed_nockchain_txs_slab() -> NounSlab<NockJammer> {
+        use nockchain_types::tx_engine::common::{BigNum, CoinbaseSplit, Hash, Page};
+
+        let page = Page {
+            digest: Hash([Belt(0); 5]),
+            pow: None,
+            parent: Hash([Belt(0); 5]),
+            tx_ids: vec![],
+            coinbase: CoinbaseSplit::V0(vec![]),
+            timestamp: 0,
+            epoch_counter: 0,
+            target: BigNum::from_u64(0),
+            accumulated_work: BigNum::from_u64(0),
+            height: 0,
+            msg: vec![],
+        };
+        let mut slab = NounSlab::new();
+        let tag = "nockchain-block".to_string().to_noun(&mut slab);
+        let page = page.to_noun(&mut slab);
+        let cause = nockvm::noun::T(
+            &mut slab,
+            &[nockvm::noun::D(0), tag, page, nockvm::noun::D(42)],
+        );
+        slab.set_root(cause);
+        slab
     }
 
     async fn setup_bridge_nockapp() -> Result<(TempDir, NockApp), BridgeError> {
@@ -2443,6 +2559,43 @@ mod tests {
             .poke_sync(OnePunchWire::Poke.to_wire(), slab)
             .map_err(|err| BridgeError::Runtime(format!("bridge kernel poke failed: {err}")))?;
         assert!(effects.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn bridge_kernel_rejects_malformed_payloads_for_valid_cause_tags() -> Result<(), BridgeError> {
+        init_kernel_black_box_test_logging();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| BridgeError::Runtime(format!("test runtime build failed: {err}")))?;
+        let (_temp, mut app) = runtime.block_on(setup_bridge_nockapp())?;
+
+        for tag in ["set-constants", "nockchain-block"] {
+            let effects = app
+                .poke_sync(
+                    OnePunchWire::Poke.to_wire(),
+                    malformed_tagged_cause_slab(tag),
+                )
+                .map_err(|err| {
+                    BridgeError::Runtime(format!("bridge kernel poke failed for %{tag}: {err}"))
+                })?;
+            assert!(
+                effects.is_empty(),
+                "malformed payload for valid tag %{tag} must be rejected at the cause mold"
+            );
+        }
+        let effects = app
+            .poke_sync(OnePunchWire::Poke.to_wire(), malformed_nockchain_txs_slab())
+            .map_err(|err| {
+                BridgeError::Runtime(format!(
+                    "bridge kernel poke failed for malformed nockchain tx map: {err}"
+                ))
+            })?;
+        assert!(
+            effects.is_empty(),
+            "malformed nockchain transaction map must be rejected before cause handling"
+        );
         Ok(())
     }
 

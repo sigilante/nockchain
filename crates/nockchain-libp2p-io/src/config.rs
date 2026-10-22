@@ -63,12 +63,8 @@ const GOSSIP_BUCKET_REFILL_PER_SECOND: u32 = 2;
 // retain almost all request reduction from 128-item batches with much lower
 // tail delay under the current 10 ms coalescing window.
 const GEN2_BATCH_MAX_ITEMS: usize = 64;
-// 10 MB caps, validated by the LAX1 stacked canary. The full chain-history
-// sweep (44 188 blocks) put the max observed individual raw-tx at 1.2 MiB and
-// the max block-plus-txs bundle at 1.34 MiB, so 10 MB is generous headroom for
-// tuned catch-up. The CBOR codec request/response maximum tracks
-// `gen2_batch_max_bytes` at runtime (see behaviour.rs), so the three move
-// together.
+// Transport and per-item byte limits bound encoded messages; the CBOR
+// request/response maximum follows `gen2_batch_max_bytes` at runtime.
 const GEN2_BATCH_MAX_BYTES: usize = 10_000_000;
 const GEN2_ITEM_MAX_BYTES: usize = 10_000_000;
 const GEN2_BLOCK_BATCH_MAX_RESPONSE_BYTES: usize = 10_000_000;
@@ -92,11 +88,10 @@ const PREFETCH_WINDOW_INITIAL: u8 = 16;
 // requester ask past the expected fit point without accepting an oversized
 // response.
 const PREFETCH_WINDOW_MAX: u8 = 128;
-// Kernel-requested height gap above the current frontier before range
-// prefetch is eligible.
+// Inclusive catch-up depth from kernel demand, or a retained future gossip
+// hint on demand at the current frontier, before range prefetch is eligible.
 const PREFETCH_KERNEL_DEMAND_THRESHOLD: u64 = 8;
-// Cap on simultaneously-inflight prefetches per peer. LAX1-tuned to 4 to keep
-// the catch-up pipeline full while bounding per-peer prefetch load.
+// Bounds simultaneously in-flight prefetch requests per peer.
 const PREFETCH_MAX_INFLIGHT_PER_PEER: u8 = 4;
 // Failure budget per height before declaring it "stuck". Eight attempts
 // covers short peer gaps during aggressive prefetch without making one
@@ -117,8 +112,7 @@ const ELDERS_DEBOUNCE_RESET: Duration = Duration::from_secs(60);
 const SEEN_TX_CLEAR_INTERVAL: u64 = 30;
 
 // ALL PROTOCOLS MUST HAVE UNIQUE VERSIONS
-const REQ_RES_PROTOCOL_VERSION_GEN1: &str = "/nockchain-1-req-res";
-const REQ_RES_PROTOCOL_VERSION_GEN2: &str = "/nockchain-2-req-res";
+const REQ_RES_PROTOCOL_VERSION: &str = "/nockchain-2-req-res";
 const KAD_PROTOCOL_VERSION: &str = "/nockchain-1-kad";
 const IDENTIFY_PROTOCOL_VERSION: &str = "/nockchain-1-identify";
 
@@ -241,34 +235,13 @@ pub struct LibP2PConfig {
     #[serde(default = "default_gossip_bucket_refill_per_second")]
     pub gossip_bucket_refill_per_second: u32,
 
-    /// Accept inbound gen2 request-response traffic. On by default — the
-    /// validated everything-on backbone posture (LAX1-tuned).
-    #[serde(default = "default_req_res_gen2_accept_enabled")]
-    pub req_res_gen2_accept_enabled: bool,
-
-    /// Prefer outbound gen2 request-response traffic when the remote supports it.
-    /// On by default; falls back to gen1 for peers that do not support gen2.
-    #[serde(default = "default_req_res_gen2_send_enabled")]
-    pub req_res_gen2_send_enabled: bool,
-
     /// Upgrade outbound `%request %block %by-height` effects to the
     /// bundled `%block-with-txs` request variant, asking peers to return
     /// the block plus its raw transactions in a single response. On by
-    /// default. Against a pre-bundle peer this surfaces as
-    /// `BatchErrorClass::Decode` and the chunk-4 fallback re-issues the
-    /// classic request.
+    /// default. A peer that does not support the bundle request shape is
+    /// retried with singleton gen2 requests.
     #[serde(default = "default_req_res_gen2_bundle_enabled")]
     pub req_res_gen2_bundle_enabled: bool,
-
-    /// Send the authenticated gossip request variant. Off by default until
-    /// staged rollout confirms peer compatibility.
-    #[serde(default = "default_req_res_authenticated_gossip_send_enabled")]
-    pub req_res_authenticated_gossip_send_enabled: bool,
-
-    /// Accept the legacy unauthenticated gossip request variant. On by default
-    /// during the accept-old/send-new rollout period.
-    #[serde(default = "default_req_res_legacy_gossip_accept_enabled")]
-    pub req_res_legacy_gossip_accept_enabled: bool,
 
     /// Hard item cap for outbound and inbound gen2 batches.
     #[serde(default = "default_gen2_batch_max_items")]
@@ -303,9 +276,9 @@ pub struct LibP2PConfig {
     #[serde(default = "default_gen2_swarm_action_queue_capacity")]
     pub gen2_swarm_action_queue_capacity: usize,
 
-    /// Enable kernel-demanded block range prefetch. When `true`, a sufficiently
-    /// deep kernel `%request %block %by-height` can issue a `BlockRangeWithTxs`
-    /// request alongside the normal singleton request.
+    /// Enable kernel-demanded block range prefetch. A sufficiently deep kernel
+    /// `%request %block %by-height`, or frontier demand with a retained future
+    /// gossip hint, can issue `BlockRangeWithTxs` alongside the normal singleton.
     #[serde(default = "default_prefetch_enabled")]
     pub prefetch_enabled: bool,
 
@@ -319,8 +292,9 @@ pub struct LibP2PConfig {
     #[serde(default = "default_prefetch_window_max")]
     pub prefetch_window_max: u8,
 
-    /// Kernel-demanded height gap above the current frontier before range
-    /// prefetch is eligible.
+    /// Inclusive catch-up depth required for range prefetch. At the current
+    /// frontier only, retained future gossip may supply an unvalidated depth
+    /// hint; issuance and block validation still require kernel demand.
     #[serde(default = "default_prefetch_kernel_demand_threshold")]
     pub prefetch_kernel_demand_threshold: u64,
 
@@ -374,6 +348,11 @@ pub struct LibP2PConfig {
     /// Timeout for low-priority peeks.
     #[serde(default = "default_low_priority_peek_timeout_secs")]
     pub low_priority_peek_timeout_secs: u64,
+
+    /// Kernel-tip reconciliation interval. Zero disables periodic checks, not
+    /// effect-lag recovery or its delayed retries after unavailable peeks.
+    #[serde(default = "default_frontier_reconcile_interval_secs")]
+    pub frontier_reconcile_interval_secs: u64,
 
     /// Number of failed pings before closing connection
     #[serde(default = "default_failed_pings_before_close")]
@@ -510,19 +489,7 @@ fn default_gossip_bucket_capacity() -> u32 {
 fn default_gossip_bucket_refill_per_second() -> u32 {
     GOSSIP_BUCKET_REFILL_PER_SECOND
 }
-fn default_req_res_gen2_accept_enabled() -> bool {
-    true
-}
-fn default_req_res_gen2_send_enabled() -> bool {
-    true
-}
 fn default_req_res_gen2_bundle_enabled() -> bool {
-    true
-}
-fn default_req_res_authenticated_gossip_send_enabled() -> bool {
-    false
-}
-fn default_req_res_legacy_gossip_accept_enabled() -> bool {
     true
 }
 fn default_gen2_batch_max_items() -> usize {
@@ -591,6 +558,10 @@ fn default_seen_tx_clear_interval() -> u64 {
 
 fn default_low_priority_peek_timeout_secs() -> u64 {
     LOW_PRIORITY_PEEK_TIMEOUT_SECS
+}
+
+fn default_frontier_reconcile_interval_secs() -> u64 {
+    30
 }
 
 fn default_failed_pings_before_close() -> u64 {
@@ -667,12 +638,7 @@ impl Default for LibP2PConfig {
             ip_bucket_request_admission_limit: default_ip_bucket_request_admission_limit(),
             gossip_bucket_capacity: default_gossip_bucket_capacity(),
             gossip_bucket_refill_per_second: default_gossip_bucket_refill_per_second(),
-            req_res_gen2_accept_enabled: default_req_res_gen2_accept_enabled(),
-            req_res_gen2_send_enabled: default_req_res_gen2_send_enabled(),
             req_res_gen2_bundle_enabled: default_req_res_gen2_bundle_enabled(),
-            req_res_authenticated_gossip_send_enabled:
-                default_req_res_authenticated_gossip_send_enabled(),
-            req_res_legacy_gossip_accept_enabled: default_req_res_legacy_gossip_accept_enabled(),
             gen2_batch_max_items: default_gen2_batch_max_items(),
             gen2_batch_max_bytes: default_gen2_batch_max_bytes(),
             gen2_item_max_bytes: default_gen2_item_max_bytes(),
@@ -694,6 +660,7 @@ impl Default for LibP2PConfig {
             elders_debounce_reset_secs: default_elders_debounce_reset_secs(),
             seen_tx_clear_interval: default_seen_tx_clear_interval(),
             low_priority_peek_timeout_secs: default_low_priority_peek_timeout_secs(),
+            frontier_reconcile_interval_secs: default_frontier_reconcile_interval_secs(),
             failed_pings_before_close: default_failed_pings_before_close(),
             ip_hygiene_enabled: default_ip_hygiene_enabled(),
             address_cooldown_secs: default_address_cooldown_secs(),
@@ -815,10 +782,6 @@ impl PeerExclusionConfig {
         Duration::from_secs(self.max_auto_exclusion_secs)
     }
 
-    pub(crate) fn event_history(&self) -> Duration {
-        self.evidence_window().max(self.ip_exclusion_history())
-    }
-
     pub(crate) fn request_peer_cooldown(&self) -> Duration {
         Duration::from_secs(self.request_peer_cooldown_secs)
     }
@@ -849,15 +812,7 @@ impl LibP2PConfig {
     }
 
     pub fn req_res_protocol_version() -> &'static str {
-        Self::req_res_gen1_protocol_version()
-    }
-
-    pub fn req_res_gen1_protocol_version() -> &'static str {
-        REQ_RES_PROTOCOL_VERSION_GEN1
-    }
-
-    pub fn req_res_gen2_protocol_version() -> &'static str {
-        REQ_RES_PROTOCOL_VERSION_GEN2
+        REQ_RES_PROTOCOL_VERSION
     }
 
     pub fn identify_protocol_version() -> &'static str {
@@ -1036,30 +991,18 @@ mod tests {
         assert!(PeerExclusionConfig::from_libp2p_config(&config).is_err());
     }
     #[test]
-    fn test_req_res_protocol_versions_are_stable() {
-        assert_eq!(
-            LibP2PConfig::req_res_gen1_protocol_version(),
-            "/nockchain-1-req-res"
-        );
-        assert_eq!(
-            LibP2PConfig::req_res_gen2_protocol_version(),
-            "/nockchain-2-req-res"
-        );
+    fn test_req_res_protocol_version_is_gen2() {
         assert_eq!(
             LibP2PConfig::req_res_protocol_version(),
-            LibP2PConfig::req_res_gen1_protocol_version()
+            "/nockchain-2-req-res"
         );
     }
 
     #[test]
-    fn test_gen2_rollout_defaults() {
+    fn test_gen2_defaults() {
         let config = LibP2PConfig::default();
 
-        assert!(config.req_res_gen2_accept_enabled);
-        assert!(config.req_res_gen2_send_enabled);
         assert!(config.req_res_gen2_bundle_enabled);
-        assert!(!config.req_res_authenticated_gossip_send_enabled);
-        assert!(config.req_res_legacy_gossip_accept_enabled);
         assert_eq!(config.gen2_batch_max_items, 64);
         assert_eq!(config.gen2_batch_max_bytes, 10_000_000);
         assert_eq!(config.gen2_item_max_bytes, 10_000_000);
@@ -1074,35 +1017,6 @@ mod tests {
         assert_eq!(config.low_priority_peek_timeout_secs, 180);
         assert_eq!(config.request_replay_cache_ttl_secs, 300);
         assert_eq!(config.request_replay_cache_max_per_peer, 4096);
-    }
-
-    #[test]
-    fn test_gen2_rollout_flags_from_env() {
-        std::env::set_var("NOCKCHAIN_LIBP2P_REQ_RES_GEN2_ACCEPT_ENABLED", "true");
-        std::env::set_var("NOCKCHAIN_LIBP2P_REQ_RES_GEN2_SEND_ENABLED", "true");
-        std::env::set_var(
-            "NOCKCHAIN_LIBP2P_REQ_RES_AUTHENTICATED_GOSSIP_SEND_ENABLED", "true",
-        );
-        std::env::set_var(
-            "NOCKCHAIN_LIBP2P_REQ_RES_LEGACY_GOSSIP_ACCEPT_ENABLED", "false",
-        );
-        let result = LibP2PConfig::from_env();
-        std::env::remove_var("NOCKCHAIN_LIBP2P_REQ_RES_GEN2_ACCEPT_ENABLED");
-        std::env::remove_var("NOCKCHAIN_LIBP2P_REQ_RES_GEN2_SEND_ENABLED");
-        std::env::remove_var("NOCKCHAIN_LIBP2P_REQ_RES_AUTHENTICATED_GOSSIP_SEND_ENABLED");
-        std::env::remove_var("NOCKCHAIN_LIBP2P_REQ_RES_LEGACY_GOSSIP_ACCEPT_ENABLED");
-
-        let config = result.expect("env config should parse");
-        assert!(
-            config.req_res_gen2_accept_enabled,
-            "gen2 accept should be enabled via NOCKCHAIN_LIBP2P_REQ_RES_GEN2_ACCEPT_ENABLED=true"
-        );
-        assert!(
-            config.req_res_gen2_send_enabled,
-            "gen2 send should be enabled via NOCKCHAIN_LIBP2P_REQ_RES_GEN2_SEND_ENABLED=true"
-        );
-        assert!(config.req_res_authenticated_gossip_send_enabled);
-        assert!(!config.req_res_legacy_gossip_accept_enabled);
     }
 
     #[test]

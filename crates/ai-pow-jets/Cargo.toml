@@ -19,6 +19,7 @@ serde.workspace = true
 bincode = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+rayon.workspace = true
 nockapp = { path = "../nockapp" }
 tempfile = { workspace = true }
 tikv-jemallocator = { workspace = true }

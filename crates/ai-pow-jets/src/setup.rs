@@ -1,37 +1,33 @@
 //! Boot-time compact verifier-setup builder.
 //!
-//! The compact verifier `context` + `verifier_key_digest` are deterministic from
-//! the puzzle SHAPE (params / trace-height) and **proof-independent** (validated in
-//! `ai-pow-miner::moe_compact_verifier_setup_is_proof_independent`). So a consensus
-//! node builds them ONCE at boot by proving a single canonical block, then injects
-//! the result via [`crate::init_ai_pow_verifier_setup`] and reuses it to verify
-//! every same-shape `%ai-pow` block. The per-block opened schedule is bound
-//! separately by the program-commitment fold — not by the setup — so one
-//! setup serves all blocks of the shape (dense and MoE alike).
+//! Verifier contexts and key digests are derived from the canonical AIR and
+//! recursive circuit shape, without executing a witness or producing a proof.
+//! The per-block opened schedule is bound separately by the program-commitment
+//! fold. Production startup validates all supported rule/shape keys before
+//! installing the disk-paged contexts.
 
 use std::io::Write;
 
 use ai_pow::params::MatmulParams;
 use ai_pow::pearl_compat::{
-    derive_pearl_moe_work_commitments, evaluate_pearl_merge_ticket_attempt,
-    pearl_bitcoin_double_sha256_raw, PearlAuxInclusionProof, PearlIncompleteBlockHeader,
-    PearlMiningConfig, PearlMoeParams, PearlNockchainAux, PearlPeriodicPattern,
-    PearlPublicProofParams, PEARL_MMA_INT7XINT7_TO_INT32, PEARL_NOCKCHAIN_AUX_COMMITMENT_TAG,
+    derive_pearl_moe_work_commitments, pearl_bitcoin_double_sha256_raw, PearlAuxInclusionProof,
+    PearlIncompleteBlockHeader, PearlMiningConfig, PearlMoeParams, PearlNockchainAux,
+    PearlPeriodicPattern, PearlPublicProofParams, PEARL_MMA_INT7XINT7_TO_INT32,
+    PEARL_NOCKCHAIN_AUX_COMMITMENT_TAG,
 };
 use ai_pow::pearl_moe_routing::build_routing_data;
 use ai_pow::synth::{synth_matrices, AI_POW_PROD_SYNTH_SEED};
-use ai_pow::zk_bridge::{
-    prove_pearl_merge_compact_recursive_certificate_with_seed,
-    prove_pearl_moe_compact_recursive_certificate_with_seed, AiPowCompactRecursiveCertificateRun,
-    PearlMoeCompactProveRun,
-};
+use ai_pow::zk_bridge::PearlMoeCompactProveRun;
 use ai_pow_miner::certificate_noun::{
     AiPowCertificateShape, AiProofNode, PearlMergeMoeArtifact, PearlMergePublicStatementShape,
 };
-use ai_pow_zk::recursion::AiPowCompactVerifierSetupSeed;
+use ai_pow_zk::proof_rules::ProofRules;
+use ai_pow_zk::recursion::{
+    compact_batch_verifier_key_digest_to_bytes, AiPowCompactVerifierSetupDescriptor,
+};
 
 use crate::{AiPowVerifierSetup, VerifierSetupShapeKey};
-/// Error building the canonical verifier setup.
+/// Error building the verifier setup.
 #[derive(Debug)]
 pub struct SetupError(pub String);
 
@@ -41,6 +37,14 @@ impl std::fmt::Display for SetupError {
     }
 }
 impl std::error::Error for SetupError {}
+
+/// Start the process-owned safe-stack proof workers before any block is admitted.
+/// A local thread-start failure must abort startup, not become invalid PoW.
+/// Existing global or embedding pools are not used for proof execution.
+/// Failed initialization is sticky; fix local resource limits and restart.
+pub fn prepare_verifier_resources() -> Result<(), SetupError> {
+    ai_pow_zk::runtime::prepare().map_err(|error| SetupError(error.to_string()))
+}
 
 fn err<E: std::fmt::Debug>(what: &str) -> impl FnOnce(E) -> SetupError + '_ {
     move |e| SetupError(format!("{what}: {e:?}"))
@@ -54,10 +58,12 @@ fn shape_key_for_zk_params(
         .ok_or_else(|| SetupError("verifier setup shape has zero noise_rank".to_string()))
 }
 
-fn shape_key_for_seed(
-    seed: &AiPowCompactVerifierSetupSeed,
+fn shape_key_for_descriptor(
+    descriptor: &AiPowCompactVerifierSetupDescriptor,
 ) -> Result<VerifierSetupShapeKey, SetupError> {
-    shape_key_for_zk_params(&seed.zk_params, seed.trace_height())
+    let mut key = shape_key_for_zk_params(&descriptor.zk_params, descriptor.trace_height())?;
+    key.rules = descriptor.rules;
+    Ok(key)
 }
 
 fn shape_key_for_params(
@@ -75,22 +81,19 @@ fn shape_key_for_params(
         (num_stripes as usize) <= ai_pow::params::STRIPE_MAX,
     ))
 }
-/// An arbitrary fixed commitment for the canonical setup block. The setup is
+/// An arbitrary fixed commitment for the setup-representative block. The setup is
 /// proof-independent, so the specific block does not matter.
-pub const CANONICAL_SETUP_COMMIT: [u8; 32] = [0x42u8; 32];
+pub const REFERENCE_SETUP_COMMIT: [u8; 32] = [0x42u8; 32];
 
-/// The canonical (setup) block: its prove run plus the pieces needed to assemble
+/// The reference (setup-representative) block: its prove run plus the pieces needed to assemble
 /// its artifact noun (used by tests to exercise the jet against this exact block).
-pub struct CanonicalBlock {
+pub struct ReferenceBlock {
     pub run: PearlMoeCompactProveRun,
     pub statement: PearlMergePublicStatementShape,
     pub aux_inclusion: PearlAuxInclusionProof,
     pub moe_art: PearlMergeMoeArtifact,
     pub certificate: AiPowCertificateShape,
     pub commit: [u8; 32],
-    /// The SMALL, serializable rebuild seed for this block's trace-height bucket —
-    /// the cacheable boot-setup input (see [`build_verifier_setup`]).
-    pub seed: AiPowCompactVerifierSetupSeed,
 }
 
 fn setup_pattern(len: u32) -> PearlPeriodicPattern {
@@ -137,8 +140,8 @@ fn setup_aux_inclusion(
         // Shared with the miner rather than copied: this header feeds `sigma`
         // and therefore the whole work transcript, and a base target the accept
         // path cannot scale by the tile shape factor makes the block
-        // unverifiable. See `ai_pow_miner::canonical::CANONICAL_NBITS`.
-        nbits: ai_pow_miner::canonical::CANONICAL_NBITS,
+        // unverifiable. See `ai_pow_miner::reference::REFERENCE_NBITS`.
+        nbits: ai_pow_miner::reference::REFERENCE_NBITS,
     };
     (
         header,
@@ -149,13 +152,13 @@ fn setup_aux_inclusion(
     )
 }
 
-/// The canonical MoE-block inputs derived from a `(params, hw, e, top_k)` shape —
+/// The reference MoE-block inputs derived from a `(params, hw, e, top_k)` shape —
 /// the synthesized matrices, work commitments, routing, opened tile indices, and
-/// the block-statement scaffolding. Shared by [`prove_canonical_moe_block`] (which
-/// then proves + assembles) and [`canonical_moe_trace_height`] (which only needs
+/// the block-statement scaffolding. Shared by [`prove_reference_moe_block`] (which
+/// then proves + assembles) and [`reference_moe_trace_height`] (which only needs
 /// the prove-inputs to predict the trace height), so the two can never disagree
 /// about which bucket a shape lands in.
-struct CanonicalMoeInputs {
+struct ReferenceMoeInputs {
     a: Vec<i8>,
     b: Vec<i8>,
     commitments: ai_pow::pearl_compat::PearlWorkCommitments,
@@ -171,12 +174,12 @@ struct CanonicalMoeInputs {
     aux_inclusion: PearlAuxInclusionProof,
 }
 
-/// The matrix-FREE part of the canonical MoE inputs: the mining config, routing,
+/// The matrix-FREE part of the reference MoE inputs: the mining config, routing,
 /// and opened tile indices — everything the trace height depends on. Kept separate
-/// from the (large) synthesized matrices so [`canonical_moe_trace_height`] can sweep
-/// candidate shapes cheaply, while [`canonical_moe_inputs`] adds the matrices +
+/// from the (large) synthesized matrices so [`reference_moe_trace_height`] can sweep
+/// candidate shapes cheaply, while [`reference_moe_inputs`] adds the matrices +
 /// commitments for the actual prove. Both derive the schedule identically.
-struct CanonicalMoeSchedule {
+struct ReferenceMoeSchedule {
     config: PearlMiningConfig,
     routing: ai_pow::pearl_moe_routing::RoutingData,
     inner: Vec<u32>,
@@ -185,12 +188,12 @@ struct CanonicalMoeSchedule {
     m: usize,
 }
 
-fn canonical_moe_schedule(
+fn reference_moe_schedule(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
-) -> Result<CanonicalMoeSchedule, SetupError> {
+) -> Result<ReferenceMoeSchedule, SetupError> {
     let m = params.m as usize;
     let n = params.n as usize;
     if e == 0 || !n.is_multiple_of(e) {
@@ -215,7 +218,7 @@ fn canonical_moe_schedule(
         .cols_pattern
         .indices_with_offset_bounded(0, 4096)
         .map_err(err("local_b"))?;
-    Ok(CanonicalMoeSchedule {
+    Ok(ReferenceMoeSchedule {
         config,
         routing,
         inner,
@@ -225,21 +228,21 @@ fn canonical_moe_schedule(
     })
 }
 
-fn canonical_moe_inputs(
+fn reference_moe_inputs(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
     nock_commit: [u8; 32],
-) -> Result<CanonicalMoeInputs, SetupError> {
-    let CanonicalMoeSchedule {
+) -> Result<ReferenceMoeInputs, SetupError> {
+    let ReferenceMoeSchedule {
         config,
         routing,
         inner,
         local_b,
         n_e,
         m,
-    } = canonical_moe_schedule(params, hw, e, top_k)?;
+    } = reference_moe_schedule(params, hw, e, top_k)?;
 
     let (a, b) = synth_matrices(AI_POW_PROD_SYNTH_SEED, params);
     let aux = setup_aux(nock_commit);
@@ -258,7 +261,7 @@ fn canonical_moe_inputs(
         &routing.routing_offsets_le_bytes(),
     );
 
-    Ok(CanonicalMoeInputs {
+    Ok(ReferenceMoeInputs {
         a,
         b,
         commitments,
@@ -275,33 +278,44 @@ fn canonical_moe_inputs(
     })
 }
 
-/// The Layer-0 trace height a canonical MoE block at `(params, hw, e, top_k)` would
+/// The Layer-0 trace height a reference MoE block at `(params, hw, e, top_k)` would
 /// have — WITHOUT proving AND without synthesizing the (large) matrices. Lets
 /// [`production_verifier_setup_buckets`] cheaply select one shape per trace-height
 /// bucket. Equal to the height the full prove yields.
-pub fn canonical_moe_trace_height(
+pub fn reference_moe_trace_height(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
 ) -> Result<usize, SetupError> {
-    let s = canonical_moe_schedule(params, hw, e, top_k)?;
+    let s = reference_moe_schedule(params, hw, e, top_k)?;
     ai_pow::zk_bridge::pearl_moe_canonical_trace_height(
         params, &s.routing, 0, &s.inner, &s.local_b, s.n_e,
     )
-    .map_err(err("moe canonical trace height"))
+    .map_err(err("moe reference trace height"))
 }
 
-/// Prove a single canonical MoE block at the given shape. `hw` is the opened-tile
+/// Prove a single reference MoE block at the given shape. `hw` is the opened-tile
 /// side (`h = w = hw`); `e`/`top_k` the MoE config. Panics-free (returns errors).
-pub fn prove_canonical_moe_block(
+pub fn prove_reference_moe_block(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
     nock_commit: [u8; 32],
-) -> Result<CanonicalBlock, SetupError> {
-    let CanonicalMoeInputs {
+) -> Result<ReferenceBlock, SetupError> {
+    prove_reference_moe_block_with_rules(params, hw, e, top_k, nock_commit, ProofRules::Hardened)
+}
+
+pub fn prove_reference_moe_block_with_rules(
+    params: &MatmulParams,
+    hw: u32,
+    e: usize,
+    top_k: usize,
+    nock_commit: [u8; 32],
+    rules: ProofRules,
+) -> Result<ReferenceBlock, SetupError> {
+    let ReferenceMoeInputs {
         a,
         b,
         commitments,
@@ -315,11 +329,11 @@ pub fn prove_canonical_moe_block(
         aux,
         aux_commitment,
         aux_inclusion,
-    } = canonical_moe_inputs(params, hw, e, top_k, nock_commit)?;
+    } = reference_moe_inputs(params, hw, e, top_k, nock_commit)?;
 
-    let (run, seed) = prove_pearl_moe_compact_recursive_certificate_with_seed(
+    let run = ai_pow::zk_bridge::prove_pearl_moe_compact_recursive_certificate_with_rules(
         params, &a, &b, &commitments.kappa, &commitments.h_a, &commitments.h_b, &routing, 0,
-        &inner, &local_b, n_e,
+        &inner, &local_b, n_e, rules,
     )
     .map_err(err("prove"))?;
 
@@ -343,6 +357,12 @@ pub fn prove_canonical_moe_block(
     let cert_bytes =
         ai_pow_zk::recursion::encode_compact_batch_recursive_certificate(&run.compact_cert)
             .map_err(err("encode cert"))?;
+    #[cfg(test)]
+    eprintln!(
+        "reference MoE {rules:?} trace_height={} certificate_bytes={}",
+        run.trace_height,
+        cert_bytes.len()
+    );
     let certificate = AiPowCertificateShape {
         version: 1,
         zk_params: run.zk_params,
@@ -362,150 +382,119 @@ pub fn prove_canonical_moe_block(
         routing_data: routing.routing_data.clone(),
     };
 
-    Ok(CanonicalBlock {
+    Ok(ReferenceBlock {
         run,
         statement,
         aux_inclusion,
         moe_art,
         certificate,
         commit: nock_commit,
-        seed,
     })
 }
 
-/// Build the boot verifier setup by proving one canonical block at the production
-/// shape. Call once at node boot, then [`crate::init_ai_pow_verifier_setup`].
+/// Compile and preprocess the canonical recursive verifier for a MoE shape.
 pub fn build_verifier_setup(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
 ) -> Result<AiPowVerifierSetup, SetupError> {
-    let block = prove_canonical_moe_block(params, hw, e, top_k, CANONICAL_SETUP_COMMIT)?;
-    let trace_height = block.run.trace_height;
-    let digest_bytes = ai_pow_zk::recursion::compact_batch_verifier_key_digest_to_bytes(
-        &block.run.verifier_key_digest(),
-    )
-    .to_vec();
-    let shape_key = shape_key_for_params(params, trace_height)?;
-    Ok(AiPowVerifierSetup {
-        trace_height,
-        sx_bound: shape_key.sx_bound,
-        context: block.run.verifier_context,
-        digest_bytes,
-    })
+    build_verifier_setup_with_rules(params, hw, e, top_k, ProofRules::Hardened)
 }
 
-/// Build ONLY the small, cacheable rebuild seed for the boot verifier setup, by
-/// proving one canonical MoE block at the given shape. The offline/boot table
-/// builder calls this per trace-height bucket and serializes the seeds; the large
-/// (~866 MB) verifier context that proving also produces is dropped here and
-/// rebuilt at boot from the seed (see [`rebuild_verifier_setup_from_seed`]). This
-/// is the size-practical form: a seed is KB-MB, so a full bucket table caches in
-/// tens of MB rather than gigabytes.
-pub fn build_verifier_setup_seed(
+pub fn build_verifier_setup_with_rules(
     params: &MatmulParams,
     hw: u32,
     e: usize,
     top_k: usize,
-) -> Result<AiPowCompactVerifierSetupSeed, SetupError> {
-    Ok(prove_canonical_moe_block(params, hw, e, top_k, CANONICAL_SETUP_COMMIT)?.seed)
-}
-/// Build ONLY the small, cacheable rebuild seed for a DENSE boot verifier setup, by
-/// proving one canonical dense block at the given shape. The dense counterpart of
-/// [`build_verifier_setup_seed`]. Used for the `(2^13, false)` bucket that no MoE
-/// shape reaches — the MoE routing scatters opened A rows, inflating the Layer-0
-/// trace height above the dense budget for the same `(params, tile)`.
-pub fn build_verifier_setup_seed_dense(
-    params: &MatmulParams,
-) -> Result<AiPowCompactVerifierSetupSeed, SetupError> {
-    Ok(prove_canonical_dense_block(params, CANONICAL_SETUP_COMMIT)?.seed)
-}
-
-/// Prove a single canonical DENSE block at the given shape. Builds a
-/// Pearl-compatible dense ticket attempt (synth matrices, aux, header), grinds
-/// the aux height until the jackpot clears the max consensus target, then
-/// proves the compact recursive certificate with seed capture. The dense
-/// counterpart of [`prove_canonical_moe_block`].
-fn prove_canonical_dense_block(
-    params: &MatmulParams,
-    nock_commit: [u8; 32],
-) -> Result<CanonicalDenseBlock, SetupError> {
-    let (a, b) = synth_matrices(AI_POW_PROD_SYNTH_SEED, params);
-    let config = PearlMiningConfig {
-        common_dim: params.k,
-        rank: params.noise_rank as u16,
-        mma_type: PEARL_MMA_INT7XINT7_TO_INT32,
-        rows_pattern: setup_pattern(params.tile),
-        cols_pattern: setup_pattern(params.tile),
-        reserved: [0u8; ai_pow::pearl_compat::PEARL_MINING_CONFIG_RESERVED_SIZE],
-    };
-    let target = ai_pow::difficulty::AI_POW_MAX_CONSENSUS_TARGET;
-    let factor = ai_pow::difficulty::shape_work_factor_for(
-        params.tile, params.tile, params.k, params.noise_rank,
-    )
-    .map_err(err("dense shape work factor"))?;
-
-    let max_pattern_len = crate::AI_POW_VERIFY_MAX_PATTERN_LEN;
-    // Grind the aux height until the jackpot clears the max consensus target.
-    // The max target scaled by the shape work factor still rejects ~99.6% of
-    // jackpots (the adjusted threshold is ~2^248 for this shape), so a few
-    // hundred attempts suffice.
-    let mut attempt = None;
-    for n in 0..100_000 {
-        let aux = PearlNockchainAux {
-            nockchain_chain_id: b"nockchain-mainnet\0".to_vec(),
-            nock_block_commitment: nock_commit,
-            nockchain_target_epoch_or_height: 123_456 + n,
-            extra_domain_data: b"ai-pow-target-window\0\0".to_vec(),
-        };
-        let aux_commitment = aux.commitment().map_err(err("aux commitment"))?;
-        let (header, _aux_inclusion) = setup_aux_inclusion(&aux_commitment);
-        let ticket_attempt = evaluate_pearl_merge_ticket_attempt(
-            &header, &config, params, 0, 0, &a, &b, &target, max_pattern_len, aux,
-        )
-        .map_err(err("evaluate dense ticket"))?;
-        if ai_pow::difficulty::attempt_wins(&ticket_attempt.ticket.jackpot_hash, &target, factor)
-            .map_err(err("attempt_wins"))?
-        {
-            attempt = Some(ticket_attempt);
-            break;
-        }
-    }
-    let attempt = attempt.ok_or_else(|| {
-        SetupError(
-            "dense canonical block: no jackpot cleared the target in 100k attempts".to_string(),
-        )
-    })?;
-
-    let (run, seed) = prove_pearl_merge_compact_recursive_certificate_with_seed(
-        &attempt, params, &a, &b, max_pattern_len,
-    )
-    .map_err(err("prove dense compact certificate with seed"))?;
-
-    Ok(CanonicalDenseBlock { run, seed })
-}
-/// The canonical dense setup block: its prove run plus the boot-setup seed.
-#[allow(dead_code)]
-struct CanonicalDenseBlock {
-    run: AiPowCompactRecursiveCertificateRun,
-    seed: AiPowCompactVerifierSetupSeed,
-}
-
-/// Rebuild the full boot verifier setup from a cached seed WITHOUT proving — the
-/// boot-time counterpart of [`build_verifier_setup_seed`]. Rebuilds the compact
-/// verifier context (circuit compile + Merkle commit; seconds, no FRI proving) and
-/// pairs it with the trace height + the cached verifier-key digest. The result is
-/// byte-for-byte equivalent to the [`build_verifier_setup`] (direct-context) form,
-/// validated in `moe_verifier_setup_seed_roundtrip_rebuilds_working_setup`.
-pub fn rebuild_verifier_setup_from_seed(
-    seed: AiPowCompactVerifierSetupSeed,
+    rules: ProofRules,
 ) -> Result<AiPowVerifierSetup, SetupError> {
-    let shape_key = shape_key_for_seed(&seed)?;
-    let digest_bytes = seed.verifier_key_digest_bytes.clone();
-    let context = seed
-        .rebuild_context()
-        .map_err(err("rebuild verifier context from seed"))?;
+    let trace_height = reference_moe_trace_height(params, hw, e, top_k)?;
+    build_verifier_setup_for_trace_height(params, trace_height, rules)
+}
+
+fn build_verifier_setup_for_trace_height(
+    params: &MatmulParams,
+    trace_height: usize,
+    rules: ProofRules,
+) -> Result<AiPowVerifierSetup, SetupError> {
+    let zk_params = ai_pow::zk_bridge::zk_params_from_matmul(params);
+    let context = ai_pow_zk::recursion::derive_compact_verifier_context_for_shape(
+        &zk_params, trace_height, rules,
+    )
+    .map_err(err("derive canonical verifier context"))?;
+    let digest = context
+        .validate_setup_binding()
+        .map_err(err("verifier setup binding"))?;
+    let shape_key = shape_key_for_zk_params(&zk_params, trace_height)?;
+    Ok(AiPowVerifierSetup {
+        trace_height,
+        sx_bound: shape_key.sx_bound,
+        context,
+        digest_bytes: ai_pow_zk::recursion::compact_batch_verifier_key_digest_to_bytes(&digest)
+            .to_vec(),
+    })
+}
+
+/// Compile a verifier and retain only its shape and canonical key digest.
+pub fn build_verifier_setup_descriptor(
+    params: &MatmulParams,
+    hw: u32,
+    e: usize,
+    top_k: usize,
+) -> Result<AiPowCompactVerifierSetupDescriptor, SetupError> {
+    build_verifier_setup_descriptor_with_rules(params, hw, e, top_k, ProofRules::Hardened)
+}
+
+pub fn build_verifier_setup_descriptor_with_rules(
+    params: &MatmulParams,
+    hw: u32,
+    e: usize,
+    top_k: usize,
+    rules: ProofRules,
+) -> Result<AiPowCompactVerifierSetupDescriptor, SetupError> {
+    let setup = build_verifier_setup_with_rules(params, hw, e, top_k, rules)?;
+    descriptor_for_setup(params, &setup)
+}
+
+/// Compile a dense shape without constructing its matrices or a reference proof.
+pub fn build_verifier_setup_descriptor_dense(
+    params: &MatmulParams,
+) -> Result<AiPowCompactVerifierSetupDescriptor, SetupError> {
+    build_verifier_setup_descriptor_dense_with_rules(params, ProofRules::Hardened)
+}
+
+pub fn build_verifier_setup_descriptor_dense_with_rules(
+    params: &MatmulParams,
+    rules: ProofRules,
+) -> Result<AiPowCompactVerifierSetupDescriptor, SetupError> {
+    let trace_height = ai_pow::zk_bridge::pearl_dense_canonical_trace_height(params, 0, 0)
+        .map_err(err("dense verifier trace height"))?;
+    let setup = build_verifier_setup_for_trace_height(params, trace_height, rules)?;
+    descriptor_for_setup(params, &setup)
+}
+
+fn descriptor_for_setup(
+    params: &MatmulParams,
+    setup: &AiPowVerifierSetup,
+) -> Result<AiPowCompactVerifierSetupDescriptor, SetupError> {
+    AiPowCompactVerifierSetupDescriptor::from_context(
+        ai_pow::zk_bridge::zk_params_from_matmul(params),
+        setup.trace_height,
+        &setup.context,
+    )
+    .map_err(err("verifier setup descriptor"))
+}
+
+/// Reconstruct a canonical context and reject a descriptor with a different key.
+pub fn rebuild_verifier_setup_from_descriptor(
+    descriptor: AiPowCompactVerifierSetupDescriptor,
+) -> Result<AiPowVerifierSetup, SetupError> {
+    let shape_key = shape_key_for_descriptor(&descriptor)?;
+    let digest_bytes = descriptor.verifier_key_digest_bytes.clone();
+    let context = descriptor
+        .derive_context()
+        .map_err(err("derive verifier context from descriptor"))?;
     Ok(AiPowVerifierSetup {
         trace_height: shape_key.trace_height,
         sx_bound: shape_key.sx_bound,
@@ -514,42 +503,42 @@ pub fn rebuild_verifier_setup_from_seed(
     })
 }
 
-/// The local seed-cache encoding. The consensus fingerprint is checked separately
-/// after decoding; this version protects the cache's non-consensus bincode framing.
-const VERIFIER_SETUP_SEED_CACHE_MAGIC: &[u8; 8] = b"NCVPSEED";
-/// Bump this when the seed-table bincode encoding or configuration changes.
-const VERIFIER_SETUP_SEED_CACHE_FORMAT_VERSION: u32 = 1;
-const VERIFIER_SETUP_SEED_CACHE_HEADER_LEN: usize = VERIFIER_SETUP_SEED_CACHE_MAGIC.len()
+const VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC: &[u8; 8] = b"NCVPSHAP";
+const VERIFIER_SETUP_DESCRIPTOR_CACHE_FORMAT_VERSION: u32 = 3;
+const VERIFIER_SETUP_DESCRIPTOR_CACHE_HEADER_LEN: usize = VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC
+    .len()
     + std::mem::size_of::<u32>()
     + std::mem::size_of::<u64>()
     + 32;
 
-/// The cache path is versioned so a changed seed serialization never destroys an
-/// older cache before a replacement has been generated successfully.
-pub fn verifier_setup_seed_cache_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+/// Shape-only cache files are independent of the obsolete proof-bearing format.
+pub fn verifier_setup_descriptor_cache_path(data_dir: &std::path::Path) -> std::path::PathBuf {
     data_dir.join("ai-pow").join(format!(
-        "verifier-setup-seeds-v{VERIFIER_SETUP_SEED_CACHE_FORMAT_VERSION}.bin"
+        "verifier-setup-shapes-v{VERIFIER_SETUP_DESCRIPTOR_CACHE_FORMAT_VERSION}.bin"
     ))
 }
 
-fn write_seed_cache_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(), SetupError> {
+fn write_file_atomically_with_commit(
+    path: &std::path::Path,
+    bytes: &[u8],
+    artifact: &str,
+    commit: impl FnOnce(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
+) -> Result<(), SetupError> {
     let parent = path.parent().ok_or_else(|| {
         SetupError(format!(
-            "verifier-setup cache has no parent: {}",
+            "{artifact} has no parent directory: {}",
             path.display()
         ))
     })?;
-    std::fs::create_dir_all(parent).map_err(err("create verifier-setup cache dir"))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| SetupError(format!("create {artifact} directory: {e:?}")))?;
 
-    let file_name = path.file_name().ok_or_else(|| {
-        SetupError(format!(
-            "verifier-setup cache has no file name: {}",
-            path.display()
-        ))
-    })?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| SetupError(format!("{artifact} has no file name: {}", path.display())))?;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_err(err("read verifier-setup cache clock"))?
+        .map_err(|e| SetupError(format!("read {artifact} clock: {e:?}")))?
         .as_nanos();
     let mut temp_name = file_name.to_os_string();
     temp_name.push(format!(".{}.{}.tmp", std::process::id(), nonce));
@@ -560,12 +549,16 @@ fn write_seed_cache_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(
             .write(true)
             .create_new(true)
             .open(&temp_path)
-            .map_err(err("create temporary verifier-setup cache"))?;
+            .map_err(|e| SetupError(format!("create temporary {artifact}: {e:?}")))?;
         file.write_all(bytes)
-            .map_err(err("write temporary verifier-setup cache"))?;
+            .map_err(|e| SetupError(format!("write temporary {artifact}: {e:?}")))?;
         file.sync_all()
-            .map_err(err("sync temporary verifier-setup cache"))?;
-        std::fs::rename(&temp_path, path).map_err(err("replace verifier-setup cache"))?;
+            .map_err(|e| SetupError(format!("sync temporary {artifact}: {e:?}")))?;
+        drop(file);
+        commit(&temp_path, path).map_err(|e| SetupError(format!("commit {artifact}: {e:?}")))?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| SetupError(format!("sync {artifact} directory: {e:?}")))?;
         Ok(())
     })();
     if result.is_err() {
@@ -574,34 +567,48 @@ fn write_seed_cache_atomically(path: &std::path::Path, bytes: &[u8]) -> Result<(
     result
 }
 
-/// Serialize a seed table to `path` with a versioned, checksummed envelope. The
-/// cached artifact is small — the seeds (KB-MB/bucket), NOT the rebuilt ~866 MB
-/// contexts.
-pub fn save_verifier_setup_seeds(
+fn write_file_atomically(
     path: &std::path::Path,
-    seeds: &[AiPowCompactVerifierSetupSeed],
+    bytes: &[u8],
+    artifact: &str,
 ) -> Result<(), SetupError> {
-    let payload = bincode::serde::encode_to_vec(seeds, bincode::config::standard())
-        .map_err(err("serialize verifier-setup seeds"))?;
+    write_file_atomically_with_commit(path, bytes, artifact, |temporary, destination| {
+        std::fs::rename(temporary, destination)
+    })
+}
+
+fn write_descriptor_cache_atomically(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), SetupError> {
+    write_file_atomically(path, bytes, "verifier-setup cache")
+}
+
+/// Serialize shape descriptors with a versioned, checksummed envelope.
+pub fn save_verifier_setup_descriptors(
+    path: &std::path::Path,
+    descriptors: &[AiPowCompactVerifierSetupDescriptor],
+) -> Result<(), SetupError> {
+    let payload = bincode::serde::encode_to_vec(descriptors, bincode::config::standard())
+        .map_err(err("serialize verifier-setup descriptors"))?;
     let payload_len = u64::try_from(payload.len())
         .map_err(|_| SetupError("verifier-setup cache payload exceeds u64".to_string()))?;
     let checksum = blake3::hash(&payload);
-    let mut bytes = Vec::with_capacity(VERIFIER_SETUP_SEED_CACHE_HEADER_LEN + payload.len());
-    bytes.extend_from_slice(VERIFIER_SETUP_SEED_CACHE_MAGIC);
-    bytes.extend_from_slice(&VERIFIER_SETUP_SEED_CACHE_FORMAT_VERSION.to_le_bytes());
+    let mut bytes = Vec::with_capacity(VERIFIER_SETUP_DESCRIPTOR_CACHE_HEADER_LEN + payload.len());
+    bytes.extend_from_slice(VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC);
+    bytes.extend_from_slice(&VERIFIER_SETUP_DESCRIPTOR_CACHE_FORMAT_VERSION.to_le_bytes());
     bytes.extend_from_slice(&payload_len.to_le_bytes());
     bytes.extend_from_slice(checksum.as_bytes());
     bytes.extend_from_slice(&payload);
-    write_seed_cache_atomically(path, &bytes)
+    write_descriptor_cache_atomically(path, &bytes)
 }
 
-/// Load a versioned seed table from `path` — the inverse of
-/// [`save_verifier_setup_seeds`].
-pub fn load_verifier_setup_seeds(
+/// Decode the shape-only cache, rejecting incompatible or corrupt framing.
+pub fn load_verifier_setup_descriptors(
     path: &std::path::Path,
-) -> Result<Vec<AiPowCompactVerifierSetupSeed>, SetupError> {
+) -> Result<Vec<AiPowCompactVerifierSetupDescriptor>, SetupError> {
     let bytes = std::fs::read(path).map_err(err("read verifier-setup cache"))?;
-    if bytes.len() < VERIFIER_SETUP_SEED_CACHE_HEADER_LEN {
+    if bytes.len() < VERIFIER_SETUP_DESCRIPTOR_CACHE_HEADER_LEN {
         return Err(SetupError(format!(
             "verifier-setup cache at {} is shorter than its header",
             path.display()
@@ -609,14 +616,14 @@ pub fn load_verifier_setup_seeds(
     }
 
     let mut offset = 0usize;
-    let magic = &bytes[offset..offset + VERIFIER_SETUP_SEED_CACHE_MAGIC.len()];
-    if magic != VERIFIER_SETUP_SEED_CACHE_MAGIC {
+    let magic = &bytes[offset..offset + VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC.len()];
+    if magic != VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC {
         return Err(SetupError(format!(
             "verifier-setup cache at {} has an unsupported format marker",
             path.display()
         )));
     }
-    offset += VERIFIER_SETUP_SEED_CACHE_MAGIC.len();
+    offset += VERIFIER_SETUP_DESCRIPTOR_CACHE_MAGIC.len();
 
     let version = u32::from_le_bytes(
         bytes[offset..offset + std::mem::size_of::<u32>()]
@@ -624,7 +631,7 @@ pub fn load_verifier_setup_seeds(
             .expect("cache header length checked"),
     );
     offset += std::mem::size_of::<u32>();
-    if version != VERIFIER_SETUP_SEED_CACHE_FORMAT_VERSION {
+    if version != VERIFIER_SETUP_DESCRIPTOR_CACHE_FORMAT_VERSION {
         return Err(SetupError(format!(
             "verifier-setup cache at {} has unsupported format version {version}",
             path.display()
@@ -663,27 +670,30 @@ pub fn load_verifier_setup_seeds(
         )));
     }
 
-    let (seeds, consumed) = bincode::serde::decode_from_slice(payload, bincode::config::standard())
-        .map_err(err("deserialize verifier-setup seeds"))?;
+    let (descriptors, consumed): (Vec<AiPowCompactVerifierSetupDescriptor>, usize) =
+        bincode::serde::decode_from_slice(payload, bincode::config::standard())
+            .map_err(err("deserialize verifier-setup descriptors"))?;
     if consumed != payload.len() {
         return Err(SetupError(format!(
-            "verifier-setup cache at {} has trailing seed bytes",
+            "verifier-setup cache at {} has trailing descriptor bytes",
             path.display()
         )));
     }
-    Ok(seeds)
+    for descriptor in &descriptors {
+        descriptor
+            .validate_shape()
+            .map_err(err("cached verifier shape"))?;
+    }
+    Ok(descriptors)
 }
 
-/// Load the cached seed table and REBUILD each seed into a full verifier setup
-/// (circuit compile + Merkle commit; NO FRI proving). This is the boot-time path:
-/// seconds per bucket, not the ~2 min of proving each would otherwise cost. The
-/// resulting table is ready for [`crate::init_ai_pow_verifier_setup`].
+/// Reconstruct canonical contexts from a shape-descriptor cache.
 pub fn load_verifier_setup_table(
     path: &std::path::Path,
 ) -> Result<Vec<AiPowVerifierSetup>, SetupError> {
-    load_verifier_setup_seeds(path)?
+    load_verifier_setup_descriptors(path)?
         .into_iter()
-        .map(rebuild_verifier_setup_from_seed)
+        .map(rebuild_verifier_setup_from_descriptor)
         .collect()
 }
 
@@ -694,7 +704,7 @@ pub const AI_POW_VERIFIER_CACHE_CAP_ENV: &str = "AI_POW_VERIFIER_CACHE_CAP";
 /// Default resident-context LRU cap. The production default retains every supported
 /// setup shape, so remote inputs cannot create an evict/reload loop on the consensus
 /// thread unless an operator deliberately lowers the cap.
-pub const AI_POW_VERIFIER_CACHE_CAP_DEFAULT: usize = 14;
+pub const AI_POW_VERIFIER_CACHE_CAP_DEFAULT: usize = 28;
 
 /// Resolve the resident-context LRU cap from `AI_POW_VERIFIER_CACHE_CAP` (clamped to
 /// `>= 1`), else the DoS-safe all-shape default.
@@ -706,114 +716,64 @@ pub fn verifier_cache_cap() -> usize {
         .unwrap_or(AI_POW_VERIFIER_CACHE_CAP_DEFAULT)
 }
 
-/// Load the cached SEEDS and validate them against the committed **v0** consensus
-/// digest WITHOUT rebuilding (lazy boot). The cache envelope rejects corruption and
-/// serialization mismatches before bincode decoding; the consensus digest then
-/// rejects a decoded table with divergent verifier keys.
-fn load_and_validate_seeds(
+fn load_and_validate_descriptors(
     path: &std::path::Path,
-) -> Result<Vec<AiPowCompactVerifierSetupSeed>, SetupError> {
-    let seeds = load_verifier_setup_seeds(path)?;
-    crate::table_digest::verify_verifier_setup_seed_table_digest(&seeds)?;
-    Ok(seeds)
+) -> Result<Vec<AiPowCompactVerifierSetupDescriptor>, SetupError> {
+    let descriptors = load_verifier_setup_descriptors(path)?;
+    crate::table_digest::verify_verifier_setup_descriptor_table_digest(&descriptors)?;
+    Ok(descriptors)
 }
 
-/// BOOT installer: ensure the AI-PoW verifier-setup table is installed (LAZILY), or
-/// FAIL.
-///
-/// The verifier-setup table is a CONSENSUS PARAMETER — every node must verify
-/// `%ai-pow` blocks against byte-identical verifier keys. This installer pins that:
-/// the SEEDS it ends up with (loaded or freshly generated) must hash to the committed
-/// [`crate::table_digest::AI_POW_V0_VERIFIER_SETUP_TABLE_DIGEST`], or the node refuses
-/// to run. It builds every bucket's context to disk AT THE OUTSET (first boot;
-/// reused after) and injects them disk-paged (see
-/// [`crate::init_ai_pow_verifier_setup_disk`]), so a verify never rebuilds — at most
-/// a ~0.6 s page-in from disk — and standing RSS is a bounded working set.
-///
-/// - **Cache present and valid:** load seeds + validate digest + build/reuse contexts.
-/// - **Cache present but corrupt / format-incompatible / digest-mismatched:** retain
-///   it until a complete replacement is atomically written, rather than deleting
-///   the only diagnostic artifact before regeneration.
-/// - **Cache absent:** GENERATE it (one real compact proof per `buckets` entry — a
-///   one-time ~15-minute boot delay), cache it, then load + validate + inject.
-///
-/// Returns the number of buckets installed. **Any failure is `Err` and is FATAL** —
-/// the caller must shut the node down. A digest mismatch on a FRESHLY-GENERATED cache
-/// is fatal and NOT retried. Idempotent (a second in-process boot returns `Ok(0)`).
+/// Derive or load every production context before admitting blocks. Both table
+/// fingerprints, every context binding, and all 28 native keys are mandatory.
+/// Existing cache bytes are retained until a complete replacement is committed.
+/// A fresh derivation mismatch is fatal. Repeated initialization returns `Ok(0)`.
 pub fn install_or_build_verifier_setup(
     data_dir: &std::path::Path,
     buckets: &[VerifierSetupBucketShape],
 ) -> Result<usize, SetupError> {
+    prepare_verifier_resources()?;
     if crate::ai_pow_verifier_setup_initialized() {
         return Ok(0);
     }
-    let path = verifier_setup_seed_cache_path(data_dir);
-
-    // Fast path: a present, loadable, digest-matching seed cache (no rebuild).
-    let mut seeds: Option<Vec<AiPowCompactVerifierSetupSeed>> = None;
-    if path.exists() {
-        match load_and_validate_seeds(&path) {
-            Ok(s) => seeds = Some(s),
-            Err(e) => {
+    let path = verifier_setup_descriptor_cache_path(data_dir);
+    let cached = if path.exists() {
+        match load_and_validate_descriptors(&path) {
+            Ok(descriptors) => Some(descriptors),
+            Err(error) => {
                 tracing::warn!(
-                    "AI-PoW verifier-setup cache at {} is unusable ({e}); \
-                     regenerating an atomic replacement",
-                    path.display(),
+                    path = %path.display(),
+                    "AI-PoW shape cache is unusable ({error}); deriving an atomic replacement",
                 );
+                None
             }
         }
-    }
-
-    let seeds = match seeds {
-        Some(s) => s,
+    } else {
+        None
+    };
+    let disk_buckets = match cached {
+        Some(descriptors) => build_or_reuse_disk_contexts(data_dir, descriptors)?,
         None => {
             if buckets.is_empty() {
                 return Err(SetupError(
-                    "no usable verifier-setup cache and no bucket shapes to generate one from"
-                        .to_string(),
+                    "no usable verifier cache and no canonical bucket shapes".to_string(),
                 ));
             }
-            tracing::info!(
-                "Generating the AI-PoW verifier-setup table ({} buckets). This is a one-time \
-                 step and takes about 15 minutes; the result is cached, so subsequent boots are \
-                 fast.",
-                buckets.len(),
-            );
-            build_and_cache_verifier_setup_seeds(&path, buckets)?;
-            // A digest mismatch HERE is fatal and NOT retried.
-            load_and_validate_seeds(&path)?
+            validate_production_bucket_shapes(buckets)?;
+            let (descriptors, disk_buckets) = derive_disk_contexts(data_dir, buckets)?;
+            save_verifier_setup_descriptors(&path, &descriptors)?;
+            disk_buckets
         }
     };
-
-    if seeds.is_empty() {
-        return Err(SetupError(
-            "verifier-setup seed table is empty after build/load".to_string(),
-        ));
-    }
-
-    // Build (or reuse) every bucket's on-disk context AT THE OUTSET: first boot builds
-    // all of them (a one-time cost); subsequent boots find the files and skip straight
-    // to disk-paged residency. Because all contexts exist before any block is verified,
-    // a verify NEVER triggers a ~12 s rebuild — at most a ~0.6 s page-in from disk.
-    let disk_buckets = build_or_reuse_disk_contexts(data_dir, seeds)?;
     let n = disk_buckets.len();
     let cap = verifier_cache_cap();
-    crate::init_ai_pow_verifier_setup_disk(disk_buckets, cap).map_err(|()| {
-        SetupError(
-            "verifier-setup table rejected (empty / duplicate buckets) or already initialized"
-                .to_string(),
-        )
-    })?;
-    tracing::info!(
-        "AI-PoW verifier-setup installed (disk-paged): {n} bucket(s); contexts paged from disk, \
-         up to {cap} resident at once.",
-    );
+    crate::init_ai_pow_verifier_setup_disk(disk_buckets, cap)
+        .map_err(|()| SetupError("verifier table rejected or already initialized".to_string()))?;
+    tracing::info!("AI-PoW verifier setup installed: {n} native contexts, at most {cap} resident",);
     Ok(n)
 }
 
-/// The on-disk file for one bucket's serialized verifier context. The shape key and
-/// committed verifier-key digest are baked into the filename so a seed/table change
-/// yields a new filename and a stale file is never mistaken for the current one.
+/// One compact context file, keyed by rule, canonical geometry and key digest.
 pub fn verifier_context_file_path(
     data_dir: &std::path::Path,
     shape_key: VerifierSetupShapeKey,
@@ -826,9 +786,10 @@ pub fn verifier_context_file_path(
         .take(8)
         .map(|b| format!("{b:02x}"))
         .collect();
-    data_dir
-        .join("ai-pow")
-        .join(format!("ctx-2p{log2}-{sx}-{tag}.bin"))
+    data_dir.join("ai-pow").join(format!(
+        "ctx-v4-{:?}-2p{log2}-{sx}-{tag}.bin",
+        shape_key.rules
+    ))
 }
 
 /// The sidecar file holding the BLAKE3 checksum of a context file's bytes.
@@ -838,22 +799,35 @@ fn context_checksum_path(context_path: &std::path::Path) -> std::path::PathBuf {
     std::path::PathBuf::from(p)
 }
 
-/// Serialize one built verifier setup to `path` for disk paging, and write a sidecar
-/// BLAKE3 of the file bytes (re-checked on every page-in to catch on-disk bit-rot).
-/// Returns the checksum.
+/// Serialize one built verifier setup to a synced temporary file and atomically
+/// rename it into place. Its checksum sidecar is replaced separately after the
+/// context commit; a missing sidecar is recoverable because page-in always hashes
+/// the context bytes.
 fn write_verifier_context_file(
     setup: &AiPowVerifierSetup,
     path: &std::path::Path,
 ) -> Result<[u8; 32], SetupError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(err("create verifier-context dir"))?;
-    }
     let bytes = bincode::serde::encode_to_vec(setup, bincode::config::standard())
         .map_err(err("serialize verifier context"))?;
     let checksum = *blake3::hash(&bytes).as_bytes();
-    std::fs::write(path, bytes).map_err(err("write verifier context file"))?;
-    std::fs::write(context_checksum_path(path), checksum)
-        .map_err(err("write verifier context checksum"))?;
+    let sidecar = context_checksum_path(path);
+    match std::fs::remove_file(&sidecar) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(SetupError(format!(
+                "remove stale verifier context checksum: {error:?}"
+            )));
+        }
+    }
+    write_file_atomically(path, &bytes, "verifier context file")?;
+    if let Err(error) = write_file_atomically(&sidecar, &checksum, "verifier context checksum") {
+        tracing::warn!(
+            path = %sidecar.display(),
+            error = %error,
+            "Verifier context committed without checksum sidecar; it will be rebuilt on load",
+        );
+    }
     Ok(checksum)
 }
 
@@ -861,7 +835,7 @@ fn write_verifier_context_file(
 /// present, else compute it from the file bytes and write the sidecar (self-heal for
 /// files written before checksums, or a lost sidecar). This never trusts the file — it
 /// only records what is on disk; `page_in_bucket` re-reads + re-checks on every use.
-fn context_file_checksum(path: &std::path::Path) -> Result<[u8; 32], SetupError> {
+pub(crate) fn context_file_checksum(path: &std::path::Path) -> Result<[u8; 32], SetupError> {
     let sidecar = context_checksum_path(path);
     if let Ok(bytes) = std::fs::read(&sidecar) {
         if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
@@ -870,74 +844,99 @@ fn context_file_checksum(path: &std::path::Path) -> Result<[u8; 32], SetupError>
     }
     let file = std::fs::read(path).map_err(err("read verifier context for checksum"))?;
     let checksum = *blake3::hash(&file).as_bytes();
-    // Best-effort sidecar write (ignore failure: page_in will recompute if absent).
-    let _ = std::fs::write(&sidecar, checksum);
+    // Best-effort atomic sidecar write (page-in recomputes when it is absent).
+    let _ = write_file_atomically(&sidecar, &checksum, "verifier context checksum");
     Ok(checksum)
 }
 
-/// Ensure every bucket has a valid on-disk context, building + serializing any that
-/// are missing (consuming `seeds`), and return the disk buckets for injection. A
-/// freshly-built context is digest-validated against its seed's committed digest
-/// before it is written; a mismatch is fatal (a divergent verifier must not run).
+/// Validate existing contexts at startup, or reconstruct missing ones from shape.
+/// Every descriptor key is checked against a freshly recomputed native binding.
 fn build_or_reuse_disk_contexts(
     data_dir: &std::path::Path,
-    seeds: Vec<AiPowCompactVerifierSetupSeed>,
+    descriptors: Vec<AiPowCompactVerifierSetupDescriptor>,
 ) -> Result<Vec<crate::DiskBucket>, SetupError> {
-    let mut disk_buckets: Vec<crate::DiskBucket> = Vec::with_capacity(seeds.len());
-    let mut built = 0usize;
-    let total = seeds.len();
-    for seed in seeds {
-        let shape_key = shape_key_for_seed(&seed)?;
-        let committed_digest = seed.verifier_key_digest_bytes.clone();
+    let mut disk_buckets = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let shape_key = shape_key_for_descriptor(&descriptor)?;
+        let committed_digest = descriptor.verifier_key_digest_bytes.clone();
         let ctx_path = verifier_context_file_path(data_dir, shape_key, &committed_digest);
         let checksum = if ctx_path.exists() {
-            // Reuse: record the existing file's checksum (page_in re-verifies on use).
             context_file_checksum(&ctx_path)?
         } else {
-            if built == 0 {
-                tracing::info!(
-                    "Building the AI-PoW verifier contexts to disk ({total} buckets, one-time; \
-                     ~1–2 minutes). They are paged in from disk afterwards, never rebuilt.",
-                );
-            }
-            let setup = rebuild_verifier_setup_from_seed(seed)?;
-            // Digest gate: the built context must internally bind its setup metadata
-            // and match its seed's committed digest.
-            let recomputed_digest = setup.context.validate_setup_binding().map_err(|e| {
-                SetupError(format!(
-                    "built verifier context for {:?} failed setup binding validation: {e:?}",
-                    shape_key,
-                ))
-            })?;
-            let digest = ai_pow_zk::recursion::compact_batch_verifier_key_digest_to_bytes(
-                &recomputed_digest,
-            );
-            if digest.as_slice() != committed_digest.as_slice()
-                || setup.digest_bytes != committed_digest
-            {
-                return Err(SetupError(format!(
-                    "built verifier context for {:?} does not match its committed digest — \
-                     refusing to run a divergent verifier",
-                    shape_key,
-                )));
-            }
-            let ck = write_verifier_context_file(&setup, &ctx_path)?;
-            built += 1;
-            ck
+            let setup = rebuild_verifier_setup_from_descriptor(descriptor)?;
+            write_verifier_context_file(&setup, &ctx_path)?
         };
-        disk_buckets.push(crate::DiskBucket::new(
-            shape_key, committed_digest, ctx_path, checksum,
+        let bucket = crate::DiskBucket::new(shape_key, committed_digest, ctx_path, checksum);
+        disk_buckets.push(bucket);
+    }
+    verify_disk_contexts(&disk_buckets)?;
+    Ok(disk_buckets)
+}
+
+fn verify_disk_contexts(buckets: &[crate::DiskBucket]) -> Result<(), SetupError> {
+    let mut native_fingerprints = Vec::with_capacity(buckets.len());
+    for bucket in buckets {
+        let native = crate::page_in_bucket(bucket).ok_or_else(|| {
+            SetupError(format!(
+                "cached verifier context at {:?} failed native binding",
+                bucket.shape_key,
+            ))
+        })?;
+        native_fingerprints.push((
+            native.shape_key(),
+            compact_batch_verifier_key_digest_to_bytes(native.context.verifier_key_digest()),
         ));
     }
-    if built > 0 {
-        tracing::info!("Built {built} AI-PoW verifier context(s) to disk.");
+    crate::table_digest::verify_production_fingerprints(&native_fingerprints)?;
+    Ok(())
+}
+
+fn derive_disk_contexts(
+    data_dir: &std::path::Path,
+    buckets: &[VerifierSetupBucketShape],
+) -> Result<
+    (
+        Vec<AiPowCompactVerifierSetupDescriptor>,
+        Vec<crate::DiskBucket>,
+    ),
+    SetupError,
+> {
+    let mut descriptors = Vec::with_capacity(2 * buckets.len());
+    let mut disk_buckets = Vec::with_capacity(2 * buckets.len());
+    let mut native_fingerprints = Vec::with_capacity(2 * buckets.len());
+    for (shape, rules) in buckets
+        .iter()
+        .flat_map(|shape| [ProofRules::Legacy, ProofRules::Hardened].map(|rules| (shape, rules)))
+    {
+        let setup = build_bucket_verifier_setup(shape, rules)?;
+        let descriptor = descriptor_for_setup(&shape.params, &setup)?;
+        let shape_key = setup.shape_key();
+        if descriptors
+            .iter()
+            .any(|prior| shape_key_for_descriptor(prior).ok() == Some(shape_key))
+        {
+            return Err(SetupError(format!(
+                "duplicate verifier shape {shape_key:?}"
+            )));
+        }
+        native_fingerprints.push((
+            shape_key,
+            compact_batch_verifier_key_digest_to_bytes(setup.context.verifier_key_digest()),
+        ));
+        let ctx_path = verifier_context_file_path(data_dir, shape_key, &setup.digest_bytes);
+        let checksum = write_verifier_context_file(&setup, &ctx_path)?;
+        disk_buckets.push(crate::DiskBucket::new(
+            shape_key, setup.digest_bytes, ctx_path, checksum,
+        ));
+        descriptors.push(descriptor);
     }
-    Ok(disk_buckets)
+    crate::table_digest::verify_production_fingerprints(&native_fingerprints)?;
+    Ok((descriptors, disk_buckets))
 }
 
 /// Test / bootstrap helper: serialize already-built `setups` to per-bucket context
 /// files under `data_dir` and inject them disk-paged, mirroring what the boot
-/// installer does after building — without generating or loading a seed cache. Each
+/// installer does after building — without generating or loading a shape cache. Each
 /// setup's own `digest_bytes` is the committed digest (re-checked on page-in).
 pub fn install_verifier_setup_disk_from_setups(
     setups: Vec<AiPowVerifierSetup>,
@@ -972,46 +971,31 @@ pub fn install_verifier_setup_disk_from_setups(
         .map_err(|()| SetupError("disk-paged setup rejected or already initialized".to_string()))
 }
 
-/// Lenient loader for non-consensus tools (e.g. roswell): if the data-dir cache
-/// exists, load + rebuild (no proving) + inject and return the bucket count;
-/// otherwise return `Ok(0)` WITHOUT generating one. Unlike
-/// [`install_or_build_verifier_setup`], this never proves at boot (so it never
-/// stalls a tool/test harness) and never shuts down on a missing cache — it only
-/// errors on a corrupt cache or rebuild failure. Idempotent.
+/// Install an existing complete cache without generating missing contexts.
+/// An absent cache is allowed for non-consensus tools; an invalid cache is not.
 pub fn install_verifier_setup_from_cache(data_dir: &std::path::Path) -> Result<usize, SetupError> {
+    prepare_verifier_resources()?;
     if crate::ai_pow_verifier_setup_initialized() {
         return Ok(0);
     }
-    let path = verifier_setup_seed_cache_path(data_dir);
+    let path = verifier_setup_descriptor_cache_path(data_dir);
     if !path.exists() {
         return Ok(0);
     }
-    // Lenient: register the disk-bucket paths WITHOUT building the heavy contexts and
-    // WITHOUT the consensus-digest gate. A non-consensus tool never verifies a real
-    // block, so it never pages a context in; if it did, page-in re-checks the digest
-    // and a missing/wrong file fails safe.
-    let seeds = load_verifier_setup_seeds(&path)?;
-    let n = seeds.len();
-    let disk_buckets: Vec<crate::DiskBucket> = seeds
-        .iter()
-        .map(|seed| {
-            let shape_key = shape_key_for_seed(seed)?;
-            let digest = seed.verifier_key_digest_bytes.clone();
-            let ctx_path = verifier_context_file_path(data_dir, shape_key, &digest);
-            // Register-only (never paged in by a non-consensus tool): read the sidecar
-            // checksum if a node already built the file, else a zero placeholder.
-            let checksum = context_file_checksum(&ctx_path).unwrap_or([0u8; 32]);
-            Ok(crate::DiskBucket::new(
-                shape_key, digest, ctx_path, checksum,
-            ))
-        })
-        .collect::<Result<Vec<_>, SetupError>>()?;
-    crate::init_ai_pow_verifier_setup_disk(disk_buckets, verifier_cache_cap()).map_err(|()| {
-        SetupError(
-            "verifier-setup table rejected (empty / duplicate buckets) or already initialized"
-                .to_string(),
-        )
-    })?;
+    let descriptors = load_and_validate_descriptors(&path)?;
+    let mut disk_buckets = Vec::with_capacity(descriptors.len());
+    for descriptor in descriptors {
+        let key = shape_key_for_descriptor(&descriptor)?;
+        let digest = descriptor.verifier_key_digest_bytes;
+        let path = verifier_context_file_path(data_dir, key, &digest);
+        let checksum = context_file_checksum(&path)?;
+        let bucket = crate::DiskBucket::new(key, digest, path, checksum);
+        disk_buckets.push(bucket);
+    }
+    verify_disk_contexts(&disk_buckets)?;
+    let n = disk_buckets.len();
+    crate::init_ai_pow_verifier_setup_disk(disk_buckets, verifier_cache_cap())
+        .map_err(|()| SetupError("verifier table rejected or already initialized".to_string()))?;
     Ok(n)
 }
 
@@ -1023,41 +1007,90 @@ pub struct VerifierSetupBucketShape {
     pub hw: u32,
     pub e: usize,
     pub top_k: usize,
-    /// When `true`, the bucket is built by proving a DENSE canonical block (not MoE).
+    /// When `true`, derive the trace height from the dense strip schedule.
     /// `hw`/`e`/`top_k` are ignored. Dense buckets cover verifier shapes that no MoE
     /// shape reaches — the MoE routing scatters opened rows, inflating the Layer-0
     /// trace height above the dense budget for the same `(params, tile)`.
     pub dense: bool,
 }
 
-/// OFFLINE (expensive — one real compact proof per bucket): build the seed table
-/// for the given bucket shapes and cache it to `path`. Run this once (offline / on
-/// first boot); subsequent boots call [`load_verifier_setup_table`] and rebuild in
-/// seconds. Rejects duplicate shape keys, matching
-/// [`crate::init_ai_pow_verifier_setup`]'s admission.
-pub fn build_and_cache_verifier_setup_seeds(
+impl VerifierSetupBucketShape {
+    pub(crate) fn trace_height(&self) -> Result<usize, SetupError> {
+        if self.dense {
+            ai_pow::zk_bridge::pearl_dense_canonical_trace_height(&self.params, 0, 0)
+                .map_err(err("dense canonical height"))
+        } else {
+            reference_moe_trace_height(&self.params, self.hw, self.e, self.top_k)
+        }
+    }
+}
+
+pub(crate) fn production_verifier_setup_geometries(
+) -> Result<Vec<(ai_pow_zk::params::ZkParams, usize)>, SetupError> {
+    production_verifier_setup_buckets()
+        .into_iter()
+        .map(|shape| {
+            Ok((
+                ai_pow::zk_bridge::zk_params_from_matmul(&shape.params),
+                shape.trace_height()?,
+            ))
+        })
+        .collect()
+}
+
+fn validate_production_bucket_shapes(
+    buckets: &[VerifierSetupBucketShape],
+) -> Result<(), SetupError> {
+    let expected = production_verifier_setup_geometries()?;
+    let supplied = buckets
+        .iter()
+        .map(|shape| {
+            Ok((
+                ai_pow::zk_bridge::zk_params_from_matmul(&shape.params),
+                shape.trace_height()?,
+            ))
+        })
+        .collect::<Result<Vec<_>, SetupError>>()?;
+    if supplied.len() != expected.len() || expected.iter().any(|shape| !supplied.contains(shape)) {
+        return Err(SetupError(
+            "setup requires all 14 canonical production geometries".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn build_bucket_verifier_setup(
+    shape: &VerifierSetupBucketShape,
+    rules: ProofRules,
+) -> Result<AiPowVerifierSetup, SetupError> {
+    build_verifier_setup_for_trace_height(&shape.params, shape.trace_height()?, rules)
+}
+
+/// Derive a shape table and compact native context files, rejecting duplicate keys.
+pub fn build_and_cache_verifier_setup_descriptors(
     path: &std::path::Path,
     buckets: &[VerifierSetupBucketShape],
 ) -> Result<(), SetupError> {
-    let mut keys: Vec<VerifierSetupShapeKey> = Vec::with_capacity(buckets.len());
-    let mut seeds: Vec<AiPowCompactVerifierSetupSeed> = Vec::with_capacity(buckets.len());
-    for b in buckets {
-        let seed = if b.dense {
-            build_verifier_setup_seed_dense(&b.params)?
-        } else {
-            build_verifier_setup_seed(&b.params, b.hw, b.e, b.top_k)?
-        };
-        let key = shape_key_for_seed(&seed)?;
+    prepare_verifier_resources()?;
+    let mut descriptors = Vec::with_capacity(2 * buckets.len());
+    let mut keys = Vec::with_capacity(2 * buckets.len());
+    for (shape, rules) in buckets
+        .iter()
+        .flat_map(|shape| [ProofRules::Legacy, ProofRules::Hardened].map(|rules| (shape, rules)))
+    {
+        let setup = build_bucket_verifier_setup(shape, rules)?;
+        let key = setup.shape_key();
         if keys.contains(&key) {
-            return Err(SetupError(format!(
-                "duplicate verifier-setup shape key {:?} in verifier-setup table",
-                key,
-            )));
+            return Err(SetupError(format!("duplicate verifier shape {key:?}")));
         }
         keys.push(key);
-        seeds.push(seed);
+        descriptors.push(descriptor_for_setup(&shape.params, &setup)?);
+        let context_name =
+            verifier_context_file_path(std::path::Path::new(""), key, &setup.digest_bytes);
+        let context_path = path.with_file_name(context_name.file_name().expect("context filename"));
+        write_verifier_context_file(&setup, &context_path)?;
     }
-    save_verifier_setup_seeds(path, &seeds)
+    save_verifier_setup_descriptors(path, &descriptors)
 }
 
 /// The production verifier setup bucket set: one canonical MoE shape per reachable
@@ -1092,7 +1125,7 @@ pub fn production_verifier_setup_buckets() -> Vec<VerifierSetupBucketShape> {
                 if params.validate_prod_envelope().is_err() {
                     continue;
                 }
-                if let Ok(th) = canonical_moe_trace_height(&params, hw, E, TOP_K) {
+                if let Ok(th) = reference_moe_trace_height(&params, hw, E, TOP_K) {
                     if th > ai_pow::params::AI_POW_MAX_TRACE_HEIGHT {
                         continue;
                     }
@@ -1153,4 +1186,42 @@ pub fn production_verifier_setup_buckets() -> Vec<VerifierSetupBucketShape> {
         }
     }
     by_bucket.into_values().collect()
+}
+
+#[cfg(test)]
+mod atomic_write_tests {
+    use super::write_file_atomically_with_commit;
+
+    #[test]
+    fn verifier_resources_are_ready_before_admission_and_reusable() {
+        super::prepare_verifier_resources().expect("initialize worker pool");
+        super::prepare_verifier_resources().expect("reuse worker pool");
+    }
+
+    #[test]
+    fn failed_atomic_commit_preserves_existing_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let destination = directory.path().join("verifier-context.bin");
+        std::fs::write(&destination, b"complete-old-context").expect("seed destination");
+
+        let error = write_file_atomically_with_commit(
+            &destination,
+            b"complete-new-context",
+            "test verifier context",
+            |temporary, _| {
+                assert_eq!(
+                    std::fs::read(temporary).expect("temporary context should be readable"),
+                    b"complete-new-context"
+                );
+                Err(std::io::Error::other("simulated interruption"))
+            },
+        )
+        .expect_err("interrupted commit must fail");
+
+        assert!(error.to_string().contains("simulated interruption"));
+        assert_eq!(
+            std::fs::read(&destination).expect("old context should remain readable"),
+            b"complete-old-context"
+        );
+    }
 }

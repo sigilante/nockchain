@@ -47,18 +47,19 @@ use p3_lookup::{Count, InteractionBuilder};
 use crate::composite_full_air::{CompositeFullAir, CompositeFullAirPinned, ProgramShapeError};
 use crate::composite_layout::{
     AB_ID_LIMBS_LEN, AB_ID_LIMBS_START, A_ID, A_ID_LEN, A_NOISED_START, A_NOISED_UNPACK_LEN,
-    A_NOISED_UNPACK_START, B_ID, B_ID_LEN, B_NOISED_START, B_NOISED_UNPACK_LEN,
+    A_NOISED_UNPACK_START, BLAKE3_MSG_START, B_ID, B_ID_LEN, B_NOISED_START, B_NOISED_UNPACK_LEN,
     B_NOISED_UNPACK_START, CV_IN_LEN, CV_IN_START, CV_OR_TWEAK_PREP, CV_OUT_FREQ, CV_OUT_LEN,
     CV_OUT_START, I8U8_FREQ, I8U8_TABLE, IRANGE7P1_FREQ, IRANGE7P1_TABLE, IRANGE8_FREQ,
-    IRANGE8_TABLE, IS_CV_IN, IS_MSG_MAT, IS_RESET_CUMSUM, IS_UPDATE_CUMSUM, MAT_FREQ, MAT_ID,
-    MAT_ID_LIMBS_LEN, MAT_ID_LIMBS_START, MAT_UNPACK_START, MAT_UNPACK_WIN, NOISED_PACKED_START,
-    NOISE_UNPACK_START, NOISE_UNPACK_WIN, STARK_ROW_IDX, TOTAL_TRACE_WIDTH, UINT8_DATA_START,
-    UINT8_DATA_WIN, URANGE13_FREQ, URANGE13_TABLE, URANGE8_FREQ, URANGE8_TABLE,
+    IRANGE8_TABLE, IS_CV_IN, IS_MSG_MAT, IS_PARENT_CV, IS_RESET_CUMSUM, IS_UPDATE_CUMSUM, MAT_FREQ,
+    MAT_ID, MAT_ID_LIMBS_LEN, MAT_ID_LIMBS_START, MAT_UNPACK_START, MAT_UNPACK_WIN,
+    NOISED_PACKED_START, NOISE_UNPACK_START, NOISE_UNPACK_WIN, STARK_ROW_IDX, TOTAL_TRACE_WIDTH,
+    UINT8_DATA_START, UINT8_DATA_WIN, URANGE13_FREQ, URANGE13_TABLE, URANGE8_FREQ, URANGE8_TABLE,
 };
 use crate::composite_lookups::{
     BUS_CV_ROUTING, BUS_I8U8, BUS_IRANGE7P1, BUS_IRANGE8, BUS_NOISED_PACKED, BUS_URANGE13,
-    BUS_URANGE8,
+    BUS_URANGE8, PARENT_LEFT_MSG_POS, PARENT_RIGHT_MSG_POS,
 };
+use crate::proof_rules::ProofRules;
 
 /// Lookup-aware composite AIR.
 ///
@@ -97,7 +98,7 @@ where
         bus_emit::irange8::<AB>(builder);
         bus_emit::i8u8::<AB>(builder);
         bus_emit::noised_packed::<AB>(builder);
-        bus_emit::cv_routing::<AB>(builder);
+        bus_emit::cv_routing::<AB>(builder, ProofRules::Hardened);
     }
 }
 
@@ -125,9 +126,15 @@ where
 #[derive(Clone)]
 pub struct CompositeFullAirWithLookupsPinned {
     inner: CompositeFullAirPinned,
+    rules: ProofRules,
 }
 
 impl CompositeFullAirWithLookupsPinned {
+    #[cfg(feature = "recursion")]
+    pub(crate) fn proof_rules(&self) -> ProofRules {
+        self.rules
+    }
+
     /// Build from the canonical program matrix (see
     /// `composite_full_air::extract_program`) with the
     /// keystone enabled (production / `num_stripes ≤ 16`).
@@ -154,8 +161,17 @@ impl CompositeFullAirWithLookupsPinned {
         program: p3_matrix::dense::RowMajorMatrix<crate::Val>,
         sx_bound: bool,
     ) -> Result<Self, ProgramShapeError> {
+        Self::try_new_with_rules(program, sx_bound, ProofRules::Hardened)
+    }
+
+    pub fn try_new_with_rules(
+        program: p3_matrix::dense::RowMajorMatrix<crate::Val>,
+        sx_bound: bool,
+        rules: ProofRules,
+    ) -> Result<Self, ProgramShapeError> {
         Ok(Self {
             inner: CompositeFullAirPinned::try_new_with(program, sx_bound)?,
+            rules,
         })
     }
 }
@@ -193,7 +209,7 @@ where
         bus_emit::irange8::<AB>(builder);
         bus_emit::i8u8::<AB>(builder);
         bus_emit::noised_packed::<AB>(builder);
-        bus_emit::cv_routing::<AB>(builder);
+        bus_emit::cv_routing::<AB>(builder, self.rules);
     }
 }
 
@@ -261,8 +277,8 @@ mod bus_emit {
     /// `irange7p1` bus — i7+1 range check `[-64, 64]`.
     ///
     /// Table: (IRANGE7P1_TABLE, −IRANGE7P1_FREQ).
-    /// Queries: NOISE_UNPACK[0..64] every row (Pearl's signed
-    /// noise bytes).
+    /// Queries: NOISE_UNPACK[0..64] and MAT_UNPACK[0..64] every row;
+    /// both signed operands are in [-64,64].
     pub fn irange7p1<AB: AirBuilder + InteractionBuilder>(builder: &mut AB) {
         let main = builder.main();
         let cur = main.current_slice();
@@ -278,12 +294,9 @@ mod bus_emit {
                 Count::bounded(<AB::Expr as p3_field::PrimeCharacteristicRing>::ONE, 1),
             );
         }
-        // Pearl parity (audit N2): the PLAIN matrix operand `MAT_UNPACK` is
-        // int7 `[-64,64]`, range-checked here alongside `NOISE_UNPACK` — exactly
-        // Pearl `pearl_stark.rs` (`MAT_UNPACK_RANGE.chain(NOISE_UNPACK_RANGE)` →
-        // IRANGE7P1, "// Signal is in [-64, 64]"). The tighter int7 bound (vs a
-        // plain i8 `[-128,127]`) is what keeps the accept-set identical to Pearl.
-        // `i8u8` bridges these i8 cells to `UINT8_DATA`.
+        // The plain matrix operand `MAT_UNPACK` and noise operand
+        // `NOISE_UNPACK` share the signed range `[-64,64]`.
+        // `i8u8` connects the matrix cells to their `UINT8_DATA` representation.
         for i in 0..MAT_UNPACK_WIN {
             builder.push_interaction(
                 BUS_IRANGE7P1,
@@ -296,9 +309,9 @@ mod bus_emit {
     /// `irange8` bus — i8 range check `[-128, 127]`.
     ///
     /// Table: (IRANGE8_TABLE, −IRANGE8_FREQ).
-    /// Queries: A_NOISED_UNPACK[0..32] + B_NOISED_UNPACK[0..32] every row (the
-    /// NOISED operands, genuinely i8). `MAT_UNPACK` moved to IRANGE7P1 `[-64,64]`
-    /// for Pearl parity (audit N2) — matches Pearl's IRANGE8 = A_NOISED ⧺ B_NOISED.
+    /// Queries: A_NOISED_UNPACK[0..32] + B_NOISED_UNPACK[0..32] every row.
+    /// These noised operands are i8; the plain `MAT_UNPACK` operand uses
+    /// IRANGE7P1 `[-64,64]`.
     pub fn irange8<AB: AirBuilder + InteractionBuilder>(builder: &mut AB) {
         let main = builder.main();
         let cur = main.current_slice();
@@ -464,11 +477,15 @@ mod bus_emit {
     ///
     /// Table key: (STARK_ROW_IDX, CV_OUT[0..8]), multiplicity
     /// CV_OUT_FREQ. Every row publishes its CV_OUT.
-    /// Queries: (CV_OR_TWEAK_PREP, CV_IN[0..8]) gated by
-    /// IS_CV_IN. When IS_CV_IN = 1, CV_OR_TWEAK_PREP holds the
-    /// referenced row's STARK_ROW_IDX (the column's dual use as
-    /// a BLAKE3 tweak is gated by IS_NEW_BLAKE instead).
-    pub fn cv_routing<AB: AirBuilder + InteractionBuilder>(builder: &mut AB) {
+    /// Queries:
+    /// - `(CV_OR_TWEAK_PREP, CV_IN[0..8])` for ordinary chaining rows;
+    /// - `(CV_OR_TWEAK_PREP, parent_message_child[0..8])` for parent
+    ///   compressions, gated by `IS_PARENT_CV`.
+    ///
+    /// On parent rows `IS_CV_IN` selects the message half: zero selects the
+    /// left child on round 1 and one selects the right child on round 6. The
+    /// canonical program pins both selectors and the referenced source row.
+    pub fn cv_routing<AB: AirBuilder + InteractionBuilder>(builder: &mut AB, rules: ProofRules) {
         let main = builder.main();
         let cur = main.current_slice();
 
@@ -483,6 +500,10 @@ mod bus_emit {
             Count::bounded(-<AB::Var as Into<AB::Expr>>::into(cur[CV_OUT_FREQ]), 0),
         );
 
+        let is_cv_in: AB::Expr = cur[IS_CV_IN].into();
+        let is_parent_cv: AB::Expr = cur[IS_PARENT_CV].into();
+        let one = <AB::Expr as p3_field::PrimeCharacteristicRing>::ONE;
+
         let mut query_key: Vec<AB::Expr> = Vec::with_capacity(1 + CV_IN_LEN);
         query_key.push(cur[CV_OR_TWEAK_PREP].into());
         for i in 0..CV_IN_LEN {
@@ -491,8 +512,26 @@ mod bus_emit {
         builder.push_interaction(
             BUS_CV_ROUTING,
             query_key,
-            Count::bounded(<AB::Var as Into<AB::Expr>>::into(cur[IS_CV_IN]), 1),
+            Count::bounded(
+                match rules {
+                    ProofRules::Legacy => is_cv_in.clone(),
+                    ProofRules::Hardened => is_cv_in.clone() * (one.clone() - is_parent_cv.clone()),
+                },
+                1,
+            ),
         );
+
+        if rules == ProofRules::Legacy {
+            return;
+        }
+        let mut parent_key: Vec<AB::Expr> = Vec::with_capacity(1 + CV_OUT_LEN);
+        parent_key.push(cur[CV_OR_TWEAK_PREP].into());
+        for i in 0..CV_OUT_LEN {
+            let left: AB::Expr = cur[BLAKE3_MSG_START + PARENT_LEFT_MSG_POS[i]].into();
+            let right: AB::Expr = cur[BLAKE3_MSG_START + PARENT_RIGHT_MSG_POS[i]].into();
+            parent_key.push(left.clone() + is_cv_in.clone() * (right - left));
+        }
+        builder.push_interaction(BUS_CV_ROUTING, parent_key, Count::bounded(is_parent_cv, 1));
     }
 }
 
@@ -944,17 +983,15 @@ mod tests {
         let res = run_batch(cfg, &trace.matrix);
         assert!(
             res.is_err(),
-            "MAT_UNPACK/UINT8_DATA split view at byte {byte_idx} must reject; got {:?}",
+            "inconsistent MAT_UNPACK/UINT8_DATA operands at byte {byte_idx} must reject; got {:?}",
             res
         );
     }
 
-    /// Regression for the split-view gap. The attack leaves the
-    /// unsigned BLAKE3-facing view unchanged, mutates the signed
-    /// matmul-facing view, and recomputes the matching `NOISED_PACKED`
-    /// cell so the input chip still accepts. Full 64-byte i8/u8 lookup
-    /// activation must reject it in every later sub-slice, not only at
-    /// byte 8.
+    /// Signed and unsigned matrix operands must agree across all 64 bytes.
+    /// Keeping the unsigned BLAKE3-facing operand unchanged while modifying
+    /// the signed matmul-facing operand and its matching `NOISED_PACKED` cell
+    /// must reject in every later sub-slice, not only at byte 8.
     #[test]
     fn non_first_subslice_split_view_rejected_by_i8u8_logup() {
         let cfg = build_stark_config(&test_zk_params(), &CircuitConfig::TEST_PEARL);
@@ -963,9 +1000,8 @@ mod tests {
         }
     }
 
-    /// Cheap full-position coverage for the frequency side of the
-    /// split-view fix. A single matrix-message row must populate
-    /// one I8U8 multiplicity for each of its 64 paired
+    /// Full-position lookup-frequency coverage: a single matrix-message row
+    /// must populate one I8U8 multiplicity for each of its 64 paired
     /// MAT_UNPACK/UINT8_DATA cells.
     #[test]
     fn full_msg_mat_row_populates_i8u8_freq_for_all_64_bytes() {
@@ -1427,12 +1463,14 @@ mod tests {
         let cfg = build_stark_config(&test_zk_params(), &CircuitConfig::PROD);
         let mut trace = CompositeTrace::baseline_min();
         trace.populate_lookup_freq();
+        let pis =
+            crate::composite_public::CompositePublicInputs::derive_from_trace(&trace).to_vec();
 
         let air = CompositeFullAirWithLookups;
         let instances = vec![StarkInstance {
             air: &air,
             trace: &trace.matrix,
-            public_values: vec![],
+            public_values: pis.clone(),
         }];
 
         let t0 = std::time::Instant::now();
@@ -1441,7 +1479,7 @@ mod tests {
         let prove_ms = t0.elapsed().as_millis();
 
         let t1 = std::time::Instant::now();
-        verify_batch(&cfg, &[air], &proof, &[vec![]], &prover_data.common)
+        verify_batch(&cfg, &[air], &proof, &[pis], &prover_data.common)
             .expect("PROD verify with LogUp");
         let verify_ms = t1.elapsed().as_millis();
 
@@ -1549,11 +1587,9 @@ mod tests {
         }
 
         /// URange8 bus (gated): place a valid u8 query at row 0 via
-        /// place_urange8_query. `place_urange8_query` couples UINT8_DATA to
-        /// MAT_UNPACK's i8 view through the i8u8 bus, and MAT_UNPACK is now
-        /// int7-constrained to [-64,64] (audit N2, Pearl parity). So the reachable
-        /// (and honest) UINT8_DATA values are exactly the u8 view of [-64,64] =
-        /// {0..=64} ∪ {192..=255}; those must verify.
+        /// place_urange8_query. The i8u8 bus couples UINT8_DATA to MAT_UNPACK's
+        /// signed view, which is constrained to [-64,64]. The corresponding
+        /// unsigned values are {0..=64} ∪ {192..=255}; those must verify.
         #[test]
         fn prop_urange8_valid_query_verifies(v in prop_oneof![0u32..=64, 192u32..=255]) {
             let cfg = build_stark_config(&test_zk_params(), &CircuitConfig::TEST_PEARL);
@@ -1564,14 +1600,10 @@ mod tests {
                 .expect("valid u8 query must verify");
         }
 
-        /// **Audit N2 — Pearl parity (the fix's teeth).** A CONSISTENT staging row
-        /// (MAT_UNPACK = i8(u8), matching NOISED_PACKED / UINT8_DATA) whose
-        /// MAT_UNPACK i8 view is OUT of int7 `[-64,64]` — i.e. u8 ∈ [65,191] →
-        /// i8 ∈ [65,127]∪[-128,-65] — is now REJECTED by the `irange7p1` range bus.
-        /// Before the fix, MAT_UNPACK was range-checked to full i8 `[-128,127]`
-        /// (`irange8`), so this exact row VERIFIED — an accept-set divergence from
-        /// Pearl (`pearl_stark.rs`: "// Signal is in [-64, 64]"). This is the
-        /// regression that pins the fix.
+        /// A consistent staging row with matching MAT_UNPACK, NOISED_PACKED,
+        /// and UINT8_DATA must still reject when MAT_UNPACK is outside
+        /// [-64,64]. Unsigned values in [65,191] represent signed values in
+        /// [65,127] ∪ [-128,-65], which have no `irange7p1` table entry.
         #[test]
         fn prop_mat_unpack_out_of_int7_rejects(u in prop_oneof![65u32..=127, 128u32..=191]) {
             let cfg = build_stark_config(&test_zk_params(), &CircuitConfig::TEST_PEARL);

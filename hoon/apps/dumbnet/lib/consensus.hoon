@@ -3,6 +3,8 @@
 /=  mine  /common/pow
 /=  dumb-transact  /common/tx-engine
 /=  asert  /apps/dumbnet/lib/asert
+::  Build once at module import; state-parameterized doors reuse this value.
+/=  legacy-checkpoints  /dat/legacy-ai-checkpoints
 /=  *  /common/h-zoon
 ::
 ::  this library is where _every_ update to the consensus state
@@ -99,6 +101,14 @@
       [%0 (from-b58:hash:t '7pR2bvzoMvfFcxXaHv4ERm8AgEnExcZLuEsjNgLkJziBkqBLidLg39Y')]
   ==
 ::
+::  Immutable realnet identities for incoming checkpoint admission.
+++  checkpoint-digest
+  |=  height=page-number:t
+  ^-  (unit hash:t)
+  =/  dense  (~(get z-by legacy-checkpoints) height)
+  ?^  dense  dense
+  (~(get z-by checkpointed-digests) height)
+::
 ::  Deterministic ZK proof version for a block height. This is authoritative
 ::  before AI activation and remains the ZK branch of the post-activation
 ::  version predicate. Persisted post-activation block IDs use
@@ -130,54 +140,28 @@
   ^-  ?
   =((height-to-proof-version height) version.proof)
 ::
-::  Check a block digest against checkpointed history.  Fakenets are
-::  identified by their non-realnet genesis seal and intentionally skip the
-::  realnet checkpoint map.
+::  Check every proof kind against the same history. Realnet requires a dense
+::  entry at each height in [126000,154500); outside it, enforce configured pins.
+::  Only the genesis seal identifies a fakenet; constants and proof-checking
+::  flags do not exempt realnet.
 ++  checkpoint-digest-valid
   ~/  %checkpoint-digest-valid
   |=  [height=page-number:t digest=hash:t =genesis-seal:t]
   ^-  ?
   ?~  genesis-seal
     %.n
-  ?|  !=(realnet-genesis-msg:dk msg-hash.u.genesis-seal)
-      ?!((~(has z-by checkpointed-digests) height))
-      =(digest (~(got z-by checkpointed-digests) height))
-  ==
+  ?:  !=(realnet-genesis-msg:dk msg-hash.u.genesis-seal)
+    %.y
+  ?:  ?&  (gte height 126.000)
+          (lth height 154.500)
+      ==
+    =/  expected  (~(get z-by legacy-checkpoints) height)
+    ?~  expected  %.n
+    =(digest u.expected)
+  =/  expected  (checkpoint-digest height)
+  ?~  expected  %.y
+  =(digest u.expected)
 ::
-::  Checkpointed IDs bind historical page identity. The stored artifact must
-::  also retain its admitted version and canonical envelope.
-++  checkpoint-page-valid
-  ~/  %checkpoint-page-valid
-  |=  [height=page-number:t expected=hash:t pag=page:t]
-  ^-  ?
-  =/  pow  ~(pow get:page:t pag)
-  ?~  pow
-    %.n
-  ?&  =(height ~(height get:page:t pag))
-      =(expected ~(digest get:page:t pag))
-      (check-digest:page:t pag)
-      (persisted-pow-valid height u.pow)
-  ==
-:::
-++  persisted-pow-valid
-  |=  [height=page-number:t pow=*]
-  ^-  ?
-  ?:  (legacy-v4-proof-artifact pow)
-    %.n
-  ?.  %+  proof-version-valid-at-height
-        (pow-artifact-to-proof-version pow)
-      height
-    %.n
-  ?:  ?=([%ai-pow *] pow)
-    (ai-pow-artifact-resource-ok:t pow)
-  =/  prf=(unit proof:sp)  ((soft proof:sp) pow)
-  ?~  prf
-    %.n
-  ?&  =(~ hashes.u.prf)
-      =(0 read-index.u.prf)
-      (canonical-pow-proof:dk [height u.prf])
-  ==
-:::
 ++  pow-artifact-shape-valid
   |=  pow=*
   ^-  ?
@@ -190,22 +174,6 @@
       ?=([%5 * * *] pow)
   ==
 ::
-::  Custom networks may deliberately disable PoW in tests and persist
-::  proofless pages.  Loading may retain those pages only when a proof is not
-::  required; any proof that is present still receives the full version and
-::  canonical-envelope audit.
-++  persisted-page-valid
-  ~/  %persisted-page-valid
-  |=  [require-proof=? height=page-number:t expected=hash:t pag=page:t]
-  ^-  ?
-  =/  pow  ~(pow get:page:t pag)
-  ?~  pow
-    ?&  !require-proof
-        =(height ~(height get:page:t pag))
-        =(expected ~(digest get:page:t pag))
-        (check-digest:page:t pag)
-    ==
-  (checkpoint-page-valid [height expected pag])
 ::  What block to start using proof version 3
 ++  proof-version-3-start  119.400
 :: What block to start using proof version 2
@@ -343,6 +311,18 @@
   ^-  page-number:t
   ~(height get:local-page:t (~(got h-by blocks.c) (need heaviest-block.c)))
 ::
+::  A stored genesis page may omit its empty balance from the index.
+++  get-block-balance
+  |=  bid=block-id:t
+  ^-  (unit (h-map nname:t nnote:t))
+  ?~  pag=(~(get h-by blocks.c) bid)
+    ~
+  =/  balance  (~(get h-by balance.c) bid)
+  ?^  balance  balance
+  ?:  =(*page-number:t ~(height get:local-page:t u.pag))
+    `*(h-map nname:t nnote:t)
+  ~
+::
 ++  get-cur-balance
   ^-  (h-map nname:t nnote:t)
   ?~  heaviest-block.c
@@ -350,9 +330,7 @@
     *(h-map nname:t nnote:t)
   =/  heaviest-page=local-page:t
     (~(got h-by blocks.c) u.heaviest-block.c)
-  ?~  balance=(~(get h-by balance.c) u.heaviest-block.c)
-    ?:  =(*page-number:t ~(height get:local-page:t heaviest-page))
-      *(h-map nname:t nnote:t)
+  ?~  balance=(get-block-balance u.heaviest-block.c)
     ~|  'get-cur-balance: Missing balance for non-genesis heaviest block'
     !!
   u.balance
@@ -423,7 +401,9 @@
 :::
 ++  zk-asert-anchor-schedule
   ^-  (list asert-anchor)
-  :~  [zk-pow-v5-phase:page:t zk-pow-v5-zk-anchor-target:page:t ~ zk-pow-v5-zk-ideal-block-time:page:t half-life.zk-asert-post-ai.blockchain-constants max-target-atom:t]
+  :~  [(need consensus-batch-phase:page:t) consensus-batch-zk-anchor-target:page:t ~ zk-pow-v5-zk-ideal-block-time:page:t half-life.zk-asert-post-ai.blockchain-constants max-target-atom:t]
+      [harden-phase:page:t asert-reset-zk-anchor-target:page:t ~ zk-pow-v5-zk-ideal-block-time:page:t half-life.zk-asert-post-ai.blockchain-constants max-target-atom:t]
+      [zk-pow-v5-phase:page:t zk-pow-v5-zk-anchor-target:page:t ~ zk-pow-v5-zk-ideal-block-time:page:t half-life.zk-asert-post-ai.blockchain-constants max-target-atom:t]
       [phase.zk-asert-post-ai.blockchain-constants anchor-target-atom.zk-asert-post-ai.blockchain-constants (asert-anchor-min-timestamp anchor-min-timestamp.zk-asert-post-ai.blockchain-constants) ideal-block-time.zk-asert-post-ai.blockchain-constants half-life.zk-asert-post-ai.blockchain-constants max-target-atom:t]
       [proof-version-3-start (asert-target-for-rate 3.000.000 ideal-block-time.zk-asert.blockchain-constants) ~ ideal-block-time.zk-asert.blockchain-constants half-life.zk-asert.blockchain-constants max-target-atom:t]
       [112.500 (asert-target-for-rate 3.000.000 ideal-block-time.zk-asert.blockchain-constants) ~ ideal-block-time.zk-asert.blockchain-constants half-life.zk-asert.blockchain-constants max-target-atom:t]
@@ -432,7 +412,9 @@
 ::::
 ++  ai-asert-anchor-schedule
   ^-  (list asert-anchor)
-  :~  [zk-pow-v5-phase:page:t zk-pow-v5-ai-anchor-target:page:t ~ zk-pow-v5-ai-ideal-block-time:page:t half-life.ai-asert.blockchain-constants max-ai-target-atom:t]
+  :~  [(need consensus-batch-phase:page:t) consensus-batch-ai-anchor-target:page:t ~ zk-pow-v5-ai-ideal-block-time:page:t half-life.ai-asert.blockchain-constants max-ai-target-atom:t]
+      [harden-phase:page:t zk-pow-v5-ai-anchor-target:page:t ~ zk-pow-v5-ai-ideal-block-time:page:t half-life.ai-asert.blockchain-constants max-ai-target-atom:t]
+      [zk-pow-v5-phase:page:t zk-pow-v5-ai-anchor-target:page:t ~ zk-pow-v5-ai-ideal-block-time:page:t half-life.ai-asert.blockchain-constants max-ai-target-atom:t]
       [phase.ai-asert.blockchain-constants anchor-target-atom.ai-asert.blockchain-constants (asert-anchor-min-timestamp anchor-min-timestamp.ai-asert.blockchain-constants) ideal-block-time.ai-asert.blockchain-constants half-life.ai-asert.blockchain-constants max-ai-target-atom:t]
   ==
 :::
@@ -512,7 +494,7 @@
   ?.  (gte child-height phase.zk-asert-post-ai.blockchain-constants)
     (compute-target-asert %zk child-height parent-digest)
   =/  state
-    ?:  =(child-height zk-pow-v5-phase:page:t)
+    ?:  (puzzle-asert-reset-at:page:t child-height)
       *puzzle-asert-state:dk
     (post-ai-parent-state parent-digest)
   =/  current-min-ts=(unit @)
@@ -561,7 +543,7 @@
   |=  [child-height=@ parent-digest=block-id:t]
   ^-  bignum:bignum:t
   =/  state
-    ?:  =(child-height zk-pow-v5-phase:page:t)
+    ?:  (puzzle-asert-reset-at:page:t child-height)
       *puzzle-asert-state:dk
     (post-ai-parent-state parent-digest)
   =/  current-min-ts=(unit @)
@@ -696,6 +678,16 @@
     (txs-size-by-id:page:t pag got-raw-tx)
   max-block-size:t
 ::
+++  coinbase-version-valid-at-height
+  |=  pag=page:t
+  ^-  ?
+  =/  cb=coinbase-split:t  ~(coinbase get:page:t pag)
+  =/  height=page-number:t  ~(height get:page:t pag)
+  ?-  -.cb
+    %0  (lth height v1-phase.blockchain-constants)
+    %1  (gte height v1-phase.blockchain-constants)
+  ==
+::
 ++  accept-page
   ~/  %accept-page
   |=  [pag=page:t acc=tx-acc:t now=@da]
@@ -812,6 +804,8 @@
             page-pow
         ==
     [%.n %proof-version-invalid]
+  ?.  (coinbase-version-valid-at-height pag)
+    [%.n %coinbase-version-height-mismatch]
   =/  ai-target-valid=?
     ?~  page-pow
       %.y
@@ -949,6 +943,8 @@
     ==
   ?.  version-check
     [%.n %proof-version-invalid]
+  ?.  (coinbase-version-valid-at-height pag)
+    [%.n %coinbase-version-height-mismatch]
   =/  digest-b58=cord  (to-b58:hash:t ~(digest get:page:t pag))
   ?.  (check-size pag)
     ~>  %slog.[1 (cat 3 'validate-page-with-txs: Block too large: ' digest-b58)]
@@ -1006,14 +1002,10 @@
     [%.n %improper-split]
   ::
   ::  Phase-gated v1 coinbase entry count. The +based:coinbase-split:v1
-  ::  parser allows up to `max-coinbase-split + 1` entries to admit the
-  ::  fund slot post-asert-activation, but pre-activation v1 blocks
-  ::  (v1-phase <= height < zk-asert-phase) carry no fund slot and must
-  ::  continue to cap at `max-coinbase-split` entries — matching the
-  ::  legacy v0 rule. Without this gate, a miner could pre-activation
-  ::  emit a 3-entry v1 coinbase that this branch accepts and stricter
-  ::  implementations reject (consensus split). See
-  ::  docs/2026-05-01-MR2545-EMISSIONS-REVIEW.md P1 #1.
+  ::  parser allows up to `max-coinbase-split + 1` entries for the
+  ::  post-activation fund slot. Pre-activation v1 blocks
+  ::  (v1-phase <= height < zk-asert-phase) carry no fund slot and
+  ::  cap at `max-coinbase-split` entries, matching the legacy v0 rule.
   =/  height=page-number:t  ~(height get:page:t pag)
   ?:  ?&  ?=([%1 *] cb)
           (pre-asert-activation:t height)
@@ -1065,8 +1057,7 @@
 ::    Post-cap special case (height > tail-end): when emission == 0 the
 ::    expected fund share is 0, but +based:coinbase-split:v1 rejects
 ::    zero-coin entries — so the only valid representation is fund-slot
-::    *absent*, with all fees flowing to miner-side outputs. See
-::    docs/2026-05-01-MR2545-EMISSIONS-REVIEW.md P1 #2.
+::    *absent*, with all fees flowing to miner-side outputs.
 ++  check-fund-split
   ~/  %check-fund-split
   |=  [cb=coinbase-split:t emission=coins:t]
@@ -1214,6 +1205,17 @@
   =.  pending-blocks.c  (~(del h-by pending-blocks.c) ~(digest get:page:t pag))
   c
 ::
+::  Discard pending headers on load so each receives fresh admission.
+::  +reject-pending-block releases dependencies and returns retained raw txs to
+::  the mempool without touching accepted blocks or their transaction claims.
+++  discard-pending-blocks
+  ^-  consensus-state:dk
+  =/  pending=(list block-id:t)  ~(tap h-in ~(key h-by pending-blocks.c))
+  %+  roll  pending
+  |=  [bid=block-id:t current=_c]
+  =.  c  current
+  (reject-pending-block bid)
+::
 ::  missing transaction ids from pending blocks
 ++  missing-tx-ids
   ^-  (list tx-id:t)
@@ -1238,6 +1240,18 @@
   =/  pag  page:(~(got h-by pending-blocks.c) block-id)
   =.  pending-blocks.c  (~(del h-by pending-blocks.c) ~(digest get:page:t pag))
   =.  blocks.c  (~(put h-by blocks.c) block-id (to-local-page:page:t pag))
+  ::  Persist proof versions for post-activation blocks exactly as
+  ::  +accept-block does: since AI-PoW activation height alone no longer
+  ::  identifies the puzzle, and this is the only road from
+  ::  `.pending-blocks` to `.blocks`, a promoted block must carry the
+  ::  same `block-versions` entry the direct path writes — or
+  ::  +block-id-to-proof-version falls back to the height-derived legacy
+  ::  version and misclassifies the block.
+  =?  block-versions.c
+      (gte ~(height get:page:t pag) ai-pow-activation-height.blockchain-constants)
+    %+  ~(put h-by block-versions.c)
+      block-id
+    (pow-artifact-to-proof-version (need ~(pow get:page:t pag)))
   c
 ::
 ::  list of pending blocks which are lower than the minimum retention height
@@ -1271,15 +1285,9 @@
 ::  Orphaned blocks: a block that is in .blocks (fully validated and accepted)
 ::  but is not the block the heaviest chain holds at its height.
 ::
-::  +accept-block claims every tx in a block: blocks-needed-by += block, and
-::  the tx leaves excluded-txs (the mempool). +reject-pending-block releases
-::  those claims for a PENDING block, but nothing ever released them for an
-::  ACCEPTED one. So when an accepted block lost a chain race its txs were
-::  stranded forever: invisible to the miner (whose candidate set is
-::  excluded-txs plus pending-block txs), never re-gossiped (that walks
-::  excluded-txs), never dropped (+drop-tx refuses anything still in
-::  blocks-needed-by), and with their inputs pinned in spent-by, so not even a
-::  replacement tx could spend those notes.
+::  Accepted blocks retain transaction claims in blocks-needed-by. Releasing
+::  an orphan's last claim returns retained transactions to excluded-txs;
+::  claims held by other blocks remain effective.
 ::
 ::  +release-orphaned-branch below is the release path. It runs on every reorg
 ::  and walks ONLY the abandoned branch (O(reorg depth)), so no event ever pays
@@ -1408,9 +1416,11 @@
 ::    with `got`, so any retained block naming a deleted one crashes the kernel
 ::    as soon as a child of it arrives.
 ::
-:::    All seven maps or none. A partial delete of .balance alone would not crash:
+::    All per-block maps or none. A partial delete of .balance alone would not crash:
 ::    +validate-page-with-txs reads balance[parent] with `get`, so the block's
 ::    children validate against an empty utxo set and are silently rejected.
+::    Logos added .block-versions to consensus state and .puzzle-asert-states to
+::    derived state, so this arm returns both state components.
 ::
 ::    Requires the claims already released (+release-orphan-claims): a block-id
 ::    left in .blocks-needed-by strands its tx (+apt: %txs-fell-through-cracks),
@@ -1418,19 +1428,34 @@
 ++  delete-orphan-blocks
   ~/  %delete-orphan-blocks
   |=  orphans=(list block-id:t)
-  ^-  consensus-state:dk
-  %+  roll  orphans
-  |=  [=block-id:t con=_c]
-  =.  c  con
-  =.  blocks.c          (~(del h-by blocks.c) block-id)
-  =.  balance.c         (~(del h-by balance.c) block-id)
-  =.  txs.c             (~(del h-by txs.c) block-id)
-  =.  min-timestamps.c  (~(del h-by min-timestamps.c) block-id)
-  =.  asert-anchor-min-timestamps.c
-    (delete-asert-anchor-min-timestamps block-id asert-anchor-min-timestamps.c)
-  =.  epoch-start.c     (~(del h-by epoch-start.c) block-id)
-  =.  targets.c         (~(del h-by targets.c) block-id)
-  c
+  ^-  [consensus-state:dk derived-state:dk]
+  =.  c
+    %+  roll  orphans
+    |=  [=block-id:t con=_c]
+    =.  c  con
+    =.  blocks.c          (~(del h-by blocks.c) block-id)
+    =.  balance.c         (~(del h-by balance.c) block-id)
+    =.  txs.c             (~(del h-by txs.c) block-id)
+    =.  min-timestamps.c  (~(del h-by min-timestamps.c) block-id)
+    =.  asert-anchor-min-timestamps.c
+      (delete-asert-anchor-min-timestamps block-id asert-anchor-min-timestamps.c)
+    =.  epoch-start.c     (~(del h-by epoch-start.c) block-id)
+    =.  targets.c         (~(del h-by targets.c) block-id)
+    c
+  ::  Retain proof-version and puzzle-lineage metadata only for blocks remaining
+  ::  after deletion. Preserve the values for every retained block, including
+  ::  when no orphan block is present.
+  =.  block-versions.c
+    %-  ~(rep h-by block-versions.c)
+    |=  [[=block-id:t version=proof-version:sp] versions=_block-versions.c]
+    ?:  (~(has h-by blocks.c) block-id)  versions
+    (~(del h-by versions) block-id)
+  =.  puzzle-asert-states.d
+    %-  ~(rep h-by puzzle-asert-states.d)
+    |=  [[=block-id:t state=puzzle-asert-state:dk] states=_puzzle-asert-states.d]
+    ?:  (~(has h-by blocks.c) block-id)  states
+    (~(del h-by states) block-id)
+  [c d]
 ::
 ::  +repair-orphaned-claims: BOOT-ONLY. Release the claims of every block that is
 ::  not on the heaviest chain, then delete those blocks.
@@ -1443,18 +1468,19 @@
 ::    Released txs land in excluded-txs, where the next +garbage-collect applies
 ::    the spent-input check and drops any the canonical chain has since spent.
 ::
-::    Two passes over the size of the chain: the ancestry walk, then the .blocks
-::    scan. Boot-only for that reason -- an event must never pay for the size of
+::    Walks the ancestry, scans .blocks, and sweeps the two proof/puzzle metadata
+::    maps. Boot-only for that reason -- an event must never pay for the size of
 ::    the chain.
 ++  repair-orphaned-claims
-  ^-  consensus-state:dk
-  ::  no chain yet, so nothing can be orphaned. Tested with `=(~ ...)` rather
+  ^-  [consensus-state:dk derived-state:dk]
+  ::  Without a chain, only metadata for missing blocks can need cleanup.
+  ::  Tested with `=(~ ...)` rather
   ::  than `?~`: `?~` would narrow .c's type to one whose heaviest-block is known
   ::  non-null, and the roll below seeds its accumulator from `_c` -- so the full
   ::  consensus-state that +release-orphan-claims returns would no longer nest.
   ?:  =(~ heaviest-block.c)
-    ~>  %slog.[0 'repair-orphaned-claims: no heaviest block yet, nothing to repair']
-    c
+    ~>  %slog.[0 'repair-orphaned-claims: no heaviest block yet, checking block metadata']
+    (delete-orphan-blocks ~)
   ::  the release and the delete must classify against one set: a block deleted
   ::  without its claims released strands those txs (+apt:
   ::  %txs-fell-through-cracks).
@@ -1462,8 +1488,11 @@
   =/  canonical=(unit (h-set block-id:t))
     ~>  %bout  canonical-block-ids
   ?~  canonical
-    ~>  %slog.[1 'repair-orphaned-claims: heaviest chain does not reach genesis, skipping repair']
-    c
+    ::  Without a complete ancestry set no stored page can safely be called an
+    ::  orphan. Returning unchanged would retain stale Zoe parents; resetting
+    ::  would discard recoverable state. A failed +load commits neither.
+    ~|  'load: Heaviest chain does not reach stored genesis; preserving state and refusing to boot'
+    !!
   ~>  %slog.[0 'repair-orphaned-claims: scanning .blocks for orphans']
   =/  mempool-before=@  ~(wyt h-in excluded-txs.c)
   =/  orphans=(list block-id:t)

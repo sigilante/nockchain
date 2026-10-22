@@ -3,7 +3,7 @@
 #
 # Full AI-PoW production flow on a fakenet, self-contained (no external Pearl
 # Gateway). Boots a `nockchain` node with AI-PoW active from a low height and
-# the gateway-free `ai-pow-mine --canonical` CPU miner, and shows the node<->miner
+# the gateway-free `ai-pow-mine --reference` CPU miner, and shows the node<->miner
 # communication end to end:
 #
 #   node  --%mine-ai (WatchEffects gRPC stream)-->  ai-pow-mine
@@ -113,6 +113,7 @@ RUST_LOG="${NODE_RUST_LOG:-info}" \
     --fakenet \
     --data-dir "$DATA_DIR" \
     --bind-private-grpc-port "$PRIV_PORT" \
+    --allow-unauthenticated-private-grpc \
     --fakenet-pow-len "$FAKENET_POW_LEN" \
     --fakenet-log-difficulty "$FAKENET_LOG_DIFF" \
     --fakenet-ai-pow-activation-height "$FAKENET_AI_ACTIVATION" \
@@ -151,12 +152,12 @@ fi
 
 sleep 2
 echo
-echo "[boot ] starting ai-pow-mine --canonical (gateway-free CPU miner) ..."
+echo "[boot ] starting ai-pow-mine --reference (gateway-free CPU miner) ..."
 RUST_LOG="${MINER_RUST_LOG:-info}" \
     "$MINER_BIN" \
     --node-addr "http://127.0.0.1:$PRIV_PORT" \
     --mining-pkh "$MINING_PKH" \
-    --canonical \
+    --reference \
     >"$MINER_LOG" 2>&1 &
 MINER_PID=$!
 echo "[boot ] miner pid=$MINER_PID"
