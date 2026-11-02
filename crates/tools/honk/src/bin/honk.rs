@@ -4020,8 +4020,7 @@ fn load_cold_state(context: &mut Context, raw: &[u8], label: &str) -> Result<()>
     //  two copies would show up not as a build failure but as a different
     //  noun (see that module's own note).
     trace_timed(format!("{label} cold load"), || {
-        honk::eval::load_cold_state(context, raw, label)
-            .map_err(|err| -> DynError { err.into() })
+        honk::eval::load_cold_state(context, raw, label).map_err(|err| -> DynError { err.into() })
     })
 }
 

@@ -127,16 +127,10 @@ pub fn load_cold_state(context: &mut Context, raw: &[u8], label: &str) -> Result
         cold_from_noun_resident(&mut context.stack, &cold_noun, &space)
             .map_err(|err| format!("decode {label} cold state: {err:?}"))?;
     context.cold = Cold::from_vecs(
-        &mut context.stack,
-        battery_to_paths,
-        root_to_paths,
-        path_to_batteries,
+        &mut context.stack, battery_to_paths, root_to_paths, path_to_batteries,
     );
     context.warm = Warm::init(
-        &mut context.stack,
-        &mut context.cold,
-        &context.hot,
-        &context.test_jets,
+        &mut context.stack, &mut context.cold, &context.hot, &context.test_jets,
         context.jet_dispatch,
     );
     Ok(())
